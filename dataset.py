@@ -42,7 +42,9 @@ def _split_pitch_shift_suffix(name: str) -> tuple[str, int]:
     return match.group("base"), int(match.group("shift"))
 
 
-def _normalize_harmony_pitch_shifts(values: list[Any] | tuple[Any, ...]) -> tuple[int, ...]:
+def _normalize_harmony_pitch_shifts(
+    values: list[Any] | tuple[Any, ...],
+) -> tuple[int, ...]:
     """YAML から読んだハモリ候補を順序付きの整数タプルへ正規化する。"""
     normalized: list[int] = []
     for value in values:
@@ -459,18 +461,25 @@ def build_pitch_interval_targets(
     active_start_ms: np.ndarray,
     active_end_ms: np.ndarray,
     active_pitch: np.ndarray,
+    active_instrument: np.ndarray,
     active_has_onset: np.ndarray,
     active_has_offset: np.ndarray,
     sample_rate: int,
     hop_length: int,
     num_frames: int,
+    num_pitch_slots: int = 1,
 ) -> PitchIntervalTargets:
     """Semi-CRFモデル用の詳細なインターバルターゲットを生成する"""
-    pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(NUM_PITCHES)]
-    has_onset_tracks: list[list[bool]] = [[] for _ in range(NUM_PITCHES)]
-    has_offset_tracks: list[list[bool]] = [[] for _ in range(NUM_PITCHES)]
-    onset_offsets_tracks: list[list[float]] = [[] for _ in range(NUM_PITCHES)]
-    offset_offsets_tracks: list[list[float]] = [[] for _ in range(NUM_PITCHES)]
+    num_pitch_slots = max(1, int(num_pitch_slots))
+    num_tracks = NUM_PITCHES * num_pitch_slots
+    pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(num_tracks)]
+    has_onset_tracks: list[list[bool]] = [[] for _ in range(num_tracks)]
+    has_offset_tracks: list[list[bool]] = [[] for _ in range(num_tracks)]
+    onset_offsets_tracks: list[list[float]] = [[] for _ in range(num_tracks)]
+    offset_offsets_tracks: list[list[float]] = [[] for _ in range(num_tracks)]
+    instrument_sets_tracks: list[list[tuple[int, ...]]] = [
+        [] for _ in range(num_tracks)
+    ]
 
     if num_frames <= 0 or active_start_ms.size == 0:
         return PitchIntervalTargets(
@@ -479,6 +488,7 @@ def build_pitch_interval_targets(
             has_offset=has_offset_tracks,
             onset_offsets=onset_offsets_tracks,
             offset_offsets=offset_offsets_tracks,
+            instrument_sets=instrument_sets_tracks,
         )
 
     # 続く複雑な処理は、フレーム境界を正確に計算し、複数のノートが重なった場合に
@@ -510,22 +520,25 @@ def build_pitch_interval_targets(
             has_offset=has_offset_tracks,
             onset_offsets=onset_offsets_tracks,
             offset_offsets=offset_offsets_tracks,
+            instrument_sets=instrument_sets_tracks,
         )
 
     start_frames = start_frames[valid_pitch_mask]
     end_frames_exclusive = end_frames_exclusive[valid_pitch_mask]
+    active_instrument = active_instrument[valid_pitch_mask]
     active_has_onset = active_has_onset[valid_pitch_mask]
     active_has_offset = active_has_offset[valid_pitch_mask]
     onset_offsets = onset_offsets[valid_pitch_mask]
     offset_offsets = offset_offsets[valid_pitch_mask]
 
-    raw_by_pitch: list[list[tuple[int, int, bool, bool, float, float]]] = [
+    raw_by_pitch: list[list[tuple[int, int, int, bool, bool, float, float]]] = [
         [] for _ in range(NUM_PITCHES)
     ]
     for (
         start_frame,
         end_frame_exclusive,
         pitch_value,
+        instrument_id,
         has_onset,
         has_offset,
         onset_off,
@@ -534,6 +547,7 @@ def build_pitch_interval_targets(
         start_frames.tolist(),
         end_frames_exclusive.tolist(),
         mapped_pitch.tolist(),
+        active_instrument.tolist(),
         active_has_onset.tolist(),
         active_has_offset.tolist(),
         onset_offsets.tolist(),
@@ -545,6 +559,7 @@ def build_pitch_interval_targets(
             (
                 int(start_frame),
                 int(end_frame_exclusive - 1),
+                int(instrument_id),
                 bool(has_onset),
                 bool(has_offset),
                 float(onset_off),
@@ -552,13 +567,62 @@ def build_pitch_interval_targets(
             )
         )
 
+    if num_pitch_slots > 1:
+        for pitch_value, intervals in enumerate(raw_by_pitch):
+            if not intervals:
+                continue
+            intervals.sort(
+                key=lambda item: (item[0], item[1], item[3], item[4], item[2])
+            )
+            slot_last_end_frames = [-1] * num_pitch_slots
+            for (
+                begin,
+                end,
+                instrument_id,
+                has_onset,
+                has_offset,
+                onset_off,
+                offset_off,
+            ) in intervals:
+                if int(begin) > int(end):
+                    continue
+
+                assigned_slot = None
+                for slot_index, last_end in enumerate(slot_last_end_frames):
+                    if int(begin) > int(last_end):
+                        assigned_slot = slot_index
+                        break
+                if assigned_slot is None:
+                    continue
+
+                track_index = int(pitch_value) * num_pitch_slots + int(assigned_slot)
+                pitch_intervals[track_index].append((int(begin), int(end)))
+                has_onset_tracks[track_index].append(bool(has_onset))
+                has_offset_tracks[track_index].append(bool(has_offset))
+                onset_offsets_tracks[track_index].append(float(onset_off))
+                offset_offsets_tracks[track_index].append(float(offset_off))
+                if 0 <= int(instrument_id) < NUM_INSTRUMENT_CLASSES:
+                    instrument_sets_tracks[track_index].append((int(instrument_id),))
+                else:
+                    instrument_sets_tracks[track_index].append(())
+                slot_last_end_frames[int(assigned_slot)] = int(end)
+
+        return PitchIntervalTargets(
+            intervals=pitch_intervals,
+            has_onset=has_onset_tracks,
+            has_offset=has_offset_tracks,
+            onset_offsets=onset_offsets_tracks,
+            offset_offsets=offset_offsets_tracks,
+            instrument_sets=instrument_sets_tracks,
+        )
+
     # ピッチごとにインターバルをソートし、重なりをマージする
     for pitch_value, intervals in enumerate(raw_by_pitch):
         if not intervals:
             continue
-        intervals.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        intervals.sort(key=lambda item: (item[0], item[1], item[3], item[4], item[2]))
         sanitized: list[list[int | bool | float]] = []
-        for begin, end, has_onset, has_offset, onset_off, offset_off in intervals:
+        for begin, end, _, has_onset, has_offset, onset_off, offset_off in intervals:
             # 重複がある場合、前のインターバルを切り詰めるかマージする
             if sanitized and begin <= sanitized[-1][1]:
                 prev_begin = int(sanitized[-1][0])
@@ -587,11 +651,20 @@ def build_pitch_interval_targets(
         for begin, end, has_onset, has_offset, onset_off, offset_off in sanitized:
             if int(begin) > int(end):
                 continue
+            instrument_ids = sorted(
+                {
+                    int(instrument_id)
+                    for raw_begin, raw_end, instrument_id, *_ in intervals
+                    if not (int(raw_end) < int(begin) or int(raw_begin) > int(end))
+                    and 0 <= int(instrument_id) < NUM_INSTRUMENT_CLASSES
+                }
+            )
             pitch_intervals[pitch_value].append((int(begin), int(end)))
             has_onset_tracks[pitch_value].append(bool(has_onset))
             has_offset_tracks[pitch_value].append(bool(has_offset))
             onset_offsets_tracks[pitch_value].append(float(onset_off))
             offset_offsets_tracks[pitch_value].append(float(offset_off))
+            instrument_sets_tracks[pitch_value].append(tuple(instrument_ids))
 
     return PitchIntervalTargets(
         intervals=pitch_intervals,
@@ -599,6 +672,7 @@ def build_pitch_interval_targets(
         has_offset=has_offset_tracks,
         onset_offsets=onset_offsets_tracks,
         offset_offsets=offset_offsets_tracks,
+        instrument_sets=instrument_sets_tracks,
     )
 
 
@@ -651,6 +725,7 @@ class StemDataset(Dataset):
         n_fft: int = 2048,
         hop_length: int = 512,
         sample_rate: int = 22050,
+        num_pitch_slots: int = 1,
         p_intra_drop: float = 0.2,
         p_cross_mix: float = 0.1,
         p_cross_mix_decay: float = 0.3,
@@ -666,6 +741,7 @@ class StemDataset(Dataset):
         self.n_fft = int(n_fft)
         self.hop_length = int(hop_length)
         self.sample_rate = int(sample_rate)
+        self.num_pitch_slots = max(1, int(num_pitch_slots))
         # 同一曲からのステムを落とす確率
         self.p_intra_drop = float(p_intra_drop)
         # 別の曲からのステムを混ぜる確率
@@ -679,9 +755,7 @@ class StemDataset(Dataset):
         self.ir_folder = ir_folder
         self.noise_folder = noise_folder
         self.group_augmentors: dict[str, AudioAugmentor | None] = {}
-        self.drum_augmentor = self._build_audio_augmentor(
-            distortion_augmentations=None
-        )
+        self.drum_augmentor = self._build_audio_augmentor(distortion_augmentations=None)
 
         self.p_drum_mix = float(p_drum_mix)
         self.drum_files: list[str] = []
@@ -702,7 +776,9 @@ class StemDataset(Dataset):
         self.stems_by_song = defaultdict(list)
         self.all_stems = []
         # 同じ元stemの pitch shift バリエーションを引くための索引
-        self.pitch_shift_stems_by_group: dict[tuple[str, str], dict[int, dict[str, Any]]] = defaultdict(dict)
+        self.pitch_shift_stems_by_group: dict[
+            tuple[str, str], dict[int, dict[str, Any]]
+        ] = defaultdict(dict)
 
         # データセットグループ: [{name, song_names, weight}, ...]
         self.dataset_groups: list[dict] = []
@@ -883,9 +959,9 @@ class StemDataset(Dataset):
                 pitch_shift_base_name, pitch_shift_value = _split_pitch_shift_suffix(
                     wav_rel_no_suffix.name
                 )
-                pitch_shift_group_key = (
-                    wav_rel_no_suffix.with_name(pitch_shift_base_name).as_posix()
-                )
+                pitch_shift_group_key = wav_rel_no_suffix.with_name(
+                    pitch_shift_base_name
+                ).as_posix()
                 # プレフィクス付きの曲名でデータセット間の名前衝突を防ぐ
                 song_name = row["song_name"]
                 if song_name_prefix:
@@ -1003,9 +1079,11 @@ class StemDataset(Dataset):
                         extra_inst = _get_instrument_name(extra_stem["stem_name"])
                         # 同じ楽器は追加しない
                         if extra_inst not in base_instruments:
-                            stem_window_start_ms = self.window_selector.select_stem_window_start_ms(
-                                stem=extra_stem,
-                                rng=rng,
+                            stem_window_start_ms = (
+                                self.window_selector.select_stem_window_start_ms(
+                                    stem=extra_stem,
+                                    rng=rng,
+                                )
                             )
                             active_stems_with_offset.append(
                                 (extra_stem, stem_window_start_ms)
@@ -1126,11 +1204,13 @@ class StemDataset(Dataset):
             active_start_ms=merged_notes.start_ms,
             active_end_ms=merged_notes.end_ms,
             active_pitch=merged_notes.pitch,
+            active_instrument=merged_notes.instrument,
             active_has_onset=merged_notes.has_onset,
             active_has_offset=merged_notes.has_offset,
             sample_rate=self.sample_rate,
             hop_length=self.hop_length,
             num_frames=self.model_frames,
+            num_pitch_slots=self.num_pitch_slots,
         )
 
         # オーディオの有効長を計算 (ゼロ埋めされていない実際の長さ)

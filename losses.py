@@ -5,7 +5,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from models.interval_boundaries import gather_boundary_targets
+from models.interval_boundaries import (
+    gather_boundary_targets,
+    gather_instrument_targets,
+)
 from models.model import AudioSemiCRFTransformer
 from models.semi_crf import compute_pitch_interval_loss
 
@@ -53,7 +56,6 @@ def compute_losses(
         dtype=torch.long,
     )
 
-    # Note: frame_valid_mask is extracted from outputs in this new architecture, not batch
     frame_valid_mask = outputs.get("frame_valid_mask")
     interval_query = outputs.get("interval_query")
     interval_key = outputs.get("interval_key")
@@ -141,7 +143,6 @@ def compute_losses(
             offset_targets = offset_targets * 0.99 + 0.005
 
             offset_dist = torch.distributions.ContinuousBernoulli(logits=offset_logits)
-            # sum over the two offset dimensions, and average over all boundaries in the batch
             interval_offset_loss = (
                 -offset_dist.log_prob(offset_targets).sum(dim=-1).mean()
             )
@@ -157,45 +158,81 @@ def compute_losses(
                 + interval_offset_loss * interval_offset_loss_weight
             )
 
-    instrument_logits = outputs.get("instrument_logits")
-    instrument_targets = batch.get("frame_instrument_targets")
-    frame_active_targets = batch.get("frame_active_targets")
-
+    instrument_features = outputs.get("instrument_features")
     if (
-        instrument_logits is not None
-        and instrument_targets is not None
-        and frame_active_targets is not None
+        model is not None
+        and model.supports_interval_instruments()
+        and instrument_features is not None
     ):
-        device = instrument_logits.device
-        instrument_targets = instrument_targets.to(device)
-        frame_active_targets = frame_active_targets.to(device)
-
-        # アクティブなフレーム・ピッチだけを抽出して楽器分類ロスを計算する。
-        mask = frame_active_targets > 0.5
-        # frame_valid_mask がある場合は、有効な音声長の範囲だけに制限する。
-        if frame_valid_mask is not None:
-            # frame_valid_mask: [B, T]
-            # mask: [B, T, 88]
-            valid_mask_expanded = frame_valid_mask.unsqueeze(-1)
-            mask = mask & valid_mask_expanded
-
-        # 楽器ラベルがないデータセットのサンプルをマスクから除外する
-        mask_instrument_loss_flag = batch.get("mask_instrument_loss")
-        if mask_instrument_loss_flag is not None:
-            # mask_instrument_loss_flag: [B] (True = ロス計算しない)
-            # mask: [B, T, 88] → 対象サンプルの全フレーム・ピッチを False にする
-            exclude_mask = mask_instrument_loss_flag.to(device).view(-1, 1, 1)
-            mask = mask & ~exclude_mask
-
-        if mask.sum() > 0:
-            active_logits = instrument_logits[mask]  # [N, C]
-            active_targets = instrument_targets[mask]  # [N, C]
-
-            instrument_loss = F.binary_cross_entropy_with_logits(
-                active_logits, active_targets
+        interval_instrument_logits, interval_instrument_entries = (
+            model.predict_interval_instruments(
+                instrument_features,
+                [target.intervals for target in interval_targets],
             )
+        )
+        if interval_instrument_entries:
+            interval_instrument_targets = gather_instrument_targets(
+                interval_targets,
+                interval_instrument_entries,
+                num_instruments=int(model.config.num_instrument_classes),
+                device=interval_instrument_logits.device,
+            )
+            if interval_instrument_targets.numel() > 0:
+                entry_mask = torch.ones(
+                    int(interval_instrument_targets.shape[0]),
+                    device=interval_instrument_logits.device,
+                    dtype=torch.bool,
+                )
+                mask_instrument_loss_flag = batch.get("mask_instrument_loss")
+                if mask_instrument_loss_flag is not None:
+                    exclude_mask = mask_instrument_loss_flag.to(
+                        interval_instrument_logits.device
+                    )
+                    entry_batch_indices = torch.tensor(
+                        [entry[0] for entry in interval_instrument_entries],
+                        device=interval_instrument_logits.device,
+                        dtype=torch.long,
+                    )
+                    entry_mask = entry_mask & ~exclude_mask[entry_batch_indices]
 
-        total_loss = total_loss + (instrument_loss * instrument_loss_weight)
+                if bool(torch.any(entry_mask).item()):
+                    instrument_loss = F.binary_cross_entropy_with_logits(
+                        interval_instrument_logits[entry_mask],
+                        interval_instrument_targets[entry_mask],
+                    )
+                    total_loss = total_loss + (instrument_loss * instrument_loss_weight)
+    else:
+        instrument_logits = outputs.get("instrument_logits")
+        instrument_targets = batch.get("frame_instrument_targets")
+        frame_active_targets = batch.get("frame_active_targets")
+
+        if (
+            instrument_logits is not None
+            and instrument_targets is not None
+            and frame_active_targets is not None
+        ):
+            device = instrument_logits.device
+            instrument_targets = instrument_targets.to(device)
+            frame_active_targets = frame_active_targets.to(device)
+
+            mask = frame_active_targets > 0.5
+            if frame_valid_mask is not None:
+                valid_mask_expanded = frame_valid_mask.unsqueeze(-1)
+                mask = mask & valid_mask_expanded
+
+            mask_instrument_loss_flag = batch.get("mask_instrument_loss")
+            if mask_instrument_loss_flag is not None:
+                exclude_mask = mask_instrument_loss_flag.to(device).view(-1, 1, 1)
+                mask = mask & ~exclude_mask
+
+            if mask.sum() > 0:
+                active_logits = instrument_logits[mask]
+                active_targets = instrument_targets[mask]
+                instrument_loss = F.binary_cross_entropy_with_logits(
+                    active_logits, active_targets
+                )
+
+            total_loss = total_loss + (instrument_loss * instrument_loss_weight)
 
     return total_loss, {
         "total_loss": total_loss,

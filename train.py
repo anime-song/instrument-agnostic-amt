@@ -157,6 +157,12 @@ def main():
         "--window_ms", type=int, default=8000, help="Audio window size in milliseconds"
     )
     parser.add_argument(
+        "--num_pitch_slots",
+        type=int,
+        default=4,
+        help="Number of deterministic pitch slots used to separate same-pitch overlaps.",
+    )
+    parser.add_argument(
         "--no_amp", action="store_true", help="Disable mixed precision training"
     )
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
@@ -296,6 +302,7 @@ def main():
         dataset_config_path=args.dataset_config,
         window_ms=args.window_ms,
         sample_rate=args.sample_rate,
+        num_pitch_slots=args.num_pitch_slots,
         p_intra_drop=args.p_intra_drop,
         p_cross_mix=args.p_cross_mix,
         max_cross_stems=args.max_cross_stems,
@@ -418,6 +425,7 @@ def main():
         sample_rate=dataset.sample_rate,
         hop_length=dataset.hop_length,
         n_fft=dataset.n_fft,
+        num_pitch_slots=args.num_pitch_slots,
         spec_augment_params=spec_augment_params if args.sa_p > 0.0 else None,
         use_beat_head=beat_dataset is not None,
         num_meter_classes=(
@@ -447,20 +455,17 @@ def main():
             # 'model_state_dict'キーがあればそれを、なければ辞書全体をロード
             state_dict = checkpoint.get("model_state_dict", checkpoint)
 
-            if config.use_beat_head or config.use_chord_head:
-                incompatible = model.load_state_dict(state_dict, strict=False)
-                if incompatible.missing_keys:
-                    logger.info(
-                        "Missing keys while loading checkpoint, initialized randomly: %s",
-                        incompatible.missing_keys,
-                    )
-                if incompatible.unexpected_keys:
-                    logger.warning(
-                        "Unexpected keys while loading checkpoint: %s",
-                        incompatible.unexpected_keys,
-                    )
-            else:
-                model.load_state_dict(state_dict)
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys:
+                logger.info(
+                    "Missing keys while loading checkpoint, initialized randomly: %s",
+                    incompatible.missing_keys,
+                )
+            if incompatible.unexpected_keys:
+                logger.warning(
+                    "Unexpected keys while loading checkpoint: %s",
+                    incompatible.unexpected_keys,
+                )
             logger.info("Weights initialized successfully.")
         else:
             logger.error(f"Checkpoint not found at {args.init_from}")

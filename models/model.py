@@ -11,7 +11,10 @@ from instrument_classes import NUM_INSTRUMENT_CLASSES
 
 from .transcription_model import AudioFeatureExtractor, Backbone
 
-from .interval_boundaries import gather_interval_endpoint_features
+from .interval_boundaries import (
+    gather_interval_endpoint_features,
+    gather_interval_sequence_features,
+)
 from .beat import BeatHead
 from .chord import ChordHead
 
@@ -33,17 +36,18 @@ class SemiCRFModelConfig:
     cqt_n_bins: int = 312
     cqt_bins_per_octave: int = 36
     cqt_filter_scale: float = 0.475
-    harmonics: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 5.0)
+    harmonics: tuple[float, ...] = (1.0,)
     harmonic_dropout_p: float = 0.0
     cqt_log_scale: bool = False
     spec_augment_params: dict[str, float | int] | None = None
-    hidden_size: int = 384
+    hidden_size: int = 512
     base_ch: int = 64
     encoder_num_layers: int = 6
-    encoder_num_heads: int = 12
+    encoder_num_heads: int = 16
     dropout: float = 0.1
     use_gradient_checkpoint: bool = True
     pitch_query_count: int = 88
+    num_pitch_slots: int = 1
     semi_crf_head_dim: int = 256
     semi_crf_length_scaling: str = "none"
     semi_crf_length_penalty: float = 0.0
@@ -124,11 +128,48 @@ class IntervalBoundaryPredictor(nn.Module):
         return self.net(interval_features)
 
 
+class IntervalInstrumentPredictor(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        num_instrument_classes: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+        if num_instrument_classes <= 0:
+            raise ValueError("num_instrument_classes must be positive")
+
+        self.input_dim = int(input_dim)
+        self.num_instrument_classes = int(num_instrument_classes)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.input_dim * 4 + 1),
+            nn.Linear(self.input_dim * 4 + 1, self.input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.input_dim, self.num_instrument_classes),
+        )
+
+    def forward(self, interval_features: torch.Tensor) -> torch.Tensor:
+        if interval_features.dim() != 2:
+            raise ValueError("interval_features must have shape [N, D]")
+        if int(interval_features.shape[-1]) != self.input_dim * 4 + 1:
+            raise ValueError(
+                "interval_features last dimension does not match the configured "
+                f"input size ({interval_features.shape[-1]} vs {self.input_dim * 4 + 1})"
+            )
+        return self.net(interval_features)
+
+
 class AudioSemiCRFTransformer(nn.Module):
     def __init__(self, config: SemiCRFModelConfig) -> None:
         super().__init__()
         if config.pitch_query_count <= 0:
             raise ValueError("pitch_query_count must be positive")
+        if config.num_pitch_slots <= 0:
+            raise ValueError("num_pitch_slots must be positive")
         if config.semi_crf_head_dim <= 0:
             raise ValueError("semi_crf_head_dim must be positive")
         if config.semi_crf_length_scaling not in {"linear", "sqrt", "none"}:
@@ -173,6 +214,10 @@ class AudioSemiCRFTransformer(nn.Module):
             input_dim=self.backbone.query_feature_dim,
             dropout=config.dropout,
         )
+        self.slot_embedding = nn.Embedding(
+            config.num_pitch_slots,
+            self.backbone.query_feature_dim,
+        )
         self.interval_scorer = IntervalScorer(
             input_dim=self.backbone.query_feature_dim,
             head_dim=config.semi_crf_head_dim,
@@ -184,6 +229,11 @@ class AudioSemiCRFTransformer(nn.Module):
             )
             if config.use_interval_boundary_head
             else None
+        )
+        self.interval_instrument_predictor = IntervalInstrumentPredictor(
+            input_dim=self.backbone.query_feature_dim,
+            num_instrument_classes=config.num_instrument_classes,
+            dropout=config.dropout,
         )
         self.instrument_classifier = nn.Linear(
             self.backbone.query_feature_dim, config.num_instrument_classes
@@ -232,6 +282,37 @@ class AudioSemiCRFTransformer(nn.Module):
     def supports_interval_boundaries(self) -> bool:
         return self.interval_boundary_predictor is not None
 
+    def supports_interval_instruments(self) -> bool:
+        return self.interval_instrument_predictor is not None
+
+    def _expand_pitch_features_with_slots(
+        self,
+        pitch_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if pitch_features.dim() != 4:
+            raise ValueError("pitch_features must have shape [B, T, P, D]")
+        if int(self.config.num_pitch_slots) <= 1:
+            return pitch_features
+
+        batch_size, time_steps, num_pitches, feature_dim = pitch_features.shape
+        slot_embeddings = self.slot_embedding.weight.to(
+            device=pitch_features.device,
+            dtype=pitch_features.dtype,
+        )
+        expanded = pitch_features.unsqueeze(3) + slot_embeddings.view(
+            1,
+            1,
+            1,
+            int(self.config.num_pitch_slots),
+            feature_dim,
+        )
+        return expanded.reshape(
+            batch_size,
+            time_steps,
+            num_pitches * int(self.config.num_pitch_slots),
+            feature_dim,
+        )
+
     def predict_interval_boundaries(
         self,
         pitch_query_features: torch.Tensor,
@@ -247,6 +328,29 @@ class AudioSemiCRFTransformer(nn.Module):
         if not entries:
             return pitch_query_features.new_zeros((0, 4)), []
         return self.interval_boundary_predictor(interval_features), entries
+
+    def predict_interval_instruments(
+        self,
+        pitch_query_features: torch.Tensor,
+        interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+    ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
+        if self.interval_instrument_predictor is None:
+            empty = pitch_query_features.new_zeros(
+                (0, int(self.config.num_instrument_classes))
+            )
+            return empty, []
+        interval_features, entries = gather_interval_sequence_features(
+            pitch_query_features,
+            interval_batch,
+        )
+        if not entries:
+            return (
+                pitch_query_features.new_zeros(
+                    (0, int(self.config.num_instrument_classes))
+                ),
+                [],
+            )
+        return self.interval_instrument_predictor(interval_features), entries
 
     def _build_frame_valid_mask(
         self,
@@ -313,24 +417,30 @@ class AudioSemiCRFTransformer(nn.Module):
         if include_amt:
             interval_features = self.interval_adapter(pitch_query_features)
             instrument_features = self.instrument_adapter(pitch_query_features)
-            interval_query, interval_key, interval_diag = self.interval_scorer(
+            interval_track_features = self._expand_pitch_features_with_slots(
                 interval_features
             )
+            instrument_track_features = self._expand_pitch_features_with_slots(
+                instrument_features
+            )
+            interval_query, interval_key, interval_diag = self.interval_scorer(
+                interval_track_features
+            )
+            instrument_logits = self.instrument_classifier(instrument_features)
             frame_valid_mask = self._build_frame_valid_mask(
                 batch_size=int(waveform.shape[0]),
                 num_frames=int(interval_query.shape[1]),
                 valid_audio_frames=valid_audio_frames,
                 device=waveform.device,
             )
-            instrument_logits = self.instrument_classifier(instrument_features)
 
             outputs.update(
                 {
                     "interval_query": interval_query,
                     "interval_key": interval_key,
                     "interval_diag": interval_diag,
-                    "interval_features": interval_features,
-                    "instrument_features": instrument_features,
+                    "interval_features": interval_track_features,
+                    "instrument_features": instrument_track_features,
                     "instrument_logits": instrument_logits,
                     "frame_valid_mask": frame_valid_mask,
                 }

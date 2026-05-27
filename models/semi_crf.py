@@ -407,7 +407,7 @@ def _expand_track_lengths(
     if lengths.dim() != 1 or int(lengths.shape[0]) != batch_size:
         raise ValueError(
             f"valid_lengths must have shape [{batch_size}], got {tuple(lengths.shape)}"
-    )
+        )
     return lengths.unsqueeze(1).expand(batch_size, num_pitches).reshape(-1)
 
 
@@ -459,8 +459,7 @@ def _flatten_interval_diag(
         interval_diag = interval_diag.squeeze(-1)
     if interval_diag.shape != (batch_size, time_steps, num_pitches):
         raise ValueError(
-            "interval_diag must have shape [B, T, P], "
-            f"got {tuple(interval_diag.shape)}"
+            f"interval_diag must have shape [B, T, P], got {tuple(interval_diag.shape)}"
         )
     return interval_diag.permute(1, 0, 2).reshape(
         time_steps,

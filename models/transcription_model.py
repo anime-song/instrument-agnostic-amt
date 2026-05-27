@@ -266,6 +266,9 @@ class BackboneOutput:
     band_features: torch.Tensor  # [B, num_bands, T, D]
     global_features: Optional[torch.Tensor]  # [B, T, D] or None
     pitch_query_features: torch.Tensor  # [B, T, num_pitch_queries, D]
+    lowres_band_features: torch.Tensor  # [B, T/8, num_bands, D]
+    lowres_global_features: Optional[torch.Tensor]  # [B, T/8, D] or None
+    lowres_pitch_query_features: torch.Tensor  # [B, T/8, num_pitch_queries, D]
 
 
 def checkpoint(
@@ -371,6 +374,67 @@ class StemConv(nn.Module):
         return x
 
 
+class PixelUnshuffleStem(nn.Module):
+    """
+    入力:
+        x: [B, in_ch, T, F]
+
+    出力:
+        y: [B, 4 * base_ch, ceil(T/8), ceil(F/4)]
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        base_ch: int,
+        n_bins: int = 312,
+        time_downsample: int = 8,
+        freq_downsample: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if in_ch <= 0:
+            raise ValueError("in_ch must be positive")
+        if base_ch <= 0:
+            raise ValueError("base_ch must be positive")
+        if time_downsample <= 0 or freq_downsample <= 0:
+            raise ValueError("downsample factors must be positive")
+
+        self.time_downsample = int(time_downsample)
+        self.freq_downsample = int(freq_downsample)
+        self.out_ch = base_ch * 4
+        self.out_freq_bins = math.ceil(n_bins / self.freq_downsample)
+
+        patch_dim = in_ch * self.time_downsample * self.freq_downsample
+        self.proj = nn.Conv2d(patch_dim, self.out_ch, kernel_size=1)
+        self.norm = nn.GroupNorm(4, self.out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.freq_embed = nn.Parameter(
+            torch.zeros(1, self.out_ch, 1, self.out_freq_bins)
+        )
+        nn.init.normal_(self.freq_embed, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, time_steps, freq_bins = x.shape
+        pad_t = (-time_steps) % self.time_downsample
+        pad_f = (-freq_bins) % self.freq_downsample
+        if pad_t > 0 or pad_f > 0:
+            x = F.pad(x, (0, pad_f, 0, pad_t))
+
+        # Anisotropic pixel unshuffle for [T, F] -> [T/8, F/4].
+        x = einops.rearrange(
+            x,
+            "b c (t pt) (f pf) -> b (c pt pf) t f",
+            pt=self.time_downsample,
+            pf=self.freq_downsample,
+        )
+        x = self.proj(x) + self.freq_embed[:, :, :, : x.shape[-1]]
+        x = self.norm(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+        return x
+
+
 class PitchQueryEmbedding(nn.Module):
     def __init__(self, num_pitch=88, dim=160):
         super().__init__()
@@ -433,7 +497,7 @@ class Backbone(nn.Module):
         self.model_dim = hidden_size
 
         # Stem は時間方向を 1/8 に、周波数方向を 1/4 に圧縮する。
-        self.stem = StemConv(
+        self.stem = PixelUnshuffleStem(
             in_ch=self.num_audio_channels,
             base_ch=base_ch,
             n_bins=self.n_bins,
@@ -584,13 +648,19 @@ class Backbone(nn.Module):
         pitch_part = self._match_time_length(pitch_part, target_T)
         # pitch_part: [B, P, T_out, D]
 
+        lowres_global_features = None
+        if global_part is not None:
+            lowres_global_features = global_part.squeeze(2).contiguous()
+
         global_features = None
         if global_part is not None:
             if self.global_up_conv is None:
                 raise RuntimeError("global_up_conv must be initialized")
             global_part = einops.rearrange(global_part, "b t g d -> (b g) d t")
             global_part = self.global_up_conv(global_part)
-            global_part = einops.rearrange(global_part, "(b g) d t -> b g t d", b=B, g=1)
+            global_part = einops.rearrange(
+                global_part, "(b g) d t -> b g t d", b=B, g=1
+            )
             global_part = self._match_time_length(global_part, target_T)
             global_features = global_part.squeeze(1).contiguous()
 
@@ -598,4 +668,7 @@ class Backbone(nn.Module):
             band_features=band_part.permute(0, 2, 1, 3).contiguous(),
             global_features=global_features,
             pitch_query_features=pitch_part.permute(0, 2, 1, 3).contiguous(),
+            lowres_band_features=band_part.contiguous(),
+            lowres_global_features=lowres_global_features,
+            lowres_pitch_query_features=x[:, :, pitch_start:, :].contiguous(),
         )
