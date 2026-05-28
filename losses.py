@@ -13,6 +13,34 @@ from models.model import AudioSemiCRFTransformer
 from models.semi_crf import compute_pitch_interval_loss
 
 
+def _normalize_instrument_loss_type(loss_type: str) -> str:
+    normalized = str(loss_type).strip().lower()
+    if normalized not in {"bce", "ce"}:
+        raise ValueError(f"Unsupported instrument_loss_type: {loss_type}")
+    return normalized
+
+
+def _compute_instrument_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    loss_type: str,
+) -> torch.Tensor:
+    normalized_loss_type = _normalize_instrument_loss_type(loss_type)
+    if logits.numel() == 0 or targets.numel() == 0:
+        return logits.sum() * 0.0
+
+    if normalized_loss_type == "bce":
+        return F.binary_cross_entropy_with_logits(logits, targets)
+
+    positive_counts = targets.sum(dim=-1)
+    valid_mask = positive_counts == 1.0
+    if not bool(torch.any(valid_mask).item()):
+        return logits.sum() * 0.0
+    class_targets = targets.argmax(dim=-1)
+    return F.cross_entropy(logits[valid_mask], class_targets[valid_mask])
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor | None],
     batch: dict[str, Any],
@@ -55,6 +83,13 @@ def compute_losses(
     )
     instrument_loss_weight = (
         1.0 if args is None else float(getattr(args, "instrument_loss_weight", 1.0))
+    )
+    instrument_loss_type = (
+        "bce"
+        if args is None
+        else _normalize_instrument_loss_type(
+            getattr(args, "instrument_loss_type", "bce")
+        )
     )
     interval_boundary_loss = outputs["interval_query"].sum() * 0.0
     interval_presence_loss = outputs["interval_query"].sum() * 0.0
@@ -208,9 +243,10 @@ def compute_losses(
                     entry_mask = entry_mask & ~exclude_mask[entry_batch_indices]
 
                 if bool(torch.any(entry_mask).item()):
-                    instrument_loss = F.binary_cross_entropy_with_logits(
+                    instrument_loss = _compute_instrument_loss(
                         interval_instrument_logits[entry_mask],
                         interval_instrument_targets[entry_mask],
+                        loss_type=instrument_loss_type,
                     )
                     total_loss = total_loss + (instrument_loss * instrument_loss_weight)
     else:
@@ -240,8 +276,10 @@ def compute_losses(
             if mask.sum() > 0:
                 active_logits = instrument_logits[mask]
                 active_targets = instrument_targets[mask]
-                instrument_loss = F.binary_cross_entropy_with_logits(
-                    active_logits, active_targets
+                instrument_loss = _compute_instrument_loss(
+                    active_logits,
+                    active_targets,
+                    loss_type=instrument_loss_type,
                 )
 
             total_loss = total_loss + (instrument_loss * instrument_loss_weight)

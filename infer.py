@@ -50,12 +50,29 @@ class InferenceSettings:
     track_batch_size: int
     length_scaling: str
     length_penalty: float
+    instrument_probability_mode: str
 
 
 def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
     if dtype_str == "bf16":
         return torch.bfloat16
     return torch.float16
+
+
+def _normalize_instrument_probability_mode(mode: str | None) -> str:
+    normalized = "sigmoid" if mode is None else str(mode).strip().lower()
+    if normalized in {"bce", "sigmoid"}:
+        return "sigmoid"
+    if normalized in {"ce", "softmax"}:
+        return "softmax"
+    raise ValueError(f"Unsupported instrument probability mode: {mode}")
+
+
+def _instrument_probabilities(logits: torch.Tensor, *, mode: str) -> torch.Tensor:
+    probability_mode = _normalize_instrument_probability_mode(mode)
+    if probability_mode == "softmax":
+        return torch.softmax(logits, dim=-1)
+    return torch.sigmoid(logits)
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -456,12 +473,16 @@ def _load_model_and_settings(
     track_batch_size = (
         int(track_batch_size_override) if track_batch_size_override is not None else 128
     )
+    instrument_probability_mode = _normalize_instrument_probability_mode(
+        raw_args.get("instrument_loss_type", "bce")
+    )
     settings = InferenceSettings(
         window_ms=window_ms,
         stride_ms=stride_ms,
         track_batch_size=track_batch_size,
         length_scaling=str(model_config.semi_crf_length_scaling),
         length_penalty=float(model_config.semi_crf_length_penalty),
+        instrument_probability_mode=instrument_probability_mode,
     )
     return model, model_config, settings
 
@@ -571,6 +592,7 @@ class PitchFirstNoteStitcher:
         velocity: int,
         merge_gap_frames: int,
         merge_onset_frames: int,
+        instrument_probability_mode: str,
     ) -> None:
         # 1. 推論設定
         self.hop_length = int(hop_length)
@@ -579,6 +601,9 @@ class PitchFirstNoteStitcher:
         self.velocity = int(velocity)
         self.merge_gap_frames = int(merge_gap_frames)
         self.merge_onset_frames = int(merge_onset_frames)
+        self.instrument_probability_mode = _normalize_instrument_probability_mode(
+            instrument_probability_mode
+        )
 
         # 2. 窓またぎ状態
         self.notes_by_track: dict[int, list[PredictedNote]] = defaultdict(list)
@@ -776,7 +801,10 @@ class PitchFirstNoteStitcher:
         pitch_index, _ = self._track_to_pitch_slot(int(track_index))
         note_logits = instrument_logits[interval_start:interval_end, pitch_index, :]
         note_prob_sum = (
-            torch.sigmoid(note_logits)
+            _instrument_probabilities(
+                note_logits,
+                mode=self.instrument_probability_mode,
+            )
             .sum(dim=0)
             .float()
             .detach()
@@ -1013,6 +1041,7 @@ def _decode_interval_instrument_logits(
     *,
     batch_size: int,
     num_tracks: int,
+    probability_mode: str,
 ) -> list[list[list[tuple[np.ndarray, int]]]]:
     stats: list[list[list[tuple[np.ndarray, int]]]] = [
         [[] for _ in range(num_tracks)] for _ in range(batch_size)
@@ -1021,7 +1050,10 @@ def _decode_interval_instrument_logits(
         return stats
 
     interval_probs = (
-        torch.sigmoid(interval_instrument_logits.float())
+        _instrument_probabilities(
+            interval_instrument_logits.float(),
+            mode=probability_mode,
+        )
         .detach()
         .cpu()
         .numpy()
@@ -1402,6 +1434,7 @@ def run_inference(
         velocity=int(velocity),
         merge_gap_frames=merge_gap_frames,
         merge_onset_frames=merge_onset_frames,
+        instrument_probability_mode=settings.instrument_probability_mode,
     )
 
     # 2. ノート処理とは独立に、補助タスク用ロジットの集約バッファを用意する。
@@ -1544,6 +1577,7 @@ def run_inference(
                 interval_instrument_entries,
                 batch_size=len(active_batch_starts),
                 num_tracks=num_tracks,
+                probability_mode=settings.instrument_probability_mode,
             )
 
         sample_logits_batch = outputs.get("instrument_logits")

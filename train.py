@@ -186,6 +186,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--instrument_loss_type",
+        choices=("bce", "ce"),
+        default="bce",
+        help=(
+            "Instrument loss type. Use 'bce' for multi-label BCE or 'ce' for "
+            "single-label softmax cross-entropy."
+        ),
+    )
+    parser.add_argument(
         "--no_amp", action="store_true", help="Disable mixed precision training"
     )
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")

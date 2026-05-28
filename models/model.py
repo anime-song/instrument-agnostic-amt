@@ -36,14 +36,14 @@ class SemiCRFModelConfig:
     cqt_n_bins: int = 312
     cqt_bins_per_octave: int = 36
     cqt_filter_scale: float = 0.475
-    harmonics: tuple[float, ...] = (1.0,)
+    harmonics: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 5.0)
     harmonic_dropout_p: float = 0.0
     cqt_log_scale: bool = False
     spec_augment_params: dict[str, float | int] | None = None
-    hidden_size: int = 512
+    hidden_size: int = 384
     base_ch: int = 64
     encoder_num_layers: int = 6
-    encoder_num_heads: int = 16
+    encoder_num_heads: int = 12
     dropout: float = 0.1
     use_gradient_checkpoint: bool = True
     pitch_query_count: int = 88
