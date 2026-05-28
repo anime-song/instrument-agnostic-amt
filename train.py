@@ -139,7 +139,12 @@ def main():
         help="Path to dataset config YAML (dataset_config.yaml). Overrides manifest_path.",
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
+    parser.add_argument(
+        "--accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients",
+    )
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument(
         "--warmup_steps",
@@ -159,8 +164,26 @@ def main():
     parser.add_argument(
         "--num_pitch_slots",
         type=int,
-        default=4,
+        default=3,
         help="Number of deterministic pitch slots used to separate same-pitch overlaps.",
+    )
+    parser.add_argument(
+        "--semi_crf_false_negative_cost",
+        type=float,
+        default=0.0,
+        help=(
+            "Structured training cost for leaving gold-active frames uncovered. "
+            "Increase to push recall up."
+        ),
+    )
+    parser.add_argument(
+        "--semi_crf_false_positive_cost",
+        type=float,
+        default=0.0,
+        help=(
+            "Structured training cost for covering gold-silent frames with an interval. "
+            "Increase to push precision up."
+        ),
     )
     parser.add_argument(
         "--no_amp", action="store_true", help="Disable mixed precision training"

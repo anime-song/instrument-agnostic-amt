@@ -33,6 +33,16 @@ def compute_losses(
     semi_crf_loss_weight = (
         1.0 if args is None else float(getattr(args, "semi_crf_loss_weight", 1.0))
     )
+    semi_crf_false_negative_cost = (
+        0.0
+        if args is None
+        else float(getattr(args, "semi_crf_false_negative_cost", 0.0))
+    )
+    semi_crf_false_positive_cost = (
+        0.0
+        if args is None
+        else float(getattr(args, "semi_crf_false_positive_cost", 0.0))
+    )
     interval_presence_loss_weight = (
         1.0
         if args is None
@@ -96,6 +106,8 @@ def compute_losses(
             if args is None
             else int(getattr(args, "semi_crf_track_batch_size", 128))
         ),
+        false_negative_cost=semi_crf_false_negative_cost,
+        false_positive_cost=semi_crf_false_positive_cost,
     )
     semi_crf_loss = semi_crf_loss_value
     semi_crf_track_count = torch.tensor(
@@ -239,6 +251,12 @@ def compute_losses(
         "semi_crf_loss": semi_crf_loss,
         "semi_crf_track_count": semi_crf_track_count,
         "semi_crf_interval_count": semi_crf_interval_count,
+        "semi_crf_false_negative_cost": interval_query.new_tensor(
+            semi_crf_false_negative_cost
+        ),
+        "semi_crf_false_positive_cost": interval_query.new_tensor(
+            semi_crf_false_positive_cost
+        ),
         "interval_boundary_loss": interval_boundary_loss,
         "interval_presence_loss": interval_presence_loss,
         "interval_offset_loss": interval_offset_loss,

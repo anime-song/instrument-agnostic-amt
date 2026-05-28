@@ -497,7 +497,7 @@ class Backbone(nn.Module):
         self.model_dim = hidden_size
 
         # Stem は時間方向を 1/8 に、周波数方向を 1/4 に圧縮する。
-        self.stem = PixelUnshuffleStem(
+        self.stem = StemConv(
             in_ch=self.num_audio_channels,
             base_ch=base_ch,
             n_bins=self.n_bins,

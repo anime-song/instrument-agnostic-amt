@@ -590,6 +590,54 @@ def _zero_noise_score(
     )
 
 
+def _build_interval_active_cost(
+    interval_targets: IntervalBatch,
+    *,
+    length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    false_negative_cost: float,
+    false_positive_cost: float,
+) -> Optional[torch.Tensor]:
+    false_negative_cost = float(false_negative_cost)
+    false_positive_cost = float(false_positive_cost)
+    if false_negative_cost == 0.0 and false_positive_cost == 0.0:
+        return None
+    if length <= 0 or not interval_targets:
+        return None
+
+    batch_size = len(interval_targets)
+    active_mask = torch.zeros(batch_size, length, device=device, dtype=dtype)
+    for batch_index, track_intervals in enumerate(interval_targets):
+        for begin, end in track_intervals:
+            begin = max(0, int(begin))
+            end = min(int(end), length - 1)
+            if end < begin:
+                continue
+            active_mask[batch_index, begin : end + 1] = 1.0
+
+    active_prefix = F.pad(active_mask.cumsum(dim=1), (1, 0))
+    end_prefix = active_prefix[:, 1:].transpose(0, 1).unsqueeze(1)
+    begin_prefix = active_prefix[:, :-1].transpose(0, 1).unsqueeze(0)
+    true_positive_frames = end_prefix - begin_prefix
+
+    end_index = torch.arange(length, device=device)
+    begin_index = torch.arange(length, device=device)
+    interval_length = (end_index.unsqueeze(1) - begin_index.unsqueeze(0) + 1).clamp_min(
+        0
+    )
+    interval_length = interval_length.to(dtype=dtype).unsqueeze(-1)
+
+    # Up to a gold-dependent constant, this equals weighted framewise
+    # Hamming loss over the predicted active mask.
+    cost = (
+        float(false_positive_cost) * interval_length
+        - float(false_negative_cost + false_positive_cost) * true_positive_frames
+    )
+    lower_mask = _strictly_lower_triangular_mask(length, device).to(dtype=dtype)
+    return cost * lower_mask
+
+
 def compute_pitch_interval_loss(
     interval_query: torch.Tensor,
     interval_key: torch.Tensor,
@@ -600,6 +648,8 @@ def compute_pitch_interval_loss(
     length_scaling: str = "linear",
     length_penalty: float = 0.0,
     track_batch_size: int = 128,
+    false_negative_cost: float = 0.0,
+    false_positive_cost: float = 0.0,
 ) -> tuple[torch.Tensor, int, int]:
     """
     Compute pitch-wise semi-CRF NLL from interval query/key features.
@@ -611,6 +661,10 @@ def compute_pitch_interval_loss(
         interval_targets: nested intervals as [B][P][(begin, end), ...]
         valid_lengths: valid frame count per batch item, shape [B]
         track_batch_size: chunk size over flattened B*P tracks.
+        false_negative_cost:
+            Cost added during training for active frames that are left uncovered.
+        false_positive_cost:
+            Cost added during training for silent frames covered by an interval.
     """
     if interval_query.shape != interval_key.shape:
         raise ValueError(
@@ -651,7 +705,7 @@ def compute_pitch_interval_loss(
         -1,
     )
 
-    total_log_prob = interval_query.new_zeros(())
+    total_loss_sum = interval_query.new_zeros(())
     total_tracks = 0
     total_intervals = 0
     chunk_size = max(1, int(track_batch_size))
@@ -697,21 +751,34 @@ def compute_pitch_interval_loss(
                 flat_targets[int(index)] for index in chunk_indices.tolist()
             ]
             chunk_targets = _sanitize_interval_batch(chunk_targets, length=length)
-            semi_crf = NeuralSemiCRFInterval(
-                score,
-                _zero_noise_score(
-                    length,
-                    batch_size=int(chunk_indices.numel()),
-                    device=score.device,
-                ),
+            noise_score = _zero_noise_score(
+                length,
+                batch_size=int(chunk_indices.numel()),
+                device=score.device,
             )
-            total_log_prob = total_log_prob + semi_crf.logProb(chunk_targets).sum()
+            interval_cost = _build_interval_active_cost(
+                chunk_targets,
+                length=length,
+                device=score.device,
+                dtype=score.dtype,
+                false_negative_cost=false_negative_cost,
+                false_positive_cost=false_positive_cost,
+            )
+            if interval_cost is None:
+                semi_crf = NeuralSemiCRFInterval(score, noise_score)
+                chunk_loss = -semi_crf.logProb(chunk_targets)
+            else:
+                augmented_score = score + interval_cost
+                semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
+                gold_score = evalPath(chunk_targets, score, noise_score)
+                chunk_loss = semi_crf.computeLogZ() - gold_score
+            total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
 
     if total_tracks <= 0:
         return interval_query.sum() * 0.0, 0, 0
-    return -total_log_prob / float(total_tracks), total_tracks, total_intervals
+    return total_loss_sum / float(total_tracks), total_tracks, total_intervals
 
 
 @torch.no_grad()
