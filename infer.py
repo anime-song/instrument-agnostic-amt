@@ -1109,7 +1109,8 @@ def _truncate_overlapping_notes(
                 # exported MIDI track. A one-sample gap can quantize back to the
                 # same MIDI tick, which some consumers read as a sustaining note.
                 new_end_frame = int(note.start_frame) - separation_frames
-                if new_end_frame > previous_note.start_frame:
+                # 短縮後の長さが極端に短い場合は残さずに削除する
+                if new_end_frame - previous_note.start_frame >= separation_frames:
                     pitch_notes[-1] = replace(
                         previous_note,
                         end_frame=new_end_frame,
