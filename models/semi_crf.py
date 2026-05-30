@@ -510,10 +510,14 @@ def _build_interval_score(
     *,
     length_scaling: str,
     length_penalty: float = 0.0,
+    note_bias: float = 0.0,
     length_scale: Optional[torch.Tensor] = None,
     length_penalty_matrix: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     score = torch.einsum("tnd,snd->stn", interval_query, interval_key).float()
+
+    if float(note_bias) != 0.0:
+        score = score + float(note_bias)
 
     if length_scale is None and length_scaling != "none":
         length_scale = _build_length_scale(
@@ -790,6 +794,7 @@ def decode_pitch_intervals(
     *,
     length_scaling: str = "linear",
     length_penalty: float = 0.0,
+    note_bias: float = 0.0,
     track_batch_size: int = 128,
     forced_start_pos: Optional[torch.Tensor | List[int] | List[List[int]]] = None,
 ) -> PitchIntervalBatch:
@@ -870,6 +875,7 @@ def decode_pitch_intervals(
                 flat_diag[:length, chunk_indices],
                 length_scaling=length_scaling,
                 length_penalty=length_penalty,
+                note_bias=note_bias,
                 length_scale=length_scale,
                 length_penalty_matrix=length_penalty_matrix,
             )

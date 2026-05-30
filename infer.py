@@ -51,6 +51,7 @@ class InferenceSettings:
     length_scaling: str
     length_penalty: float
     instrument_probability_mode: str
+    note_bias: float = 0.0
 
 
 def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
@@ -264,6 +265,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-chord", action="store_true", help="Disable chord embedding"
     )
+    parser.add_argument(
+        "--note-bias",
+        type=float,
+        default=0.0,
+        help="Add a constant bias to the semi-CRF interval score to increase recall.",
+    )
 
     args = parser.parse_args()
 
@@ -390,6 +397,7 @@ def _load_model_and_settings(
     window_ms_override: int | None,
     stride_ms_override: int | None,
     track_batch_size_override: int | None,
+    note_bias: float = 0.0,
 ) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig, InferenceSettings]:
     checkpoint = torch.load(
         checkpoint_path,
@@ -484,6 +492,7 @@ def _load_model_and_settings(
         length_scaling=str(model_config.semi_crf_length_scaling),
         length_penalty=float(model_config.semi_crf_length_penalty),
         instrument_probability_mode=instrument_probability_mode,
+        note_bias=float(note_bias),
     )
     return model, model_config, settings
 
@@ -1536,6 +1545,7 @@ def run_inference(
                 valid_lengths[sample_index : sample_index + 1],
                 length_scaling=settings.length_scaling,
                 length_penalty=settings.length_penalty,
+                note_bias=settings.note_bias,
                 track_batch_size=settings.track_batch_size,
                 forced_start_pos=[forced_start_pos],
             )
@@ -1919,6 +1929,7 @@ def main() -> None:
         window_ms_override=args.window_ms,
         stride_ms_override=args.stride_ms,
         track_batch_size_override=args.semi_crf_track_batch_size,
+        note_bias=args.note_bias,
     )
 
     # 処理対象ファイルリストの構築
