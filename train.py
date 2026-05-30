@@ -487,6 +487,32 @@ def main():
             # 'model_state_dict'キーがあればそれを、なければ辞書全体をロード
             state_dict = checkpoint.get("model_state_dict", checkpoint)
 
+            model_state = model.state_dict()
+            for key in list(state_dict.keys()):
+                if key in model_state:
+                    if state_dict[key].shape != model_state[key].shape:
+                        logger.warning(
+                            "Shape mismatch for %s: checkpoint %s, model %s. Adapting...",
+                            key, state_dict[key].shape, model_state[key].shape
+                        )
+                        ckpt_shape = state_dict[key].shape
+                        mod_shape = model_state[key].shape
+                        
+                        if len(ckpt_shape) == 1:
+                            min_len = min(ckpt_shape[0], mod_shape[0])
+                            new_tensor = model_state[key].clone()
+                            new_tensor[:min_len] = state_dict[key][:min_len]
+                            state_dict[key] = new_tensor
+                        elif len(ckpt_shape) == 2:
+                            min_d0 = min(ckpt_shape[0], mod_shape[0])
+                            min_d1 = min(ckpt_shape[1], mod_shape[1])
+                            new_tensor = model_state[key].clone()
+                            new_tensor[:min_d0, :min_d1] = state_dict[key][:min_d0, :min_d1]
+                            state_dict[key] = new_tensor
+                        else:
+                            logger.warning("Unsupported shape mismatch dimension %s. Skipping key %s.", len(ckpt_shape), key)
+                            del state_dict[key]
+
             incompatible = model.load_state_dict(state_dict, strict=False)
             if incompatible.missing_keys:
                 logger.info(

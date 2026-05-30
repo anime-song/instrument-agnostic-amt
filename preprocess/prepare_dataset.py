@@ -18,13 +18,23 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 MELODY_CLASS_ID = get_instrument_class_id_by_name("melody")
+VOCAL_HARMONY_CLASS_ID = get_instrument_class_id_by_name("vocal_harmony")
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
+VOCAL_HARMONY_TRACK_KEYWORDS = ("vocal_harmony", "harmony")
 DRUM_TRACK_KEYWORDS = ("drum",)
 DRUM_TRACK_NAMES = ("percussion",)
 
 
+def is_vocal_harmony_track(instrument: pretty_midi.Instrument) -> bool:
+    """MIDIトラック名に vocal_harmony または harmony が含まれるかを判定する。"""
+    name = (instrument.name or "").lower()
+    return any(keyword in name for keyword in VOCAL_HARMONY_TRACK_KEYWORDS)
+
+
 def is_melody_track(instrument: pretty_midi.Instrument) -> bool:
-    """MIDIトラック名に vocal / melody が含まれるかを判定する。"""
+    """MIDIトラック名に vocal / melody が含まれるかを判定する。ただし vocal_harmony は除外。"""
+    if is_vocal_harmony_track(instrument):
+        return False
     name = (instrument.name or "").lower()
     return any(keyword in name for keyword in MELODY_TRACK_KEYWORDS)
 
@@ -90,13 +100,16 @@ def process_stem(
 
     if midi_data is not None:
         for instrument in midi_data.instruments:
+            is_harmony = is_vocal_harmony_track(instrument)
             is_named_melody = is_melody_track(instrument)
-            if not is_named_melody and is_excluded_instrument(instrument):
+            if not is_named_melody and not is_harmony and is_excluded_instrument(instrument):
                 continue
 
-            # vocal/melody と明示されたトラックは、元のGM音色よりトラック名を優先する。
+            # vocal/melody/vocal_harmony と明示されたトラックは、元のGM音色よりトラック名を優先する。
             # これにより、Voice/Flute/Synthなどに分散していたメロディを1クラスに集約できる。
-            if is_named_melody:
+            if is_harmony:
+                inst_id = VOCAL_HARMONY_CLASS_ID
+            elif is_named_melody:
                 inst_id = MELODY_CLASS_ID
             else:
                 inst_id = get_instrument_class_id(
@@ -198,8 +211,15 @@ def process_stem(
         return None
 
     # song_name は "__" より前の部分を使う。
+    # ピッチシフトやタイムストレッチのサフィックスがある場合は別曲扱いとして付加する。
+    import re
     stem_name = wav_path.stem
-    song_name = stem_name.split("__")[0] if "__" in stem_name else stem_name
+    match = re.search(r"((?:_(?:pitch|stretch)_[^_]+)+)$", stem_name)
+    suffix = match.group(1) if match else ""
+    base_name = stem_name[:match.start()] if match else stem_name
+
+    song_name = base_name.split("__")[0] if "__" in base_name else base_name
+    song_name += suffix
 
     return {
         "song_name": song_name,

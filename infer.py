@@ -108,7 +108,8 @@ DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
     "organ": 88,
     "synth_pad": 76,
     "synth_lead": 84,
-    "melody": 98,
+    "melody": 110,
+    "vocal_harmony": 60
 }
 
 
@@ -1297,7 +1298,7 @@ def _build_midi(
 
     midi = pretty_midi.PrettyMIDI(resolution=1920)
     short_note_velocity_threshold_ms = 30.0
-    short_note_velocity_scale = 0.5
+    short_note_velocity_scale = 0.9
     min_midi_note_frames = max(
         0,
         int(round(float(min_midi_note_ms) * float(sample_rate) / 1000.0)),

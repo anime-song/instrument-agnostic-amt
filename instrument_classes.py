@@ -15,6 +15,7 @@ if not _MERGE_JSON_PATH.exists():
 # 新しい非GMクラスは末尾に追加して、既存IDをずらさない。
 EXTRA_INSTRUMENT_CLASS_PROGRAMS = {
     "melody": 65,  # 推論結果をMIDIに戻すときの代表音色は Alto Sax にする。
+    "vocal_harmony": 65,
 }
 
 INSTRUMENT_CLASSES: List[str] = []
