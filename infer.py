@@ -126,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--type",
-        choices=["default", "bass", "vocal", "guitar"],
+        choices=["default", "bass", "vocal", "guitar", "vocal_harmony"],
         default="default",
-        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model.",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model.",
     )
 
     # 単一ファイルモード
@@ -350,6 +350,9 @@ def _ensure_checkpoint(
         elif model_type == "guitar":
             checkpoint_path = Path("checkpoints/best_model_guitar.pth")
             url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_guitar.pth?download=true"
+        elif model_type == "vocal_harmony":
+            checkpoint_path = Path("checkpoints/best_model_vocal_harmony.pth")
+            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal_harmony.pth?download=true"
         else:
             checkpoint_path = DEFAULT_CHECKPOINT_PATH
             url = DEFAULT_CHECKPOINT_URL
@@ -360,6 +363,8 @@ def _ensure_checkpoint(
             url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal.pth?download=true"
         elif model_type == "guitar":
             url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_guitar.pth?download=true"
+        elif model_type == "vocal_harmony":
+            url = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main/best_model_vocal_harmony.pth?download=true"
         else:
             url = DEFAULT_CHECKPOINT_URL
 
