@@ -164,7 +164,7 @@ def main():
     parser.add_argument(
         "--num_pitch_slots",
         type=int,
-        default=3,
+        default=1,
         help="Number of deterministic pitch slots used to separate same-pitch overlaps.",
     )
     parser.add_argument(
