@@ -38,6 +38,8 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 > **Note**: There's also an experimental multi-track MIDI output with instrument classification, but classification accuracy is still limited. The core feature is instrument-agnostic pitch detection.
 
+> **Note**: Drum and percussion transcription is not supported. The model is trained to ignore unpitched percussive sounds.
+
 > **Warning**: Generalization to electric guitar (especially with distortion) is still weak, and transcription accuracy tends to be lower. The same applies to ethnic instruments (e.g. shamisen, sitar) that are underrepresented in the training data.
 
 ### Changelog
