@@ -14,6 +14,8 @@ import librosa
 import soundfile as sf
 import numpy as np
 
+from velocity_estimator import estimate_velocities_for_notes, apply_velocities_to_notes
+
 
 INSTRUMENT_CLASS_GAIN: dict[str, int] = {  
     # Percussion & Rhythm  
@@ -399,7 +401,18 @@ def run_stem_separated_transcription(
             max_note_seconds=15.0
         )
 
-        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=INSTRUMENT_CLASS_GAIN)
+        # Estimate MIDI velocities from audio amplitude
+        if notes:
+            waveform_np = waveform.cpu().numpy()
+            estimated_velocities = estimate_velocities_for_notes(
+                waveform=waveform_np,
+                notes=notes,
+                sample_rate=int(current_amt_config.sample_rate),
+                fallback_velocity=100,
+            )
+            apply_velocities_to_notes(notes, estimated_velocities)
+
+        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=None)
         midi.write(str(output_midi))
         song_midi_paths.append(output_midi)
 
