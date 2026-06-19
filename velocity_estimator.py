@@ -17,6 +17,7 @@ Pipeline:
 
 import math
 import numpy as np
+import scipy.signal.windows as win
 from typing import Sequence
 
 from instrument_classes import INSTRUMENT_CLASSES
@@ -144,7 +145,7 @@ def _precompute_stft_magnitude(
 
     # Use librosa-style STFT: sliding window → rfft per frame
     num_frames = 1 + (num_samples - n_fft) // hop_length
-    window = np.hanning(n_fft).astype(np.float64)
+    window = win.flattop(n_fft).astype(np.float64)
     stft_mag = np.zeros((num_frames, n_fft // 2 + 1), dtype=np.float32)
 
     for frame_idx in range(num_frames):
@@ -266,24 +267,16 @@ def _extract_note_top_trimmed_magnitude(
     exclusive_ranges: list[tuple[int, int]],
     shared_ranges: list[tuple[int, int, int]],
     *,
-    top_ratio: float = 0.3,
+    top_ratio: float = 0.1,
 ) -> float:
-    """Extract the representative magnitude for a note via top-trimmed mean.
+    """Extract representative magnitude via top-trimmed mean.
 
-    For each assigned STFT frame, reads the magnitude at the note's
-    fundamental bin. Collective all frame magnitudes into a list,
-    sorted descending, and averages the top `top_ratio` fraction.
+    Collects weighted magnitudes from all assigned STFT frames,
+    sorts descending, and averages the top `top_ratio` fraction.
 
-    This balances two opposing requirements:
-    - Decaying instruments (piano, plucked strings): the initial attack
-      frames are much louder; a simple mean would be dragged down by the
-      long quiet tail.
-    - Sustained instruments (strings, organ, flute): the steady-state
-      portion defines the perceived loudness; taking only the max would
-      over-emphasize transient artefacts.
-
-    By averaging the top 30%, both instrument families produce a sensible
-    "representative loudness".
+    top_ratio=0.1 means averaging the loudest 10% of frames.
+    This preserves attack peaks for percussive instruments while
+    avoiding a single-noisy-frame maximum.
 
     Args:
         stft_magnitude: [num_frames, n_fft//2+1] magnitude spectrogram.
@@ -292,7 +285,7 @@ def _extract_note_top_trimmed_magnitude(
         n_fft: FFT window size.
         exclusive_ranges: Exclusive frame intervals (full weight).
         shared_ranges: Shared frame intervals (1/num_sharers weight).
-        top_ratio: Fraction of loudest frames to average. Default 0.3.
+        top_ratio: Fraction of loudest frames to average. Default 0.1.
 
     Returns:
         Representative weighted magnitude (float).
@@ -330,7 +323,15 @@ def _extract_note_top_trimmed_magnitude(
     all_magnitudes.sort(reverse=True)
     top_count = max(1, int(round(len(all_magnitudes) * float(top_ratio))))
     top_values = all_magnitudes[:top_count]
-    return float(np.mean(top_values))
+    result = float(np.mean(top_values))
+    # Debug: print top values for this note
+    print(
+        f"  [vel-debug] pitch={pitch} frames={len(all_magnitudes)} "
+        f"top{int(float(top_ratio)*100)}%_mean={result:.4f} "
+        f"top_values={[f'{v:.4f}' for v in top_values[:5]]}"
+        f"{'...' if len(top_values) > 5 else ''}"
+    )
+    return result
 
 
 # ===========================================================================
@@ -349,9 +350,9 @@ def _magnitude_to_linear_amplitude(
     """
     if magnitude <= 0.0:
         return 0.0
-    # Hanning window coherent gain = 0.5
+    # Flat-top window coherent gain ≈ sum(window) / N ≈ 0.2156
     # FFT magnitude for real sinusoid: ~ A * N * coherent_gain / 2
-    coherent_gain = 0.5
+    coherent_gain = 0.2156
     true_amplitude = 2.0 * float(magnitude) / (float(n_fft) * coherent_gain)
     return float(np.clip(true_amplitude, 0.0, 1.0))
 
@@ -364,11 +365,11 @@ def _amplitude_to_db(amplitude: float, epsilon: float = 1e-10) -> float:
 
 def _db_to_velocity(
     db_value: float,
-    min_db: float = -48.0,
-    max_db: float = -3.0,
+    min_db: float = -60.0,
+    max_db: float = -1.0,
     min_velocity: int = 8,
     max_velocity: int = 127,
-    curve_exponent: float = 0.6,
+    curve_exponent: float = 0.4,
 ) -> int:
     """Map dBFS to MIDI velocity via power-law curve."""
     clamped = np.clip(float(db_value), float(min_db), float(max_db))
@@ -389,11 +390,11 @@ def estimate_velocities_for_notes(
     *,
     n_fft: int = 2048,
     hop_length: int = 512,
-    min_db: float = -48.0,
-    max_db: float = -3.0,
+    min_db: float = -60.0,
+    max_db: float = -1.0,
     min_velocity: int = 8,
     max_velocity: int = 127,
-    curve_exponent: float = 0.6,
+    curve_exponent: float = 0.4,
     fallback_velocity: int = 80,
 ) -> list[int]:
     """Estimate MIDI velocities for a list of PredictedNote objects.
@@ -469,17 +470,22 @@ def estimate_velocities_for_notes(
             fund_ratio = max(_get_fundamental_ratio(instrument_id), 0.01)
             corrected_mag = raw_mag / fund_ratio
 
-            # 5. Convert to dBFS → velocity
-            linear_amp = _magnitude_to_linear_amplitude(corrected_mag, n_fft)
-            db_val = _amplitude_to_db(linear_amp)
+            # 5. Convert FFT magnitude directly to dB → velocity
+            db_val = 20.0 * np.log10(max(corrected_mag, 1e-10))
+            print(
+                f"  [vel-debug] note[{i}] pitch={pitch} inst={instrument_id} "
+                f"ratio={fund_ratio:.2f} raw={raw_mag:.4f} corrected={corrected_mag:.4f} "
+                f"db={db_val:.1f}"
+            )
             velocity = _db_to_velocity(
                 db_val,
-                min_db=float(min_db),
-                max_db=float(max_db),
+                min_db=11.0,
+                max_db=42.0,
                 min_velocity=int(min_velocity),
                 max_velocity=int(max_velocity),
-                curve_exponent=float(curve_exponent),
+                curve_exponent=1.5,
             )
+            print(f"  [vel-debug] note[{i}] -> velocity={velocity}")
             velocities.append(velocity)
         except Exception:
             velocities.append(int(fallback_velocity))
