@@ -72,13 +72,14 @@ _DEFAULT_FUNDAMENTAL_RATIO: float = 0.50
 
 
 def _get_fundamental_ratio(instrument_id: int) -> float:
-    if 0 <= instrument_id < len(INSTRUMENT_CLASSES):
-        class_name = INSTRUMENT_CLASSES[instrument_id]
-        return FUNDAMENTAL_ENERGY_RATIO.get(
-            class_name.lower().replace("-", "_").replace(" ", "_"),
-            _DEFAULT_FUNDAMENTAL_RATIO,
-        )
-    return _DEFAULT_FUNDAMENTAL_RATIO
+    return 0.5
+    # if 0 <= instrument_id < len(INSTRUMENT_CLASSES):
+    #     class_name = INSTRUMENT_CLASSES[instrument_id]
+    #     return FUNDAMENTAL_ENERGY_RATIO.get(
+    #         class_name.lower().replace("-", "_").replace(" ", "_"),
+    #         _DEFAULT_FUNDAMENTAL_RATIO,
+    #     )
+    # return _DEFAULT_FUNDAMENTAL_RATIO
 
 
 # ===========================================================================
