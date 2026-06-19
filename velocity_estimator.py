@@ -479,11 +479,11 @@ def estimate_velocities_for_notes(
             )
             velocity = _db_to_velocity(
                 db_val,
-                min_db=11.0,
-                max_db=42.0,
+                min_db=0,
+                max_db=48.0,
                 min_velocity=int(min_velocity),
                 max_velocity=int(max_velocity),
-                curve_exponent=1.5,
+                curve_exponent=1.2,
             )
             print(f"  [vel-debug] note[{i}] -> velocity={velocity}")
             velocities.append(velocity)
