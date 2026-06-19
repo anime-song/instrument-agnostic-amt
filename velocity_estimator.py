@@ -325,12 +325,12 @@ def _extract_note_top_trimmed_magnitude(
     top_values = all_magnitudes[:top_count]
     result = float(np.mean(top_values))
     # Debug: print top values for this note
-    print(
-        f"  [vel-debug] pitch={pitch} frames={len(all_magnitudes)} "
-        f"top{int(float(top_ratio)*100)}%_mean={result:.4f} "
-        f"top_values={[f'{v:.4f}' for v in top_values[:5]]}"
-        f"{'...' if len(top_values) > 5 else ''}"
-    )
+    # print(
+    #     f"  [vel-debug] pitch={pitch} frames={len(all_magnitudes)} "
+    #     f"top{int(float(top_ratio)*100)}%_mean={result:.4f} "
+    #     f"top_values={[f'{v:.4f}' for v in top_values[:5]]}"
+    #     f"{'...' if len(top_values) > 5 else ''}"
+    # )
     return result
 
 
@@ -472,11 +472,11 @@ def estimate_velocities_for_notes(
 
             # 5. Convert FFT magnitude directly to dB → velocity
             db_val = 20.0 * np.log10(max(corrected_mag, 1e-10))
-            print(
-                f"  [vel-debug] note[{i}] pitch={pitch} inst={instrument_id} "
-                f"ratio={fund_ratio:.2f} raw={raw_mag:.4f} corrected={corrected_mag:.4f} "
-                f"db={db_val:.1f}"
-            )
+            # print(
+            #     f"  [vel-debug] note[{i}] pitch={pitch} inst={instrument_id} "
+            #     f"ratio={fund_ratio:.2f} raw={raw_mag:.4f} corrected={corrected_mag:.4f} "
+            #     f"db={db_val:.1f}"
+            # )
             velocity = _db_to_velocity(
                 db_val,
                 min_db=0,
@@ -485,7 +485,7 @@ def estimate_velocities_for_notes(
                 max_velocity=int(max_velocity),
                 curve_exponent=1.2,
             )
-            print(f"  [vel-debug] note[{i}] -> velocity={velocity}")
+            # print(f"  [vel-debug] note[{i}] -> velocity={velocity}")
             velocities.append(velocity)
         except Exception:
             velocities.append(int(fallback_velocity))
