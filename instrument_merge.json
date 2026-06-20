@@ -24,11 +24,11 @@
     },
     "piano": {
       "decision": "keep_separate",
-      "description": "Piano-family bucket including acoustic, bright, electric grand, and honky-tonk piano.",
+      "description": "Piano-family bucket including acoustic, bright, and honky-tonk piano.",
       "song_group_count": 12073,
       "midi_file_count": 12073,
-      "note_count": 10647236,
-      "part_count": 17135,
+      "note_count": 9673993,
+      "part_count": 15837,
       "members": [
         {
           "instrument_key": "0",
@@ -51,16 +51,6 @@
           "part_count": 3333
         },
         {
-          "instrument_key": "2",
-          "program_number": 2,
-          "instrument_name": "Electric Grand Piano",
-          "family": "Piano",
-          "song_group_count": 1198,
-          "midi_file_count": 1198,
-          "note_count": 973243,
-          "part_count": 1298
-        },
-        {
           "instrument_key": "3",
           "program_number": 3,
           "instrument_name": "Honky-tonk Piano",
@@ -74,11 +64,11 @@
     },
     "electric_piano": {
       "decision": "keep_separate",
-      "description": "Electric/electro-mechanical piano bucket.",
+      "description": "Electric/electro-mechanical piano bucket, including electric grand piano.",
       "song_group_count": 4439,
       "midi_file_count": 4439,
-      "note_count": 2788414,
-      "part_count": 5047,
+      "note_count": 3761657,
+      "part_count": 6345,
       "members": [
         {
           "instrument_key": "4",
@@ -99,6 +89,16 @@
           "midi_file_count": 2114,
           "note_count": 1291560,
           "part_count": 2257
+        },
+        {
+          "instrument_key": "2",
+          "program_number": 2,
+          "instrument_name": "Electric Grand Piano",
+          "family": "Piano",
+          "song_group_count": 1198,
+          "midi_file_count": 1198,
+          "note_count": 973243,
+          "part_count": 1298
         }
       ]
     },
@@ -1627,7 +1627,7 @@
     "drums": "drums",
     "0": "piano",
     "1": "piano",
-    "2": "piano",
+    "2": "electric_piano",
     "3": "piano",
     "4": "electric_piano",
     "5": "electric_piano",
