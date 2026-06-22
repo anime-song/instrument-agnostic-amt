@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 MELODY_CLASS_ID = get_instrument_class_id_by_name("melody")
 VOCAL_HARMONY_CLASS_ID = get_instrument_class_id_by_name("vocal_harmony")
+DRUM_CLASS_ID = get_instrument_class_id_by_name("drums")
+LABEL_MODE_MELODIC = "melodic"
+LABEL_MODE_DRUM = "drum"
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
 VOCAL_HARMONY_TRACK_KEYWORDS = ("vocal_harmony", "harmony")
 DRUM_TRACK_KEYWORDS = ("drum",)
@@ -76,7 +79,13 @@ def is_excluded_instrument(instrument: pretty_midi.Instrument) -> bool:
 
 
 def process_stem(
-    mid_path: Path | None, wav_path: Path, npz_dir: Path, manifest_dir: Path
+    mid_path: Path | None,
+    wav_path: Path,
+    npz_dir: Path,
+    manifest_dir: Path,
+    *,
+    label_mode: str = LABEL_MODE_MELODIC,
+    drum_note_duration_ms: int = 80,
 ) -> dict[str, Any] | None:
     """
     1つの音声ステムを処理し、MIDI由来のノート配列をnpzに保存する。
@@ -100,9 +109,28 @@ def process_stem(
 
     if midi_data is not None:
         for instrument in midi_data.instruments:
+            if label_mode == LABEL_MODE_DRUM:
+                if not instrument.is_drum:
+                    continue
+                inst_id = DRUM_CLASS_ID
+
+                for note in sorted(instrument.notes, key=lambda x: x.start):
+                    start_ms = int(round(note.start * 1000.0))
+                    end_ms = start_ms + int(drum_note_duration_ms)
+                    all_start_ms.append(start_ms)
+                    all_end_ms.append(max(end_ms, start_ms + 1))
+                    all_pitch.append(note.pitch)
+                    all_velocity.append(note.velocity)
+                    all_instrument_id.append(inst_id)
+                continue
+
             is_harmony = is_vocal_harmony_track(instrument)
             is_named_melody = is_melody_track(instrument)
-            if not is_named_melody and not is_harmony and is_excluded_instrument(instrument):
+            if (
+                not is_named_melody
+                and not is_harmony
+                and is_excluded_instrument(instrument)
+            ):
                 continue
 
             # vocal/melody/vocal_harmony と明示されたトラックは、元のGM音色よりトラック名を優先する。
@@ -214,10 +242,11 @@ def process_stem(
     # ピッチシフト / タイムストレッチ / swing のサフィックスがある場合は、
     # 元データとは別曲扱いになるよう song_name にも付加する。
     import re
+
     stem_name = wav_path.stem
     match = re.search(r"((?:_(?:pitch|stretch|swing)_[^_]+)+)$", stem_name)
     suffix = match.group(1) if match else ""
-    base_name = stem_name[:match.start()] if match else stem_name
+    base_name = stem_name[: match.start()] if match else stem_name
 
     song_name = base_name.split("__")[0] if "__" in base_name else base_name
     song_name += suffix
@@ -265,7 +294,21 @@ def main():
         action="store_true",
         help="MIDIファイルが存在するステムのみをマニフェストに含める",
     )
+    parser.add_argument(
+        "--label-mode",
+        choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM),
+        default=LABEL_MODE_MELODIC,
+        help="Label extraction mode. Use 'drum' to keep only MIDI is_drum tracks.",
+    )
+    parser.add_argument(
+        "--drum-note-duration-ms",
+        type=int,
+        default=80,
+        help="Fixed label duration for drum notes in --label-mode drum.",
+    )
     args = parser.parse_args()
+    if args.drum_note_duration_ms <= 0:
+        raise ValueError("--drum-note-duration-ms must be positive")
 
     midis_dir = args.midis_dir.resolve()
     stems_dir = args.stems_dir.resolve()
@@ -296,7 +339,14 @@ def main():
             skipped_no_midi += 1
             continue
 
-        row = process_stem(target_mid_path, wav_path, npz_dir, manifest_path.parent)
+        row = process_stem(
+            target_mid_path,
+            wav_path,
+            npz_dir,
+            manifest_path.parent,
+            label_mode=args.label_mode,
+            drum_note_duration_ms=args.drum_note_duration_ms,
+        )
         if row:
             rows.append(row)
 
