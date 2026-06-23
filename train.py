@@ -129,6 +129,23 @@ def resolve_training_amp_dtype(
     return torch.float16
 
 
+def count_parameters(parameters) -> int:
+    return sum(parameter.numel() for parameter in parameters)
+
+
+def freeze_stem_conv(model: torch.nn.Module) -> tuple[int, int]:
+    stem = getattr(getattr(model, "backbone", None), "stem", None)
+    if stem is None:
+        raise AttributeError("model.backbone.stem was not found")
+
+    frozen_tensors = 0
+    for parameter in stem.parameters():
+        parameter.requires_grad_(False)
+        frozen_tensors += 1
+
+    return frozen_tensors, count_parameters(stem.parameters())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Stem-based AMT Model")
     parser.add_argument("--manifest_path", type=str, default="manifest.csv")
@@ -184,6 +201,12 @@ def main():
             "Structured training cost for covering gold-silent frames with an interval. "
             "Increase to push precision up."
         ),
+    )
+    parser.add_argument(
+        "--semi_crf_track_batch_size",
+        type=int,
+        default=128,
+        help="Track chunk size for Semi-CRF loss computation",
     )
     parser.add_argument(
         "--instrument_loss_type",
@@ -295,6 +318,11 @@ def main():
         type=str,
         default=None,
         help="Path to pre-trained checkpoint for weight initialization",
+    )
+    parser.add_argument(
+        "--freeze-stem-conv",
+        action="store_true",
+        help="Freeze model.backbone.stem parameters for fine-tuning",
     )
     parser.add_argument(
         "--ema-decay",
@@ -493,11 +521,13 @@ def main():
                     if state_dict[key].shape != model_state[key].shape:
                         logger.warning(
                             "Shape mismatch for %s: checkpoint %s, model %s. Adapting...",
-                            key, state_dict[key].shape, model_state[key].shape
+                            key,
+                            state_dict[key].shape,
+                            model_state[key].shape,
                         )
                         ckpt_shape = state_dict[key].shape
                         mod_shape = model_state[key].shape
-                        
+
                         if len(ckpt_shape) == 1:
                             min_len = min(ckpt_shape[0], mod_shape[0])
                             new_tensor = model_state[key].clone()
@@ -507,10 +537,16 @@ def main():
                             min_d0 = min(ckpt_shape[0], mod_shape[0])
                             min_d1 = min(ckpt_shape[1], mod_shape[1])
                             new_tensor = model_state[key].clone()
-                            new_tensor[:min_d0, :min_d1] = state_dict[key][:min_d0, :min_d1]
+                            new_tensor[:min_d0, :min_d1] = state_dict[key][
+                                :min_d0, :min_d1
+                            ]
                             state_dict[key] = new_tensor
                         else:
-                            logger.warning("Unsupported shape mismatch dimension %s. Skipping key %s.", len(ckpt_shape), key)
+                            logger.warning(
+                                "Unsupported shape mismatch dimension %s. Skipping key %s.",
+                                len(ckpt_shape),
+                                key,
+                            )
                             del state_dict[key]
 
             incompatible = model.load_state_dict(state_dict, strict=False)
@@ -529,6 +565,14 @@ def main():
             logger.error(f"Checkpoint not found at {args.init_from}")
             raise FileNotFoundError(f"Checkpoint not found at {args.init_from}")
 
+    if args.freeze_stem_conv:
+        frozen_tensors, frozen_params = freeze_stem_conv(model)
+        logger.info(
+            "Frozen stem conv for fine-tuning: %d tensors, %d parameters",
+            frozen_tensors,
+            frozen_params,
+        )
+
     if args.wandb:
         wandb.config.update({"model_config": asdict(config)})
 
@@ -538,11 +582,26 @@ def main():
     if use_ema:
         logger.info(f"EMA enabled (decay={args.ema_decay})")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    total_parameter_count = count_parameters(model.parameters())
+    trainable_parameter_count = count_parameters(trainable_parameters)
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters remain after applying freezes")
+    logger.info(
+        "Trainable parameters: %d / %d",
+        trainable_parameter_count,
+        total_parameter_count,
+    )
+
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
     if args.accumulation_steps <= 0:
         raise ValueError("--accumulation_steps must be positive")
     if args.warmup_steps < 0:
         raise ValueError("--warmup_steps must be non-negative")
+    if args.semi_crf_track_batch_size <= 0:
+        raise ValueError("--semi_crf_track_batch_size must be positive")
     if args.beat_update_interval <= 0:
         raise ValueError("--beat_update_interval must be positive")
     if args.chord_update_interval <= 0:
@@ -559,13 +618,13 @@ def main():
     def flush_optimizer_step() -> None:
         if scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=1.0)
             scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer_step_was_skipped = scaler.get_scale() < scale_before_step
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=1.0)
             optimizer.step()
             optimizer_step_was_skipped = False
 
