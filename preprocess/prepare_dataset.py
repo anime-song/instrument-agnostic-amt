@@ -20,12 +20,23 @@ logger = logging.getLogger(__name__)
 MELODY_CLASS_ID = get_instrument_class_id_by_name("melody")
 VOCAL_HARMONY_CLASS_ID = get_instrument_class_id_by_name("vocal_harmony")
 DRUM_CLASS_ID = get_instrument_class_id_by_name("drums")
+TIMPANI_CLASS_ID = get_instrument_class_id_by_name("timpani")
+WIND_CHIMES_CLASS_ID = get_instrument_class_id_by_name("wind_chimes")
 LABEL_MODE_MELODIC = "melodic"
 LABEL_MODE_DRUM = "drum"
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
 VOCAL_HARMONY_TRACK_KEYWORDS = ("vocal_harmony", "harmony")
 DRUM_TRACK_KEYWORDS = ("drum",)
 DRUM_TRACK_NAMES = ("percussion",)
+TIMPANI_TRACK_KEYWORDS = ("timpani", "timpany")
+WIND_CHIMES_TRACK_KEYWORDS = (
+    "windchime",
+    "wind chime",
+    "wind-chime",
+    "windbell",
+    "wind bell",
+    "w.chime",
+)
 
 
 def is_vocal_harmony_track(instrument: pretty_midi.Instrument) -> bool:
@@ -48,6 +59,28 @@ def is_named_drum_track(instrument: pretty_midi.Instrument) -> bool:
     return name in DRUM_TRACK_NAMES or any(
         keyword in name for keyword in DRUM_TRACK_KEYWORDS
     )
+
+
+def is_timpani_track(instrument: pretty_midi.Instrument) -> bool:
+    name = (instrument.name or "").strip().lower()
+    return instrument.program == 47 or any(
+        keyword in name for keyword in TIMPANI_TRACK_KEYWORDS
+    )
+
+
+def is_wind_chimes_track(instrument: pretty_midi.Instrument) -> bool:
+    name = (instrument.name or "").strip().lower()
+    return any(keyword in name for keyword in WIND_CHIMES_TRACK_KEYWORDS)
+
+
+def get_drum_mode_class_id(instrument: pretty_midi.Instrument) -> int | None:
+    if instrument.is_drum:
+        return DRUM_CLASS_ID
+    if is_timpani_track(instrument):
+        return TIMPANI_CLASS_ID
+    if is_wind_chimes_track(instrument):
+        return WIND_CHIMES_CLASS_ID
+    return None
 
 
 def is_excluded_instrument(instrument: pretty_midi.Instrument) -> bool:
@@ -110,13 +143,16 @@ def process_stem(
     if midi_data is not None:
         for instrument in midi_data.instruments:
             if label_mode == LABEL_MODE_DRUM:
-                if not instrument.is_drum:
+                inst_id = get_drum_mode_class_id(instrument)
+                if inst_id is None:
                     continue
-                inst_id = DRUM_CLASS_ID
 
                 for note in sorted(instrument.notes, key=lambda x: x.start):
                     start_ms = int(round(note.start * 1000.0))
-                    end_ms = start_ms + int(drum_note_duration_ms)
+                    if instrument.is_drum:
+                        end_ms = start_ms + int(drum_note_duration_ms)
+                    else:
+                        end_ms = int(round(note.end * 1000.0))
                     all_start_ms.append(start_ms)
                     all_end_ms.append(max(end_ms, start_ms + 1))
                     all_pitch.append(note.pitch)
@@ -298,7 +334,7 @@ def main():
         "--label-mode",
         choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM),
         default=LABEL_MODE_MELODIC,
-        help="Label extraction mode. Use 'drum' to keep only MIDI is_drum tracks.",
+        help="Label extraction mode. Use 'drum' to keep drum tracks plus supported percussion classes.",
     )
     parser.add_argument(
         "--drum-note-duration-ms",
