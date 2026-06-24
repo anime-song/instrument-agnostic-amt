@@ -38,7 +38,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 > **Note**: There's also an experimental multi-track MIDI output with instrument classification, but classification accuracy is still limited. The core feature is instrument-agnostic pitch detection.
 
-> **Note**: Drum and percussion transcription is not supported. The model is trained to ignore unpitched percussive sounds.
+> **Note**: A dedicated drum model is available via `--type drums`, but it is still **Experimental**. Accuracy and behavior may change as the model evolves.
 
 > **Warning**: Generalization to electric guitar (especially with distortion) is still weak, and transcription accuracy tends to be lower. The same applies to ethnic instruments (e.g. shamisen, sitar) that are underrepresented in the training data.
 
@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-06-24 | 🥁 Added experimental drum-focused inference model (`--type drums`) |
 | 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |
 | 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
 | 2026-05-20 | 🎸 Added guitar-focused model (`--type guitar`) |
@@ -328,7 +329,7 @@ python infer.py --audio input_song.wav
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
 
 1. separates the uploaded song into stems,
-2. transcribes each non-drum stem individually,
+2. transcribes the separated stems individually,
 3. merges the per-stem MIDI files into one final MIDI.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
@@ -353,7 +354,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `other`: fine-tuned for other instruments. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |
