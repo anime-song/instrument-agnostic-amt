@@ -41,9 +41,7 @@ def _build_checkpoint_url(filename: str) -> str:
     return f"{HF_CHECKPOINT_BASE_URL}/{filename}?download=true"
 
 
-DEFAULT_CHECKPOINT_URL = _build_checkpoint_url(
-    MODEL_CHECKPOINT_FILENAMES["default"]
-)
+DEFAULT_CHECKPOINT_URL = _build_checkpoint_url(MODEL_CHECKPOINT_FILENAMES["default"])
 
 
 @dataclass
@@ -130,7 +128,11 @@ DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
     "synth_pad": 76,
     "synth_lead": 84,
     "melody": 110,
-    "vocal_harmony": 60
+    "vocal_harmony": 60,
+}
+
+DEFAULT_MIDI_PROGRAM_OVERRIDES: dict[str, int] = {
+    "acoustic_guitar": 25,
 }
 
 
@@ -1330,13 +1332,16 @@ def _build_midi(
             if 0 <= inst_id < len(INSTRUMENT_CLASSES)
             else "Piano"
         )
-        prog_num = get_program_number_from_class_id(inst_id)
+        class_key = _normalize_instrument_class_name(class_name)
+        prog_num = DEFAULT_MIDI_PROGRAM_OVERRIDES.get(
+            class_key,
+            get_program_number_from_class_id(inst_id),
+        )
         is_drum = class_name.lower() == "drums"
 
         instrument = pretty_midi.Instrument(
             program=prog_num, is_drum=is_drum, name=class_name
         )
-        class_key = _normalize_instrument_class_name(class_name)
         if instrument_volumes and class_key in instrument_volumes:
             instrument.control_changes.append(
                 pretty_midi.ControlChange(
