@@ -16,6 +16,7 @@ if not _MERGE_JSON_PATH.exists():
 EXTRA_INSTRUMENT_CLASS_PROGRAMS = {
     "melody": 85,  # 推論結果をMIDIに戻すときの代表音色はSynth Voxにする。
      "vocal_harmony": 85,
+    "wind_chimes": 124,
 }
 
 INSTRUMENT_CLASSES: List[str] = []

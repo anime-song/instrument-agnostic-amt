@@ -314,6 +314,11 @@ def run_stem_separated_transcription(
     other_amt_config = other_bundle["amt_config"]
     other_amt_settings = other_bundle["amt_settings"]
 
+    drums_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="drums")
+    drums_amt_model = drums_bundle["amt_model"]
+    drums_amt_config = drums_bundle["amt_config"]
+    drums_amt_settings = drums_bundle["amt_settings"]
+
     # 1. 出力先を曲ごとに分ける。
     run_root = Path(output_root) / audio_file.stem
     stem_dir = run_root / "stems"
@@ -357,10 +362,13 @@ def run_stem_separated_transcription(
         output_midi = stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
         print(f"Transcribing stem: {stem_name}")
         if "drum" in stem_name.lower():
-            print(f"Transcribe drum stem using ADTOF: {stem_name}")
-            transcribe_to_midi(stem_path, output_midi)
-            song_midi_paths.append(output_midi)
-            continue
+            # print(f"Transcribe drum stem using ADTOF: {stem_name}")
+            # transcribe_to_midi(stem_path, output_midi)
+            # song_midi_paths.append(output_midi)
+            # continue
+            current_amt_model = drums_amt_model
+            current_amt_config = drums_amt_config
+            current_amt_settings = drums_amt_settings
         elif "bass" in stem_name.lower():
             current_amt_model = bass_amt_model
             current_amt_config = bass_amt_config
@@ -405,7 +413,7 @@ def run_stem_separated_transcription(
         )
 
         # Estimate MIDI velocities from audio amplitude
-        if notes:
+        if notes and not "drum" in stem_name.lower():
             waveform_np = waveform.cpu().numpy()
             estimated_velocities = estimate_velocities_for_notes(
                 waveform=waveform_np,

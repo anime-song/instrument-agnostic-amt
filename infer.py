@@ -31,6 +31,7 @@ MODEL_CHECKPOINT_FILENAMES = {
     "vocal": "best_model_vocal.pth",
     "guitar": "best_model_guitar.pth",
     "vocal_harmony": "best_model_vocal_harmony.pth",
+    "drums": "best_model_drums.pth",
     "other": "best_model_other.pth",
 }
 DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / MODEL_CHECKPOINT_FILENAMES["default"]
@@ -147,7 +148,7 @@ def parse_args() -> argparse.Namespace:
         "--type",
         choices=list(MODEL_CHECKPOINT_FILENAMES.keys()),
         default="default",
-        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'other' for other-instrument-focused model.",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'drums' for drum-focused model, 'other' for other-instrument-focused model.",
     )
 
     # 単一ファイルモード
