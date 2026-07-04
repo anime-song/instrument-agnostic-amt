@@ -1,45 +1,22 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
-import pretty_midi
-import soundfile as sf
 import torch
-import torchaudio.functional as audio_functional
 from tqdm.auto import tqdm
 
-from ..modeling.heads.semi_crf import decode_pitch_intervals
-from ..modeling.model import MIN_MIDI_PITCH, AudioSemiCRFTransformer, SemiCRFModelConfig
+from ..inference.audio import collect_audio_files, load_audio
+from ..inference.midi import build_midi
+from ..inference.types import InferenceSettings
+from ..inference.windowed import decode_notes
+from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
-    get_program_number_from_class_id,
 )
-
-SUPPORTED_AUDIO_EXTENSIONS = {
-    ".wav",
-    ".mp3",
-    ".flac",
-    ".ogg",
-    ".opus",
-    ".m4a",
-    ".aac",
-    ".wma",
-    ".aiff",
-    ".aif",
-}
-
-
-@dataclass(frozen=True)
-class PredictedNote:
-    pitch: int
-    start_sample: int
-    end_sample: int
-    velocity: int
-    slot_index: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,7 +46,45 @@ def parse_args() -> argparse.Namespace:
         choices=("fp16", "bf16"),
         default="bf16" if torch.cuda.is_bf16_supported() else "fp16",
     )
-    parser.add_argument("--semi-crf-track-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--window-ms",
+        type=int,
+        default=None,
+        help=(
+            "Inference window size in milliseconds. Defaults to checkpoint "
+            "training window, or 8000."
+        ),
+    )
+    parser.add_argument(
+        "--stride-ms",
+        type=int,
+        default=None,
+        help="Inference stride in milliseconds. Defaults to half of window-ms.",
+    )
+    parser.add_argument(
+        "--window-batch-size",
+        type=int,
+        default=1,
+        help="Number of windows to forward at once. Keep at 1 unless VRAM allows more.",
+    )
+    parser.add_argument(
+        "--semi-crf-track-batch-size",
+        type=int,
+        default=None,
+        help="Chunk size for Semi-CRF track decoding. Defaults to checkpoint value, or 128.",
+    )
+    parser.add_argument("--merge-gap-ms", type=float, default=None)
+    parser.add_argument("--merge-onset-ms", type=float, default=20.0)
+    parser.add_argument(
+        "--silence-gate-rms-dbfs",
+        type=float,
+        default=-72.0,
+        help=(
+            "Skip fully silent windows below this RMS level. Set very low "
+            "to effectively disable."
+        ),
+    )
+    parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--note-bias", type=float, default=0.0)
     parser.add_argument("--velocity", type=int, default=100)
     parser.add_argument("--min-midi-note-ms", type=float, default=5.0)
@@ -80,6 +95,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("--audio and --audio-dir cannot be used together")
     if args.output_midi is not None and args.audio_dir is not None:
         parser.error("--output-midi cannot be used with --audio-dir")
+    if args.window_ms is not None and args.window_ms <= 0:
+        parser.error("--window-ms must be positive")
+    if args.stride_ms is not None and args.stride_ms <= 0:
+        parser.error("--stride-ms must be positive")
+    if args.window_batch_size <= 0:
+        parser.error("--window-batch-size must be positive")
+    if (
+        args.semi_crf_track_batch_size is not None
+        and args.semi_crf_track_batch_size <= 0
+    ):
+        parser.error("--semi-crf-track-batch-size must be positive")
+    if args.merge_gap_ms is not None and args.merge_gap_ms < 0:
+        parser.error("--merge-gap-ms must be non-negative")
+    if args.merge_onset_ms < 0:
+        parser.error("--merge-onset-ms must be non-negative")
+    if args.silence_gate_rms_dbfs is not None and args.silence_gate_rms_dbfs > 0:
+        parser.error("--silence-gate-rms-dbfs must be <= 0")
     return args
 
 
@@ -105,7 +137,7 @@ def _coerce_model_config(raw_model_config: dict[str, Any]) -> SemiCRFModelConfig
 
 def load_model(
     checkpoint_path: Path, *, device: torch.device
-) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig]:
+) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig, dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
@@ -129,7 +161,48 @@ def load_model(
         )
     model.to(device)
     model.eval()
-    return model, config
+    training_args = (
+        raw_run_config.get("args", {}) if isinstance(raw_run_config, dict) else {}
+    )
+    if not isinstance(training_args, dict):
+        training_args = {}
+    return model, config, training_args
+
+
+def resolve_inference_settings(
+    config: SemiCRFModelConfig,
+    training_args: dict[str, Any],
+    args: argparse.Namespace,
+) -> InferenceSettings:
+    default_window_ms = int(training_args.get("window_ms") or 8000)
+    window_ms = int(args.window_ms) if args.window_ms is not None else default_window_ms
+    stride_ms = (
+        int(args.stride_ms) if args.stride_ms is not None else max(1, window_ms // 2)
+    )
+    track_batch_size = (
+        int(args.semi_crf_track_batch_size)
+        if args.semi_crf_track_batch_size is not None
+        else int(training_args.get("semi_crf_track_batch_size") or 128)
+    )
+    if window_ms <= 0:
+        raise ValueError("window_ms must be positive")
+    if stride_ms <= 0:
+        raise ValueError("stride_ms must be positive")
+    if track_batch_size <= 0:
+        raise ValueError("semi_crf_track_batch_size must be positive")
+    if int(round(window_ms * int(config.sample_rate) / 1000.0)) < int(config.n_fft):
+        raise ValueError(f"window_ms={window_ms} is too short for n_fft={config.n_fft}")
+    return InferenceSettings(
+        window_ms=window_ms,
+        stride_ms=stride_ms,
+        track_batch_size=track_batch_size,
+        window_batch_size=int(args.window_batch_size),
+        merge_gap_ms=args.merge_gap_ms,
+        merge_onset_ms=float(args.merge_onset_ms),
+        silence_gate_rms_dbfs=args.silence_gate_rms_dbfs,
+        note_bias=float(args.note_bias),
+        disable_tqdm=bool(args.disable_tqdm),
+    )
 
 
 def resolve_instrument_id(name: str) -> int:
@@ -143,137 +216,6 @@ def resolve_instrument_id(name: str) -> int:
         ) from None
 
 
-def load_audio(audio_path: Path, *, target_sample_rate: int) -> torch.Tensor:
-    waveform_np, source_sample_rate = sf.read(
-        audio_path, dtype="float32", always_2d=True
-    )
-    waveform = torch.from_numpy(waveform_np.T.copy())
-    if waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-    elif waveform.shape[0] > 2:
-        waveform = waveform[:2]
-    if int(source_sample_rate) != int(target_sample_rate):
-        waveform = audio_functional.resample(
-            waveform, int(source_sample_rate), int(target_sample_rate)
-        )
-    return waveform.contiguous()
-
-
-def decode_notes(
-    model: AudioSemiCRFTransformer,
-    config: SemiCRFModelConfig,
-    waveform: torch.Tensor,
-    *,
-    condition_instrument_id: int,
-    device: torch.device,
-    amp_enabled: bool,
-    amp_dtype: torch.dtype,
-    track_batch_size: int,
-    note_bias: float,
-    velocity: int,
-) -> list[PredictedNote]:
-    audio = waveform.unsqueeze(0).to(device)
-    valid_audio_frames = torch.tensor(
-        [waveform.shape[-1]], dtype=torch.long, device=device
-    )
-    condition_ids = torch.tensor(
-        [condition_instrument_id], dtype=torch.long, device=device
-    )
-    with (
-        torch.no_grad(),
-        torch.amp.autocast(
-            device_type=device.type,
-            dtype=amp_dtype,
-            enabled=bool(amp_enabled and device.type == "cuda"),
-        ),
-    ):
-        outputs = model(
-            audio,
-            condition_instrument_ids=condition_ids,
-            valid_audio_frames=valid_audio_frames,
-        )
-    valid_lengths = outputs["frame_valid_mask"].to(dtype=torch.long).sum(dim=-1)
-    decoded = decode_pitch_intervals(
-        outputs["interval_query"].float(),
-        outputs["interval_key"].float(),
-        outputs["interval_diag"].float(),
-        valid_lengths,
-        length_scaling=str(config.semi_crf_length_scaling),
-        length_penalty=float(config.semi_crf_length_penalty),
-        note_bias=float(note_bias),
-        track_batch_size=int(track_batch_size),
-    )[0]
-
-    notes: list[PredictedNote] = []
-    num_pitch_slots = int(config.num_pitch_slots)
-    min_duration_samples = max(1, int(round(float(config.sample_rate) * 0.005)))
-    for track_index, intervals in enumerate(decoded):
-        pitch_index = int(track_index) // num_pitch_slots
-        slot_index = int(track_index) % num_pitch_slots
-        midi_pitch = MIN_MIDI_PITCH + pitch_index
-        for begin_frame, end_frame in intervals:
-            start_sample = int(begin_frame) * int(config.hop_length)
-            end_sample = (int(end_frame) + 1) * int(config.hop_length)
-            end_sample = max(end_sample, start_sample + min_duration_samples)
-            if start_sample >= int(waveform.shape[-1]):
-                continue
-            notes.append(
-                PredictedNote(
-                    pitch=midi_pitch,
-                    start_sample=start_sample,
-                    end_sample=min(end_sample, int(waveform.shape[-1])),
-                    velocity=max(1, min(127, int(velocity))),
-                    slot_index=slot_index,
-                )
-            )
-    return sorted(
-        notes, key=lambda note: (note.start_sample, note.pitch, note.slot_index)
-    )
-
-
-def build_midi(
-    notes: list[PredictedNote],
-    *,
-    sample_rate: int,
-    instrument_id: int,
-    min_midi_note_ms: float,
-) -> pretty_midi.PrettyMIDI:
-    midi = pretty_midi.PrettyMIDI(resolution=1920)
-    class_name = (
-        INSTRUMENT_CLASSES[instrument_id]
-        if 0 <= instrument_id < len(INSTRUMENT_CLASSES)
-        else "Piano"
-    )
-    instrument = pretty_midi.Instrument(
-        program=get_program_number_from_class_id(instrument_id),
-        is_drum=class_name.lower() == "drums",
-        name=class_name,
-    )
-    min_duration_sec = float(min_midi_note_ms) / 1000.0
-    for note in notes:
-        start = float(note.start_sample) / float(sample_rate)
-        end = float(note.end_sample) / float(sample_rate)
-        end = max(end, start + min_duration_sec)
-        instrument.notes.append(
-            pretty_midi.Note(
-                velocity=int(note.velocity),
-                pitch=int(note.pitch),
-                start=start,
-                end=end,
-            )
-        )
-    midi.instruments.append(instrument)
-    return midi
-
-
-def collect_audio_files(directory: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in directory.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-    )
-
-
 def process_file(
     audio_path: Path,
     output_midi_path: Path,
@@ -281,13 +223,14 @@ def process_file(
     model: AudioSemiCRFTransformer,
     config: SemiCRFModelConfig,
     instrument_id: int,
+    settings: InferenceSettings,
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     args: argparse.Namespace,
 ) -> None:
     waveform = load_audio(audio_path, target_sample_rate=int(config.sample_rate))
-    notes = decode_notes(
+    notes, stats = decode_notes(
         model,
         config,
         waveform,
@@ -295,8 +238,7 @@ def process_file(
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
-        track_batch_size=int(args.semi_crf_track_batch_size),
-        note_bias=float(args.note_bias),
+        settings=settings,
         velocity=int(args.velocity),
     )
     midi = build_midi(
@@ -307,7 +249,13 @@ def process_file(
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
     midi.write(str(output_midi_path))
-    print(f"wrote {len(notes)} notes: {output_midi_path}")
+    print(
+        f"wrote {len(notes)} notes: {output_midi_path} "
+        f"window_ms={settings.window_ms} stride_ms={settings.stride_ms} "
+        f"windows={stats['window_count']} "
+        f"decoded_windows={stats['decoded_window_count']} "
+        f"skipped_silent_windows={stats['skipped_silent_window_count']}"
+    )
 
 
 def main() -> None:
@@ -316,7 +264,8 @@ def main() -> None:
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
     amp_enabled = bool(args.amp and device.type == "cuda")
     instrument_id = resolve_instrument_id(args.instrument)
-    model, config = load_model(args.checkpoint.resolve(), device=device)
+    model, config, training_args = load_model(args.checkpoint.resolve(), device=device)
+    settings = resolve_inference_settings(config, training_args, args)
 
     if args.audio_dir is not None:
         audio_dir = args.audio_dir.resolve()
@@ -334,6 +283,7 @@ def main() -> None:
                 model=model,
                 config=config,
                 instrument_id=instrument_id,
+                settings=settings,
                 device=device,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
@@ -353,6 +303,7 @@ def main() -> None:
         model=model,
         config=config,
         instrument_id=instrument_id,
+        settings=settings,
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,

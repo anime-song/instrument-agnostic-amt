@@ -144,6 +144,8 @@ python -m instrument_agnostic_amt.cli.infer \
   --output-dir ./midi
 ```
 
+Inference runs in overlapping windows by default. `--window-ms` uses the checkpoint training window when available, otherwise 8000 ms, and `--stride-ms` defaults to half the window. Use `--window-batch-size` only when VRAM allows it; `--semi-crf-track-batch-size` controls Semi-CRF track decoding memory inside each window.
+
 The MIDI writer creates one track/program for the requested instrument.
 
 ## Smoke Tests

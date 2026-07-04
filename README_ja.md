@@ -144,6 +144,8 @@ python -m instrument_agnostic_amt.cli.infer \
   --output-dir ./midi
 ```
 
+推論はデフォルトで overlap ありの window 推論です。`--window-ms` は checkpoint に保存された学習 window を優先し、無い場合は 8000 ms です。`--stride-ms` は未指定なら window の半分になります。`--window-batch-size` は VRAM に余裕がある場合だけ上げてください。`--semi-crf-track-batch-size` は各 window 内の Semi-CRF decode メモリを調整します。
+
 生成されるMIDIは、指定楽器の1トラックだけです。
 
 ## Smoke Test
