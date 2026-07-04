@@ -23,7 +23,7 @@ class STFTFeatureExtractor(nn.Module):
         self,
         *,
         sample_rate: int,
-        n_fft: int = 2048,
+        n_fft: int = 1024,
         hop_length: int = 512,
         win_length: int | None = None,
         center: bool = True,

@@ -111,11 +111,12 @@ Useful architecture arguments:
 
 | Argument | Default | Meaning |
 |---|---:|---|
-| `--n_fft` | `2048` | STFT FFT size |
+| `--n_fft` | `1024` | STFT FFT size |
 | `--hop_length` | `512` | STFT hop length |
-| `--hidden_size` | `384` | Transformer token dimension |
+| `--hidden_size` | `256` | Transformer token dimension |
 | `--encoder_num_layers` | `6` | Dual-axis block count |
-| `--encoder_num_heads` | `12` | Attention heads |
+| `--encoder_num_heads` | `8` | Attention heads |
+| `--encoder_head_dim` | `64` | Per-head attention dimension |
 | `--lwr_ratio` | `4` | LWR-ALL time downsample ratio |
 | `--condition_negative_prob` | `0.25` | Probability of sampling an absent instrument as a negative target |
 

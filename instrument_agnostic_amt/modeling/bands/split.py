@@ -12,8 +12,8 @@ from ..blocks.transformer import RMSNorm
 
 def build_band_indices(
     *,
-    sample_rate: int = 44_100,
-    n_fft: int = 2048,
+    sample_rate: int = 22_050,
+    n_fft: int = 1024,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """Build the BS-RoFormer style contiguous frequency bands."""
 

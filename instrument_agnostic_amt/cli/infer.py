@@ -94,6 +94,10 @@ def _coerce_model_config(raw_model_config: dict[str, Any]) -> SemiCRFModelConfig
     kwargs = {key: value for key, value in raw_model_config.items() if key in allowed}
     if int(kwargs.get("architecture_version", 1)) != 2:
         raise ValueError("This inference entrypoint only supports V2 checkpoints")
+    if "encoder_head_dim" not in kwargs:
+        kwargs["encoder_head_dim"] = int(kwargs.get("hidden_size", 256)) // int(
+            kwargs.get("encoder_num_heads", 8)
+        )
     kwargs["use_gradient_checkpoint"] = False
     kwargs["spec_augment_params"] = None
     return SemiCRFModelConfig(**kwargs)

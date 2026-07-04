@@ -63,7 +63,7 @@ class StemDataset(Dataset):
         *,
         dataset_config_path: str | Path | None = None,
         window_ms: int = 5000,
-        n_fft: int = 2048,
+        n_fft: int = 1024,
         hop_length: int = 512,
         sample_rate: int = 22050,
         num_pitch_slots: int = 1,

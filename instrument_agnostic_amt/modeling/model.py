@@ -29,7 +29,7 @@ def compute_model_frames(num_audio_frames: int, n_fft: int, hop_length: int) -> 
 class SemiCRFModelConfig:
     sample_rate: int
     hop_length: int
-    n_fft: int = 2048
+    n_fft: int = 1024
     architecture_version: int = 2
     feature_extractor: str = "stft"
     band_split_type: str = "bs"
@@ -38,6 +38,7 @@ class SemiCRFModelConfig:
     hidden_size: int = 256
     encoder_num_layers: int = 6
     encoder_num_heads: int = 8
+    encoder_head_dim: int = 64
     dropout: float = 0.1
     use_gradient_checkpoint: bool = True
     pitch_query_count: int = NUM_PITCHES
@@ -84,8 +85,12 @@ class ConditionedBandSplitBackbone(nn.Module):
             raise ValueError("V2 model currently only supports band_split_type='bs'")
         if config.lwr_mode != "all":
             raise ValueError("V2 model currently only supports lwr_mode='all'")
-        if config.hidden_size % config.encoder_num_heads != 0:
-            raise ValueError("hidden_size must be divisible by encoder_num_heads")
+        if config.encoder_num_heads <= 0:
+            raise ValueError("encoder_num_heads must be positive")
+        if config.encoder_head_dim <= 0:
+            raise ValueError("encoder_head_dim must be positive")
+        if config.encoder_head_dim % 2 != 0:
+            raise ValueError("encoder_head_dim must be even for RoPE")
 
         self.config = config
         self.feature_extractor = STFTFeatureExtractor(
@@ -129,7 +134,7 @@ class ConditionedBandSplitBackbone(nn.Module):
             [
                 DualAxisTransformerLayer(
                     dim=self.model_dim,
-                    head_dim=self.model_dim // int(config.encoder_num_heads),
+                    head_dim=int(config.encoder_head_dim),
                     num_heads=int(config.encoder_num_heads),
                     dropout=float(config.dropout),
                     lwr_ratio=int(config.lwr_ratio),

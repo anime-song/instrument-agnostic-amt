@@ -22,6 +22,7 @@ except ImportError:
 
 from ..data.dataset import StemDataset
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
+from ..modeling.stem_splitter_init import load_stem_splitter_initialization
 from ..training.losses import compute_losses
 
 logging.basicConfig(
@@ -108,11 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=3000)
     parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--window_ms", type=int, default=8000)
-    parser.add_argument("--n_fft", type=int, default=2048)
+    parser.add_argument("--n_fft", type=int, default=1024)
     parser.add_argument("--hop_length", type=int, default=512)
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--encoder_num_layers", type=int, default=6)
     parser.add_argument("--encoder_num_heads", type=int, default=8)
+    parser.add_argument("--encoder_head_dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lwr_ratio", type=int, default=4)
     parser.add_argument("--num_pitch_slots", type=int, default=1)
@@ -147,6 +149,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_interval", type=int, default=5)
     parser.add_argument("--init-from", type=str, default=None)
+    parser.add_argument(
+        "--init-from-stem-splitter",
+        type=str,
+        default=None,
+        help="Initialize compatible V2 backbone weights from an MSS BS-RoFormer stem splitter checkpoint.",
+    )
     parser.add_argument("--ema-decay", type=float, default=0.99)
     parser.add_argument("--disable-gradient-checkpoint", action="store_true")
     return parser.parse_args()
@@ -160,6 +168,10 @@ def main() -> None:
         raise ValueError("--accumulation_steps must be positive")
     if args.semi_crf_track_batch_size <= 0:
         raise ValueError("--semi_crf_track_batch_size must be positive")
+    if args.init_from and args.init_from_stem_splitter:
+        raise ValueError(
+            "--init-from and --init-from-stem-splitter are mutually exclusive"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = not args.no_amp and device.type == "cuda"
@@ -209,6 +221,7 @@ def main() -> None:
         hidden_size=args.hidden_size,
         encoder_num_layers=args.encoder_num_layers,
         encoder_num_heads=args.encoder_num_heads,
+        encoder_head_dim=args.encoder_head_dim,
         dropout=args.dropout,
         lwr_ratio=args.lwr_ratio,
         num_pitch_slots=args.num_pitch_slots,
@@ -218,6 +231,27 @@ def main() -> None:
         use_gradient_checkpoint=not args.disable_gradient_checkpoint,
     )
     model = AudioSemiCRFTransformer(config).to(device)
+
+    if args.init_from_stem_splitter:
+        report = load_stem_splitter_initialization(
+            model,
+            args.init_from_stem_splitter,
+        )
+        logger.info(
+            "Loaded stem splitter init from %s. tensors=%d numel=%d categories=%s category_numel=%s skipped_missing=%d skipped_shape=%d",
+            args.init_from_stem_splitter,
+            report.loaded_tensors,
+            report.loaded_numel,
+            report.categories,
+            report.category_numel,
+            report.skipped_missing,
+            report.skipped_shape,
+        )
+        if report.skipped_shape_examples:
+            logger.info(
+                "Stem splitter shape-skip examples: %s",
+                report.skipped_shape_examples[:10],
+            )
 
     if args.init_from:
         checkpoint = torch.load(args.init_from, map_location=device, weights_only=False)
