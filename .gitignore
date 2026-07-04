@@ -237,3 +237,4 @@ dataset_config.yaml
 *.bat
 beat_chord_dataset/
 batch_process_unlabeled.py
+configs/

@@ -35,9 +35,9 @@ class SemiCRFModelConfig:
     band_split_type: str = "bs"
     lwr_mode: str = "all"
     lwr_ratio: int = 4
-    hidden_size: int = 384
+    hidden_size: int = 256
     encoder_num_layers: int = 6
-    encoder_num_heads: int = 12
+    encoder_num_heads: int = 8
     dropout: float = 0.1
     use_gradient_checkpoint: bool = True
     pitch_query_count: int = NUM_PITCHES
