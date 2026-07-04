@@ -90,9 +90,9 @@ class RoPE(nn.Module):
         """
         B, _, Tq, Dq = q.shape
         _, _, Tk, Dk = k.shape
-        assert (
-            Dq == self.dim and Dk == self.dim
-        ), "q/k の最終次元は dim と一致させてください。"
+        assert Dq == self.dim and Dk == self.dim, (
+            "q/k の最終次元は dim と一致させてください。"
+        )
 
         # 標準RoPE: pad を考慮せず絶対位置を使用
         pos_q = (
@@ -343,9 +343,9 @@ class Transformer(nn.Module):
 
             idx = 1
             if self.use_cross_attention:
-                assert (
-                    context is not None
-                ), "use_cross_attention=True の場合は context を与えてください"
+                assert context is not None, (
+                    "use_cross_attention=True の場合は context を与えてください"
+                )
                 cross_attn = blocks[idx]
                 residual = x
                 x = cross_attn(

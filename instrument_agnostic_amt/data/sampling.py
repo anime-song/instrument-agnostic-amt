@@ -112,9 +112,7 @@ class StemWindowSelector:
         effective_end_ms = min(int(stem["duration_ms"]), int(stem["end_note_ms"]))
         return max(0, effective_end_ms - self.window_ms)
 
-    def _build_active_window_profile(
-        self, stem: dict[str, Any]
-    ) -> ActiveWindowProfile:
+    def _build_active_window_profile(self, stem: dict[str, Any]) -> ActiveWindowProfile:
         """
         ノート重なり数を重みとして、active 区間を優先サンプリングする分布を構築する。
 
