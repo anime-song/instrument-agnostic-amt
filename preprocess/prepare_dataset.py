@@ -1,5 +1,7 @@
 ﻿import argparse
 import csv
+from bisect import bisect_right
+from concurrent.futures import ProcessPoolExecutor
 import logging
 import os
 import sys
@@ -27,6 +29,7 @@ TIMPANI_CLASS_ID = get_instrument_class_id_by_name("timpani")
 WIND_CHIMES_CLASS_ID = get_instrument_class_id_by_name("wind_chimes")
 LABEL_MODE_MELODIC = "melodic"
 LABEL_MODE_DRUM = "drum"
+LABEL_MODE_ALL = "all"
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
 VOCAL_HARMONY_TRACK_KEYWORDS = ("vocal_harmony", "harmony")
 DRUM_TRACK_KEYWORDS = ("drum",)
@@ -77,7 +80,7 @@ def is_wind_chimes_track(instrument: pretty_midi.Instrument) -> bool:
 
 
 def get_drum_mode_class_id(instrument: pretty_midi.Instrument) -> int | None:
-    if instrument.is_drum:
+    if instrument.is_drum or is_named_drum_track(instrument):
         return DRUM_CLASS_ID
     if is_timpani_track(instrument):
         return TIMPANI_CLASS_ID
@@ -145,23 +148,27 @@ def process_stem(
 
     if midi_data is not None:
         for instrument in midi_data.instruments:
-            if label_mode == LABEL_MODE_DRUM:
+            if label_mode in (LABEL_MODE_DRUM, LABEL_MODE_ALL):
                 inst_id = get_drum_mode_class_id(instrument)
-                if inst_id is None:
+                if inst_id is not None:
+                    use_fixed_duration = instrument.is_drum or is_named_drum_track(
+                        instrument
+                    )
+                    for note in sorted(instrument.notes, key=lambda x: x.start):
+                        start_ms = int(round(note.start * 1000.0))
+                        if use_fixed_duration:
+                            end_ms = start_ms + int(drum_note_duration_ms)
+                        else:
+                            end_ms = int(round(note.end * 1000.0))
+                        all_start_ms.append(start_ms)
+                        all_end_ms.append(max(end_ms, start_ms + 1))
+                        all_pitch.append(note.pitch)
+                        all_velocity.append(note.velocity)
+                        all_instrument_id.append(inst_id)
                     continue
 
-                for note in sorted(instrument.notes, key=lambda x: x.start):
-                    start_ms = int(round(note.start * 1000.0))
-                    if instrument.is_drum:
-                        end_ms = start_ms + int(drum_note_duration_ms)
-                    else:
-                        end_ms = int(round(note.end * 1000.0))
-                    all_start_ms.append(start_ms)
-                    all_end_ms.append(max(end_ms, start_ms + 1))
-                    all_pitch.append(note.pitch)
-                    all_velocity.append(note.velocity)
-                    all_instrument_id.append(inst_id)
-                continue
+                if label_mode == LABEL_MODE_DRUM:
+                    continue
 
             is_harmony = is_vocal_harmony_track(instrument)
             is_named_melody = is_melody_track(instrument)
@@ -200,20 +207,24 @@ def process_stem(
             notes = sorted(instrument.notes, key=lambda x: x.start)
             max_original_end = max((n.end for n in notes), default=0.0)
 
+            pedal_starts = [start for start, _ in pedal_intervals]
             extended_ends = []
             for note in notes:
                 new_end = note.end
-                for p_start, p_end in pedal_intervals:
+                pedal_index = bisect_right(pedal_starts, note.end) - 1
+                if pedal_index >= 0:
+                    p_start, p_end = pedal_intervals[pedal_index]
                     if p_start <= note.end < p_end:
                         new_end = p_end
-                        break
                 extended_ends.append(new_end)
 
             # For repeated notes of the same pitch, trim each note at the next onset.
-            for pitch in range(128):
-                pitch_indices = [
-                    i for i, note in enumerate(notes) if note.pitch == pitch
-                ]
+            pitch_indices_by_pitch: dict[int, list[int]] = {}
+            for note_index, note in enumerate(notes):
+                pitch_indices_by_pitch.setdefault(int(note.pitch), []).append(
+                    note_index
+                )
+            for pitch_indices in pitch_indices_by_pitch.values():
                 for i in range(len(pitch_indices) - 1):
                     idx = pitch_indices[i]
                     next_idx = pitch_indices[i + 1]
@@ -302,6 +313,20 @@ def process_stem(
     }
 
 
+def process_stem_task(
+    task: tuple[Path | None, Path, Path, Path, str, int],
+) -> dict[str, Any] | None:
+    mid_path, wav_path, npz_dir, manifest_dir, label_mode, drum_note_duration_ms = task
+    return process_stem(
+        mid_path,
+        wav_path,
+        npz_dir,
+        manifest_dir,
+        label_mode=label_mode,
+        drum_note_duration_ms=drum_note_duration_ms,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare dataset from midis and stems")
     parser.add_argument(
@@ -335,19 +360,30 @@ def main():
     )
     parser.add_argument(
         "--label-mode",
-        choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM),
+        choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM, LABEL_MODE_ALL),
         default=LABEL_MODE_MELODIC,
-        help="Label extraction mode. Use 'drum' to keep drum tracks plus supported percussion classes.",
+        help=(
+            "Label extraction mode. Use 'all' for melodic plus drums/percussion; "
+            "use 'drum' for drums/percussion only."
+        ),
     )
     parser.add_argument(
         "--drum-note-duration-ms",
         type=int,
         default=80,
-        help="Fixed label duration for drum notes in --label-mode drum.",
+        help="Fixed label duration for drum notes in --label-mode drum/all.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes for MIDI/audio metadata extraction.",
     )
     args = parser.parse_args()
     if args.drum_note_duration_ms <= 0:
         raise ValueError("--drum-note-duration-ms must be positive")
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
 
     midis_dir = args.midis_dir.resolve()
     stems_dir = args.stems_dir.resolve()
@@ -365,9 +401,9 @@ def main():
     wav_files = list(stems_dir.glob("*.wav")) + list(stems_dir.glob("*.flac"))
     logger.info(f"Found {len(wav_files)} audio files.")
 
-    rows = []
+    tasks: list[tuple[Path | None, Path, Path, Path, str, int]] = []
     skipped_no_midi = 0
-    for wav_path in tqdm(wav_files, desc="Processing stems"):
+    for wav_path in wav_files:
         mid_path = midis_dir / f"{wav_path.stem}.mid"
         if not mid_path.exists():
             mid_path = midis_dir / f"{wav_path.stem}.midi"
@@ -378,16 +414,34 @@ def main():
             skipped_no_midi += 1
             continue
 
-        row = process_stem(
-            target_mid_path,
-            wav_path,
-            npz_dir,
-            manifest_path.parent,
-            label_mode=args.label_mode,
-            drum_note_duration_ms=args.drum_note_duration_ms,
+        tasks.append(
+            (
+                target_mid_path,
+                wav_path,
+                npz_dir,
+                manifest_path.parent,
+                args.label_mode,
+                args.drum_note_duration_ms,
+            )
         )
-        if row:
-            rows.append(row)
+
+    rows = []
+    if args.workers == 1 or len(tasks) <= 1:
+        row_iter = (process_stem_task(task) for task in tasks)
+        for row in tqdm(row_iter, total=len(tasks), desc="Processing stems"):
+            if row:
+                rows.append(row)
+    else:
+        worker_count = min(args.workers, len(tasks))
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            row_iter = executor.map(process_stem_task, tasks, chunksize=8)
+            for row in tqdm(
+                row_iter,
+                total=len(tasks),
+                desc=f"Processing stems ({worker_count} workers)",
+            ):
+                if row:
+                    rows.append(row)
 
     if skipped_no_midi > 0:
         logger.info(f"Skipped {skipped_no_midi} stems without MIDI (--require-midi)")

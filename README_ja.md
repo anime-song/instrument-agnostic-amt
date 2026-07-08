@@ -1,30 +1,29 @@
-﻿# Instrument-Agnostic AMT V2
+# Instrument-Agnostic AMT
 
-V2は、混合音声から指定した1つの楽器クラスのノートだけを出力する、条件付きAMTモデルです。
+このブランチは、入力スタックとdual-axis TransformerをV1相当のCQT/StemConvへ戻しつつ、出力側は現在のinstrument-pitch pair gate + Semi-CRF interval decoderを残したシンプルなAMTモデルです。重複するinstrument-pitch区間を表現できます。
 
-現在の構成は次の通りです。
+現在の構成:
 
 ```text
 waveform
-  -> STFTFeatureExtractor
-  -> BandSplit
-  -> Dual-axis Transformer blocks
-       time axis -> band axis
-       LWR-ALL layer-wise time resampling, default ratio 4
-  -> instrument-conditioned pitch query tokens
-  -> Semi-CRF interval decoding + boundary head
-  -> single-instrument MIDI
+  -> HCQT / RecursiveCQT
+  -> StemConv (時間解像度は維持)
+  -> V1 dual-axis Transformer blocks
+       band axis -> time axis
+       LWR layer-wise time resampling, default ratio 4
+  -> pitch query features
+  -> instrument-pitch pair gate
+  -> flat Semi-CRF interval decoding + boundary head
+  -> MIDI tracks
 ```
 
-V2では次のV1要素を外しています。
+削除したもの:
 
-- beat / chord 学習
-- global token による補助タスク分岐
-- framewise instrument classifier
-- interval instrument predictor
-- CQT / HCQT / StemConv
-
-V1 checkpointとの互換性はありません。
+- Source-separation BS-RoFormer stem-splitter backbone
+- stem splitter / V1 partial checkpoint initialization helper
+- previous spectral band-splitting input path
+- beat / chord auxiliary head
+- framewise instrument classifier / interval instrument predictor
 
 ## ディレクトリ構成
 
@@ -38,12 +37,11 @@ instrument_agnostic_amt/
     dataset.py
     sampling.py
   modeling/
-    features/stft.py
-    bands/split.py
+    features/cqt.py
+    features/spec_augment.py
     blocks/lwr.py
     blocks/axis_transformer.py
     blocks/transformer.py
-    conditioning.py
     heads/semi_crf.py
     heads/interval_boundaries.py
     model.py
@@ -56,15 +54,12 @@ instrument_agnostic_amt/
 configs/
   datasets/
     dataset_config.yaml
-    dataset_real_config_vocal.yaml
     ...
 preprocess/
   prepare_dataset.py
   resample_only.py
   ...
 ```
-
-top直下の`train.py` / `infer.py` wrapperは使いません。
 
 ## インストール
 
@@ -93,7 +88,7 @@ python preprocess/prepare_dataset.py \
   --manifest_path ./manifest.csv
 ```
 
-V2では`condition_instrument_id`を使うため、信頼できる楽器ラベルが必要です。`mask_instrument_loss: true`のdataset groupは学習対象から除外されます。
+Semi-CRFのtrackはinstrument-pitch pair targetから選ぶため、学習には信頼できる楽器ラベルが必要です。
 
 ## 学習
 
@@ -111,20 +106,33 @@ python -m instrument_agnostic_amt.cli.train \
 
 | Argument | Default | Meaning |
 |---|---:|---|
-| `--n_fft` | `1024` | STFT FFT size |
-| `--hop_length` | `512` | STFT hop length |
-| `--hidden_size` | `256` | Transformer token dimension |
-| `--encoder_num_layers` | `6` | Dual-axis block count |
-| `--encoder_num_heads` | `8` | Attention heads |
-| `--encoder_head_dim` | `64` | Attentionのheadあたりの内部次元 |
-| `--lwr_ratio` | `4` | LWR-ALL time downsample ratio |
-| `--condition_negative_prob` | `0.25` | 存在しない楽器をnegative targetとして選ぶ確率 |
+| `--hop_length` | `512` | CQT/model frame hop |
+| `--n_fft` | `2048` | 互換用に保存するwindow-size guard |
+| `--cqt_n_bins` | `312` | StemConv前のCQT bins |
+| `--cqt_bins_per_octave` | `36` | CQT resolution |
+| `--harmonics` | `1,2,3,4,5` | HCQT harmonic channels |
+| `--hidden_size` | `384` | Transformer attention hidden size |
+| `--base_ch` | `64` | StemConv base channels。token dimは`4 * base_ch` |
+| `--encoder_num_layers` | `6` | V1 dual-axis block count |
+| `--encoder_num_heads` | `12` | Attention heads |
+| `--lwr_layers` | `last3` | LWRを入れるTransformer layer: `last3`, `all`, `none`, `0,2,4`, `0-2,5`, mask `101001` |
+| `--lwr_ratio` | `8` | 有効化された層のLWR time downsample ratio |
+| `--lwr_resampling_mode` | `mean` | LWRのresampling operator: `mean` または学習可能なdepthwise `conv1d` |
 
-checkpointには`architecture_version=2`, `feature_extractor="stft"`, `band_split_type="bs"`, `lwr_mode="all"`, `lwr_ratio`が保存されます。
+checkpointには`architecture_version=2`, `lwr_layers`, `lwr_ratio`, `lwr_resampling_mode`が保存されます。
 
 ## 推論
 
-推論ではV2 checkpointと対象楽器を必ず指定します。
+全楽器をdecode:
+
+```bash
+python -m instrument_agnostic_amt.cli.infer \
+  --checkpoint checkpoints/checkpoint_epoch_100.pth \
+  --audio input_song.wav \
+  --output-midi output.mid
+```
+
+単一楽器クラスだけdecode:
 
 ```bash
 python -m instrument_agnostic_amt.cli.infer \
@@ -139,14 +147,11 @@ python -m instrument_agnostic_amt.cli.infer \
 ```bash
 python -m instrument_agnostic_amt.cli.infer \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
-  --instrument guitar \
   --audio-dir ./audio \
   --output-dir ./midi
 ```
 
-推論はデフォルトで overlap ありの window 推論です。`--window-ms` は checkpoint に保存された学習 window を優先し、無い場合は 8000 ms です。`--stride-ms` は未指定なら window の半分になります。`--window-batch-size` は VRAM に余裕がある場合だけ上げてください。`--semi-crf-track-batch-size` は各 window 内の Semi-CRF decode メモリを調整します。
-
-生成されるMIDIは、指定楽器の1トラックだけです。
+推論はデフォルトでoverlapありのwindow推論です。`--window-ms`はcheckpointに保存された学習windowを優先し、無い場合は8000 msです。`--stride-ms`は未指定ならwindowの半分になります。`--window-batch-size`はVRAMに余裕がある場合だけ上げてください。`--semi-crf-track-batch-size`は各window内のSemi-CRF decodeメモリを調整します。
 
 ## Smoke Test
 

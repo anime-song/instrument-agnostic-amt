@@ -23,17 +23,23 @@ from .harmony import (
 )
 from .notes import (
     WindowNotes,
-    choose_condition_instrument_id,
     concat_window_notes,
-    filter_window_notes_by_instrument,
     split_window_notes,
 )
 from .sampling import StemWindowSelector
 from .targets import build_frame_note_targets, build_pitch_interval_targets
+from ..taxonomy.instrument_classes import (
+    NUM_INSTRUMENT_CLASSES,
+    get_instrument_class_id_by_name,
+)
 
 logger = logging.getLogger(__name__)
 
 PITCH_SHIFT_SUFFIX_RE = re.compile(r"^(?P<base>.+?)_pitch_(?P<shift>-?\d+)$")
+try:
+    DRUM_CLASS_ID = get_instrument_class_id_by_name("drums")
+except KeyError:
+    DRUM_CLASS_ID = None
 
 
 def _get_instrument_name(stem_name: str) -> str:
@@ -51,9 +57,21 @@ def _split_pitch_shift_suffix(name: str) -> tuple[str, int]:
     return match.group("base"), int(match.group("shift"))
 
 
+def _valid_instrument_id_set(instrument_ids: np.ndarray) -> frozenset[int]:
+    if instrument_ids.size == 0:
+        return frozenset()
+
+    values = instrument_ids.astype(np.int64, copy=False)
+    valid_mask = (values >= 0) & (values < NUM_INSTRUMENT_CLASSES)
+    if not np.any(valid_mask):
+        return frozenset()
+
+    return frozenset(int(value) for value in np.unique(values[valid_mask]).tolist())
+
+
 class StemDataset(Dataset):
     """
-    Load stem audio/MIDI pairs and build V2 conditioned AMT samples.
+    Load stem audio/MIDI pairs and build all-instrument AMT samples.
     Supports weighted multi-dataset sampling from a dataset_config YAML file.
     """
 
@@ -66,24 +84,23 @@ class StemDataset(Dataset):
         n_fft: int = 1024,
         hop_length: int = 512,
         sample_rate: int = 22050,
-        num_pitch_slots: int = 1,
         p_intra_drop: float = 0.2,
         p_cross_mix: float = 0.1,
         p_cross_mix_decay: float = 0.3,
         max_cross_stems: int = 5,
+        max_cross_aug_positive_pairs: int = 160,
+        max_cross_aug_intervals: int = 1200,
         p_augment: float = 0.5,
         ir_folder: str | Path | None = None,
         noise_folder: str | Path | None = None,
         drum_folder: str | Path | None = None,
         p_drum_mix: float = 0.1,
-        condition_negative_prob: float = 0.25,
         seed: int = 42,
     ):
         self.window_ms = int(window_ms)
         self.n_fft = int(n_fft)
         self.hop_length = int(hop_length)
         self.sample_rate = int(sample_rate)
-        self.num_pitch_slots = max(1, int(num_pitch_slots))
         # Probability of dropping stems from the same song.
         self.p_intra_drop = float(p_intra_drop)
         # Probability of mixing stems from other songs.
@@ -91,6 +108,8 @@ class StemDataset(Dataset):
         # Decay factor when adding multiple cross-song stems.
         self.p_cross_mix_decay = float(p_cross_mix_decay)
         self.max_cross_stems = int(max_cross_stems)
+        self.max_cross_aug_positive_pairs = int(max_cross_aug_positive_pairs)
+        self.max_cross_aug_intervals = int(max_cross_aug_intervals)
         self.p_augment = float(p_augment)
         self.seed = int(seed)
         self.epoch = 0
@@ -100,7 +119,6 @@ class StemDataset(Dataset):
         self.drum_augmentor = self._build_audio_augmentor(distortion_augmentations=None)
 
         self.p_drum_mix = float(p_drum_mix)
-        self.condition_negative_prob = float(condition_negative_prob)
         self.drum_files: list[str] = []
         if drum_folder is not None and Path(drum_folder).exists():
             for p in Path(drum_folder).rglob("*"):
@@ -139,6 +157,7 @@ class StemDataset(Dataset):
                     "weight": 1.0,
                     "use_for_cross_aug": True,
                     "active_window_sampling": False,
+                    "use_intra_drop": True,
                     "allow_multi_stem_same_song": True,
                     "mask_instrument_loss": False,
                     "distortion_augmentations": (),
@@ -151,7 +170,7 @@ class StemDataset(Dataset):
 
         if not self.dataset_groups:
             raise ValueError(
-                "No usable dataset groups found for V2 conditioned training"
+                "No usable dataset groups found for V2 filtered instrument-pitch training"
             )
 
         self.dataset_groups_by_name = {
@@ -186,6 +205,7 @@ class StemDataset(Dataset):
                 f"cross_aug={group.get('use_for_cross_aug', True)}, "
                 f"active_window={group.get('active_window_sampling', False)}, "
                 f"multi_stem_same_song={group.get('allow_multi_stem_same_song', True)}, "
+                f"intra_drop={group.get('use_intra_drop', True)}, "
                 f"mask_inst={group.get('mask_instrument_loss', False)}, "
                 f"distort={group.get('distortion_augmentations', ()) or 'none'}, "
                 f"harmony={group.get('harmony_config', HarmonyAugmentationConfig()).describe()}"
@@ -252,7 +272,7 @@ class StemDataset(Dataset):
             mask_inst = bool(dataset_entry.get("mask_instrument_loss", False))
             if mask_inst:
                 logger.info(
-                    "Skipping dataset group %s for V2 conditioned training because mask_instrument_loss=true",
+                    "Skipping dataset group %s for V2 filtered instrument-pitch training because mask_instrument_loss=true",
                     dataset_entry.get("name", manifest_rel),
                 )
                 continue
@@ -285,6 +305,7 @@ class StemDataset(Dataset):
                     "allow_multi_stem_same_song": bool(
                         dataset_entry.get("allow_multi_stem_same_song", True)
                     ),
+                    "use_intra_drop": bool(dataset_entry.get("use_intra_drop", True)),
                     "mask_instrument_loss": bool(
                         dataset_entry.get("mask_instrument_loss", False)
                     ),
@@ -371,6 +392,101 @@ class StemDataset(Dataset):
                 return group
         return self.cross_dataset_groups[-1]
 
+    def _get_stem_note_instrument_ids(self, stem: dict[str, Any]) -> frozenset[int]:
+        cached_ids = stem.get("note_instrument_ids")
+        if cached_ids is not None:
+            return frozenset(int(value) for value in cached_ids)
+
+        note_instrument_ids = frozenset()
+        try:
+            with np.load(stem["npz_path"]) as data:
+                if "note_instrument" in data.files:
+                    note_instrument_ids = _valid_instrument_id_set(
+                        data["note_instrument"]
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to read note_instrument from %s: %s",
+                stem.get("npz_path"),
+                e,
+            )
+
+        stem["note_instrument_ids"] = note_instrument_ids
+        return note_instrument_ids
+
+    def _get_stem_instrument_keys(
+        self,
+        stem: dict[str, Any],
+    ) -> frozenset[tuple[str, int | str]]:
+        note_instrument_ids = self._get_stem_note_instrument_ids(stem)
+        if note_instrument_ids:
+            return frozenset(
+                ("note", instrument_id) for instrument_id in note_instrument_ids
+            )
+
+        return frozenset({("name", _get_instrument_name(str(stem["stem_name"])))})
+
+    def _load_window_note_groups_for_mix_specs(
+        self,
+        mix_specs: list[Any],
+        *,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> list[WindowNotes]:
+        note_groups: list[WindowNotes] = []
+        for mix_spec in mix_specs:
+            mix_stem = mix_spec.stem
+            with np.load(mix_stem["npz_path"]) as data:
+                start_ms = data["note_start_ms"]
+                end_ms = data["note_end_ms"]
+                pitch = data["note_pitch"]
+                velocity = data["note_velocity"]
+                instrument_ids = data.get("note_instrument", np.zeros_like(pitch))
+                instrument_ids = mix_spec.override_instrument_ids(instrument_ids)
+
+            carry_in, body = split_window_notes(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                pitch=pitch,
+                velocity=velocity,
+                instrument=instrument_ids,
+                window_start_ms=int(window_start_ms),
+                window_end_ms=int(window_end_ms),
+                clip_note_end_to_window=True,
+            )
+            note_groups.extend([carry_in, body])
+        return note_groups
+
+    def _cross_aug_density_allowed(
+        self,
+        current_note_groups: list[WindowNotes],
+        candidate_note_groups: list[WindowNotes],
+    ) -> bool:
+        max_positive_pairs = int(self.max_cross_aug_positive_pairs)
+        max_intervals = int(self.max_cross_aug_intervals)
+        if max_positive_pairs <= 0 and max_intervals <= 0:
+            return True
+
+        merged_notes = concat_window_notes(*current_note_groups, *candidate_note_groups)
+        interval_targets = build_pitch_interval_targets(
+            active_start_ms=merged_notes.start_ms,
+            active_end_ms=merged_notes.end_ms,
+            active_pitch=merged_notes.pitch,
+            active_instrument=merged_notes.instrument,
+            active_has_onset=merged_notes.has_onset,
+            active_has_offset=merged_notes.has_offset,
+            sample_rate=self.sample_rate,
+            hop_length=self.hop_length,
+            num_frames=self.model_frames,
+        )
+        positive_pair_count = len(interval_targets.positive_pair_ids)
+        interval_count = sum(len(track) for track in interval_targets.intervals)
+        if max_positive_pairs > 0 and positive_pair_count > max_positive_pairs:
+            return False
+        if max_intervals > 0 and interval_count > max_intervals:
+            return False
+        return True
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rng = random.Random(self.seed + self.epoch * len(self.primary_song_names) + idx)
 
@@ -394,9 +510,9 @@ class StemDataset(Dataset):
         )
 
         # Track instruments already present in the base mix.
-        base_instruments = {
-            _get_instrument_name(stem["stem_name"]) for stem in selected_base_stems
-        }
+        base_instrument_keys: set[tuple[str, int | str]] = set()
+        for stem in selected_base_stems:
+            base_instrument_keys.update(self._get_stem_instrument_keys(stem))
 
         # 2. Choose a shared base window start.
         #    active_window_sampling=true biases toward windows with active notes.
@@ -408,7 +524,7 @@ class StemDataset(Dataset):
         )
 
         active_stems_with_offset = [
-            (stem, window_start_ms) for stem in selected_base_stems
+            (stem, window_start_ms, False) for stem in selected_base_stems
         ]
 
         # 3. Cross-song mix augmentation.
@@ -434,9 +550,11 @@ class StemDataset(Dataset):
                     extra_stem = rng.choice(self.stems_by_song[cross_song_name])
 
                     if extra_stem["song_name"] != song_name:
-                        extra_inst = _get_instrument_name(extra_stem["stem_name"])
-                        # Do not add the same instrument twice.
-                        if extra_inst not in base_instruments:
+                        extra_instrument_keys = self._get_stem_instrument_keys(
+                            extra_stem
+                        )
+                        # Do not add the same note-labeled instrument twice.
+                        if base_instrument_keys.isdisjoint(extra_instrument_keys):
                             stem_window_start_ms = (
                                 self.window_selector.select_stem_window_start_ms(
                                     stem=extra_stem,
@@ -444,20 +562,40 @@ class StemDataset(Dataset):
                                 )
                             )
                             active_stems_with_offset.append(
-                                (extra_stem, stem_window_start_ms)
+                                (extra_stem, stem_window_start_ms, True)
                             )
-                            base_instruments.add(extra_inst)
+                            base_instrument_keys.update(extra_instrument_keys)
                             break
 
         # 4. Load and mix audio plus note labels.
         mixed_audio = np.zeros((2, self.window_frames), dtype=np.float32)
-        note_groups = []
+        note_groups: list[WindowNotes] = []
+        mixed_stems_with_offset: list[tuple[dict[str, Any], int]] = []
+        mixed_instrument_keys: set[tuple[str, int | str]] = set()
+        density_guard_closed = False
+        cross_aug_density_skipped = 0
 
-        for stem, stem_window_start_ms in active_stems_with_offset:
+        for stem, stem_window_start_ms, is_cross_aug in active_stems_with_offset:
+            if is_cross_aug and density_guard_closed:
+                cross_aug_density_skipped += 1
+                continue
+
             stem_window_end_ms = stem_window_start_ms + self.window_ms
             # Harmony handling returns a mix plan; the loop below only applies it.
-            #
             mix_specs = self.harmony_manager.build_mix_specs(stem, rng)
+            stem_note_groups = self._load_window_note_groups_for_mix_specs(
+                mix_specs,
+                window_start_ms=int(stem_window_start_ms),
+                window_end_ms=int(stem_window_end_ms),
+            )
+            if is_cross_aug and not self._cross_aug_density_allowed(
+                note_groups,
+                stem_note_groups,
+            ):
+                density_guard_closed = True
+                cross_aug_density_skipped += 1
+                continue
+
             # Use one base gain for the main stem.
             # Harmony stems use gain offsets relative to that main gain.
             base_gain_db = rng.uniform(-6.0, 6.0)
@@ -482,30 +620,20 @@ class StemDataset(Dataset):
                 gain_db = base_gain_db + float(mix_spec.gain_db_offset)
                 gain = 10.0 ** (gain_db / 20.0)
                 mixed_audio += audio * gain
+                mixed_instrument_keys.update(self._get_stem_instrument_keys(mix_stem))
 
-                # 3. Load MIDI-derived labels for the same window.
-                with np.load(mix_stem["npz_path"]) as data:
-                    start_ms = data["note_start_ms"]
-                    end_ms = data["note_end_ms"]
-                    pitch = data["note_pitch"]
-                    velocity = data["note_velocity"]
-                    instrument_ids = data.get("note_instrument", np.zeros_like(pitch))
-                    instrument_ids = mix_spec.override_instrument_ids(instrument_ids)
-
-                carry_in, body = split_window_notes(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    pitch=pitch,
-                    velocity=velocity,
-                    instrument=instrument_ids,
-                    window_start_ms=stem_window_start_ms,
-                    window_end_ms=stem_window_end_ms,
-                    clip_note_end_to_window=True,
-                )
-                note_groups.extend([carry_in, body])
+            note_groups.extend(stem_note_groups)
+            mixed_stems_with_offset.append((stem, int(stem_window_start_ms)))
 
         # 5. Random drum mix-in for drum robustness.
-        has_drum = any("drum" in inst.lower() for inst in base_instruments)
+        has_drum = (
+            DRUM_CLASS_ID is not None
+            and ("note", DRUM_CLASS_ID) in mixed_instrument_keys
+            or any(
+                key_type == "name" and "drum" in str(value).lower()
+                for key_type, value in mixed_instrument_keys
+            )
+        )
         if not has_drum and self.drum_files and rng.random() < self.p_drum_mix:
             drum_path = rng.choice(self.drum_files)
             try:
@@ -536,43 +664,31 @@ class StemDataset(Dataset):
 
         audio_tensor = torch.from_numpy(mixed_audio).contiguous()
 
-        # V2: choose one target instrument condition and build AMT targets only for it.
         merged_notes = concat_window_notes(*note_groups)
-        condition_instrument_id = choose_condition_instrument_id(
-            merged_notes,
-            rng=rng,
-            negative_prob=self.condition_negative_prob,
-        )
-        target_notes = filter_window_notes_by_instrument(
-            merged_notes,
-            condition_instrument_id,
-        )
 
         frame_active_targets = build_frame_note_targets(
-            active_start_ms=target_notes.start_ms,
-            active_end_ms=target_notes.end_ms,
-            active_pitch=target_notes.pitch,
+            active_start_ms=merged_notes.start_ms,
+            active_end_ms=merged_notes.end_ms,
+            active_pitch=merged_notes.pitch,
             sample_rate=self.sample_rate,
             hop_length=self.hop_length,
             num_frames=self.model_frames,
         )
 
         interval_targets = build_pitch_interval_targets(
-            active_start_ms=target_notes.start_ms,
-            active_end_ms=target_notes.end_ms,
-            active_pitch=target_notes.pitch,
-            active_instrument=target_notes.instrument,
-            active_has_onset=target_notes.has_onset,
-            active_has_offset=target_notes.has_offset,
+            active_start_ms=merged_notes.start_ms,
+            active_end_ms=merged_notes.end_ms,
+            active_pitch=merged_notes.pitch,
+            active_instrument=merged_notes.instrument,
+            active_has_onset=merged_notes.has_onset,
+            active_has_offset=merged_notes.has_offset,
             sample_rate=self.sample_rate,
             hop_length=self.hop_length,
             num_frames=self.model_frames,
-            num_pitch_slots=self.num_pitch_slots,
         )
-
         # Compute the valid, non-padded audio length.
         max_valid_audio_ms = 0
-        for stem, stem_window_start_ms in active_stems_with_offset:
+        for stem, stem_window_start_ms in mixed_stems_with_offset:
             valid_ms = stem["duration_ms"] - stem_window_start_ms
             if valid_ms > max_valid_audio_ms:
                 max_valid_audio_ms = valid_ms
@@ -584,10 +700,10 @@ class StemDataset(Dataset):
             valid_audio_ms = 0
         valid_audio_frames_val = int(round(valid_audio_ms * self.sample_rate / 1000.0))
 
-        # V2 excludes mask_instrument_loss=true groups while loading configs.
+        # V2 filtered training excludes mask_instrument_loss=true groups while loading configs.
         mask_instrument_loss = any(
             stem.get("mask_instrument_loss", False)
-            for stem, _ in active_stems_with_offset
+            for stem, _ in mixed_stems_with_offset
         )
 
         return {
@@ -597,6 +713,6 @@ class StemDataset(Dataset):
             "frame_active_targets": frame_active_targets,
             "interval_targets": interval_targets,
             "valid_audio_frames": valid_audio_frames_val,
-            "condition_instrument_id": int(condition_instrument_id),
             "mask_instrument_loss": mask_instrument_loss,
+            "cross_aug_density_skipped": int(cross_aug_density_skipped),
         }

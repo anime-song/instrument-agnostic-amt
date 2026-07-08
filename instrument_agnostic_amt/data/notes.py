@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import random
-
 import numpy as np
-
-from ..taxonomy.instrument_classes import NUM_INSTRUMENT_CLASSES
 
 
 class WindowNotes:
@@ -136,51 +132,3 @@ def concat_window_notes(*note_groups: WindowNotes) -> WindowNotes:
             [group.has_offset for group in non_empty_groups]
         ).astype(np.bool_, copy=False),
     )
-
-
-def filter_window_notes_by_instrument(
-    notes: WindowNotes,
-    instrument_id: int,
-) -> WindowNotes:
-    if notes.start_ms.size == 0:
-        return notes
-    mask = notes.instrument == int(instrument_id)
-    if not np.any(mask):
-        return WindowNotes.empty()
-    return WindowNotes(
-        start_ms=notes.start_ms[mask].astype(np.int64, copy=False),
-        end_ms=notes.end_ms[mask].astype(np.int64, copy=False),
-        pitch=notes.pitch[mask].astype(np.int16, copy=False),
-        velocity=notes.velocity[mask].astype(np.int16, copy=False),
-        instrument=notes.instrument[mask].astype(np.int16, copy=False),
-        has_onset=notes.has_onset[mask].astype(np.bool_, copy=False),
-        has_offset=notes.has_offset[mask].astype(np.bool_, copy=False),
-    )
-
-
-def choose_condition_instrument_id(
-    notes: WindowNotes,
-    *,
-    rng: random.Random,
-    negative_prob: float,
-) -> int:
-    valid_ids = sorted(
-        {
-            int(instrument_id)
-            for instrument_id in notes.instrument.tolist()
-            if 0 <= int(instrument_id) < NUM_INSTRUMENT_CLASSES
-        }
-    )
-    if not valid_ids:
-        return rng.randrange(max(1, NUM_INSTRUMENT_CLASSES))
-
-    if rng.random() < float(negative_prob) and len(valid_ids) < NUM_INSTRUMENT_CLASSES:
-        valid_set = set(valid_ids)
-        negative_ids = [
-            instrument_id
-            for instrument_id in range(NUM_INSTRUMENT_CLASSES)
-            if instrument_id not in valid_set
-        ]
-        if negative_ids:
-            return int(rng.choice(negative_ids))
-    return int(rng.choice(valid_ids))

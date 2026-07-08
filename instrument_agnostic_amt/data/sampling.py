@@ -56,6 +56,8 @@ class StemWindowSelector:
         """同一楽曲から使う base stem 群を選ぶ。"""
         if not selected_group.get("allow_multi_stem_same_song", True):
             return [rng.choice(base_stems)]
+        if not selected_group.get("use_intra_drop", True):
+            return list(base_stems)
 
         selected_base_stems = []
         for stem in base_stems:

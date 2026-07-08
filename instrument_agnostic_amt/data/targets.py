@@ -66,6 +66,21 @@ def build_frame_note_targets(
     return torch.from_numpy(active_targets)
 
 
+def _empty_pair_interval_targets() -> PitchIntervalTargets:
+    return PitchIntervalTargets(
+        intervals=[],
+        has_onset=[],
+        has_offset=[],
+        onset_offsets=[],
+        offset_offsets=[],
+        instrument_sets=[],
+        positive_pair_ids=[],
+        pair_presence=torch.zeros(
+            (NUM_INSTRUMENT_CLASSES, NUM_PITCHES), dtype=torch.bool
+        ),
+    )
+
+
 def build_pitch_interval_targets(
     *,
     active_start_ms: np.ndarray,
@@ -77,32 +92,11 @@ def build_pitch_interval_targets(
     sample_rate: int,
     hop_length: int,
     num_frames: int,
-    num_pitch_slots: int = 1,
 ) -> PitchIntervalTargets:
-    """Build per-pitch Semi-CRF interval targets."""
-    num_pitch_slots = max(1, int(num_pitch_slots))
-    num_tracks = NUM_PITCHES * num_pitch_slots
-    pitch_intervals: list[list[tuple[int, int]]] = [[] for _ in range(num_tracks)]
-    has_onset_tracks: list[list[bool]] = [[] for _ in range(num_tracks)]
-    has_offset_tracks: list[list[bool]] = [[] for _ in range(num_tracks)]
-    onset_offsets_tracks: list[list[float]] = [[] for _ in range(num_tracks)]
-    offset_offsets_tracks: list[list[float]] = [[] for _ in range(num_tracks)]
-    instrument_sets_tracks: list[list[tuple[int, ...]]] = [
-        [] for _ in range(num_tracks)
-    ]
-
+    """Build sparse instrument-pitch Semi-CRF interval targets."""
     if num_frames <= 0 or active_start_ms.size == 0:
-        return PitchIntervalTargets(
-            intervals=pitch_intervals,
-            has_onset=has_onset_tracks,
-            has_offset=has_offset_tracks,
-            onset_offsets=onset_offsets_tracks,
-            offset_offsets=offset_offsets_tracks,
-            instrument_sets=instrument_sets_tracks,
-        )
+        return _empty_pair_interval_targets()
 
-    # Keep frame-boundary math explicit so interval endpoints and overlap handling
-    # stay consistent with the Semi-CRF loss and boundary head.
     start_samples = _ms_to_sample_index(active_start_ms, sample_rate=sample_rate)
     end_samples = _ms_to_sample_index(active_end_ms, sample_rate=sample_rate)
 
@@ -118,32 +112,28 @@ def build_pitch_interval_targets(
         np.maximum(raw_end_frames_exclusive, start_frames + 1), 0, num_frames
     )
 
-    # Fractional offsets are used by the boundary timing correction loss.
     onset_offsets = real_start_frames - raw_start_frames
     offset_offsets = real_end_frames - raw_end_frames_inclusive
     mapped_pitch, valid_pitch_mask = _map_model_pitch_array(active_pitch)
+    valid_instrument_mask = (active_instrument.astype(np.int64, copy=False) >= 0) & (
+        active_instrument.astype(np.int64, copy=False) < NUM_INSTRUMENT_CLASSES
+    )
+    valid_mask = valid_pitch_mask.copy()
+    valid_mask[valid_pitch_mask] &= valid_instrument_mask[valid_pitch_mask]
 
-    if not np.any(valid_pitch_mask):
-        return PitchIntervalTargets(
-            intervals=pitch_intervals,
-            has_onset=has_onset_tracks,
-            has_offset=has_offset_tracks,
-            onset_offsets=onset_offsets_tracks,
-            offset_offsets=offset_offsets_tracks,
-            instrument_sets=instrument_sets_tracks,
-        )
+    if not np.any(valid_mask):
+        return _empty_pair_interval_targets()
 
-    start_frames = start_frames[valid_pitch_mask]
-    end_frames_exclusive = end_frames_exclusive[valid_pitch_mask]
-    active_instrument = active_instrument[valid_pitch_mask]
-    active_has_onset = active_has_onset[valid_pitch_mask]
-    active_has_offset = active_has_offset[valid_pitch_mask]
-    onset_offsets = onset_offsets[valid_pitch_mask]
-    offset_offsets = offset_offsets[valid_pitch_mask]
+    start_frames = start_frames[valid_mask]
+    end_frames_exclusive = end_frames_exclusive[valid_mask]
+    active_instrument = active_instrument[valid_mask].astype(np.int64, copy=False)
+    active_has_onset = active_has_onset[valid_mask]
+    active_has_offset = active_has_offset[valid_mask]
+    onset_offsets = onset_offsets[valid_mask]
+    offset_offsets = offset_offsets[valid_mask]
+    mapped_pitch, _ = _map_model_pitch_array(active_pitch[valid_mask])
 
-    raw_by_pitch: list[list[tuple[int, int, int, bool, bool, float, float]]] = [
-        [] for _ in range(NUM_PITCHES)
-    ]
+    raw_by_pair: dict[int, list[tuple[int, int, bool, bool, float, float]]] = {}
     for (
         start_frame,
         end_frame_exclusive,
@@ -165,11 +155,11 @@ def build_pitch_interval_targets(
     ):
         if start_frame >= num_frames or end_frame_exclusive <= start_frame:
             continue
-        raw_by_pitch[pitch_value].append(
+        pair_id = int(instrument_id) * NUM_PITCHES + int(pitch_value)
+        raw_by_pair.setdefault(pair_id, []).append(
             (
                 int(start_frame),
                 int(end_frame_exclusive - 1),
-                int(instrument_id),
                 bool(has_onset),
                 bool(has_offset),
                 float(onset_off),
@@ -177,80 +167,37 @@ def build_pitch_interval_targets(
             )
         )
 
-    if num_pitch_slots > 1:
-        for pitch_value, intervals in enumerate(raw_by_pitch):
-            if not intervals:
-                continue
-            intervals.sort(
-                key=lambda item: (item[0], item[1], item[3], item[4], item[2])
-            )
-            slot_last_end_frames = [-1] * num_pitch_slots
-            for (
-                begin,
-                end,
-                instrument_id,
-                has_onset,
-                has_offset,
-                onset_off,
-                offset_off,
-            ) in intervals:
-                if int(begin) > int(end):
-                    continue
+    pair_presence = torch.zeros((NUM_INSTRUMENT_CLASSES, NUM_PITCHES), dtype=torch.bool)
+    positive_pair_ids: list[int] = []
+    pair_intervals: list[list[tuple[int, int]]] = []
+    has_onset_tracks: list[list[bool]] = []
+    has_offset_tracks: list[list[bool]] = []
+    onset_offsets_tracks: list[list[float]] = []
+    offset_offsets_tracks: list[list[float]] = []
+    instrument_sets_tracks: list[list[tuple[int, ...]]] = []
 
-                assigned_slot = None
-                for slot_index, last_end in enumerate(slot_last_end_frames):
-                    if int(begin) > int(last_end):
-                        assigned_slot = slot_index
-                        break
-                if assigned_slot is None:
-                    continue
-
-                track_index = int(pitch_value) * num_pitch_slots + int(assigned_slot)
-                pitch_intervals[track_index].append((int(begin), int(end)))
-                has_onset_tracks[track_index].append(bool(has_onset))
-                has_offset_tracks[track_index].append(bool(has_offset))
-                onset_offsets_tracks[track_index].append(float(onset_off))
-                offset_offsets_tracks[track_index].append(float(offset_off))
-                if 0 <= int(instrument_id) < NUM_INSTRUMENT_CLASSES:
-                    instrument_sets_tracks[track_index].append((int(instrument_id),))
-                else:
-                    instrument_sets_tracks[track_index].append(())
-                slot_last_end_frames[int(assigned_slot)] = int(end)
-
-        return PitchIntervalTargets(
-            intervals=pitch_intervals,
-            has_onset=has_onset_tracks,
-            has_offset=has_offset_tracks,
-            onset_offsets=onset_offsets_tracks,
-            offset_offsets=offset_offsets_tracks,
-            instrument_sets=instrument_sets_tracks,
-        )
-
-    # Sort intervals per pitch and merge overlaps into non-overlapping targets.
-    for pitch_value, intervals in enumerate(raw_by_pitch):
-        if not intervals:
-            continue
-        intervals.sort(key=lambda item: (item[0], item[1], item[3], item[4], item[2]))
+    for pair_id in sorted(raw_by_pair):
+        intervals = raw_by_pair[pair_id]
+        intervals.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
         sanitized: list[list[int | bool | float]] = []
-        for begin, end, _, has_onset, has_offset, onset_off, offset_off in intervals:
-            # Trim or merge overlapping intervals before adding the next one.
-            if sanitized and begin <= sanitized[-1][1]:
-                prev_begin = int(sanitized[-1][0])
-                if begin > prev_begin:
+        for begin, end, has_onset, has_offset, onset_off, offset_off in intervals:
+            if sanitized and begin <= int(sanitized[-1][1]):
+                previous_begin = int(sanitized[-1][0])
+                if begin > previous_begin:
                     sanitized[-1][1] = begin - 1
                     sanitized[-1][3] = True
                     sanitized[-1][5] = 0.5
                 else:
                     sanitized.pop()
-            if sanitized and begin <= sanitized[-1][1]:
-                begin = sanitized[-1][1] + 1
+            if sanitized and begin <= int(sanitized[-1][1]):
+                begin = int(sanitized[-1][1]) + 1
                 onset_off = 0.5
             if begin > end:
                 continue
             sanitized.append(
                 [
-                    begin,
-                    end,
+                    int(begin),
+                    int(end),
                     bool(has_onset),
                     bool(has_offset),
                     float(onset_off),
@@ -258,29 +205,26 @@ def build_pitch_interval_targets(
                 ]
             )
 
-        for begin, end, has_onset, has_offset, onset_off, offset_off in sanitized:
-            if int(begin) > int(end):
-                continue
-            instrument_ids = sorted(
-                {
-                    int(instrument_id)
-                    for raw_begin, raw_end, instrument_id, *_ in intervals
-                    if not (int(raw_end) < int(begin) or int(raw_begin) > int(end))
-                    and 0 <= int(instrument_id) < NUM_INSTRUMENT_CLASSES
-                }
-            )
-            pitch_intervals[pitch_value].append((int(begin), int(end)))
-            has_onset_tracks[pitch_value].append(bool(has_onset))
-            has_offset_tracks[pitch_value].append(bool(has_offset))
-            onset_offsets_tracks[pitch_value].append(float(onset_off))
-            offset_offsets_tracks[pitch_value].append(float(offset_off))
-            instrument_sets_tracks[pitch_value].append(tuple(instrument_ids))
+        if not sanitized:
+            continue
+        instrument_id = int(pair_id) // NUM_PITCHES
+        pitch_value = int(pair_id) % NUM_PITCHES
+        pair_presence[instrument_id, pitch_value] = True
+        positive_pair_ids.append(int(pair_id))
+        pair_intervals.append([(int(item[0]), int(item[1])) for item in sanitized])
+        has_onset_tracks.append([bool(item[2]) for item in sanitized])
+        has_offset_tracks.append([bool(item[3]) for item in sanitized])
+        onset_offsets_tracks.append([float(item[4]) for item in sanitized])
+        offset_offsets_tracks.append([float(item[5]) for item in sanitized])
+        instrument_sets_tracks.append([(instrument_id,) for _ in sanitized])
 
     return PitchIntervalTargets(
-        intervals=pitch_intervals,
+        intervals=pair_intervals,
         has_onset=has_onset_tracks,
         has_offset=has_offset_tracks,
         onset_offsets=onset_offsets_tracks,
         offset_offsets=offset_offsets_tracks,
         instrument_sets=instrument_sets_tracks,
+        positive_pair_ids=positive_pair_ids,
+        pair_presence=pair_presence,
     )

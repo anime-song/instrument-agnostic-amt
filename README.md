@@ -1,30 +1,29 @@
-﻿# Instrument-Agnostic AMT V2
+# Instrument-Agnostic AMT
 
-V2 is a conditioned Automatic Music Transcription model. It predicts notes for one requested instrument class from a mixed audio input.
+This branch uses a simplified CQT/StemConv AMT model: the input stack and dual-axis Transformer are back to the V1 style, while the output side keeps the current pair-gated Semi-CRF interval decoder so overlapping instrument-pitch intervals can be represented.
 
 The current architecture is:
 
 ```text
 waveform
-  -> STFTFeatureExtractor
-  -> BandSplit
-  -> Dual-axis Transformer blocks
-       time axis -> band axis
-       LWR-ALL layer-wise time resampling, ratio 4 by default
-  -> instrument-conditioned pitch query tokens
-  -> Semi-CRF interval decoding + boundary head
-  -> single-instrument MIDI
+  -> HCQT / RecursiveCQT
+  -> StemConv (keeps time resolution)
+  -> V1 dual-axis Transformer blocks
+       band axis -> time axis
+       LWR layer-wise time resampling, ratio 4 by default
+  -> pitch query features
+  -> instrument-pitch pair gate
+  -> flat Semi-CRF interval decoding + boundary head
+  -> MIDI tracks
 ```
 
-V2 intentionally removes the V1 auxiliary tasks and heads:
+Removed from this simplified model:
 
-- Beat and chord training
-- Global token auxiliary routing
-- Framewise instrument classifier
-- Interval instrument predictor
-- CQT / HCQT / StemConv feature stack
-
-V1 checkpoints are not compatible with the V2 entrypoints.
+- Source-separation BS-RoFormer stem-splitter backbone
+- stem splitter and V1 partial checkpoint initialization helpers
+- previous spectral band-splitting input path
+- beat / chord auxiliary heads
+- framewise instrument classifier and interval instrument predictor
 
 ## Project Layout
 
@@ -38,12 +37,11 @@ instrument_agnostic_amt/
     dataset.py
     sampling.py
   modeling/
-    features/stft.py
-    bands/split.py
+    features/cqt.py
+    features/spec_augment.py
     blocks/lwr.py
     blocks/axis_transformer.py
     blocks/transformer.py
-    conditioning.py
     heads/semi_crf.py
     heads/interval_boundaries.py
     model.py
@@ -56,15 +54,12 @@ instrument_agnostic_amt/
 configs/
   datasets/
     dataset_config.yaml
-    dataset_real_config_vocal.yaml
     ...
 preprocess/
   prepare_dataset.py
   resample_only.py
   ...
 ```
-
-Top-level `train.py` and `infer.py` wrappers are no longer used.
 
 ## Install
 
@@ -74,7 +69,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -93,7 +88,7 @@ python preprocess/prepare_dataset.py \
   --manifest_path ./manifest.csv
 ```
 
-V2 training expects reliable instrument labels. Dataset groups with `mask_instrument_loss: true` are skipped because the model is trained with an explicit `condition_instrument_id`.
+Training expects reliable instrument labels because the Semi-CRF tracks are selected by instrument-pitch pair targets.
 
 ## Training
 
@@ -111,20 +106,33 @@ Useful architecture arguments:
 
 | Argument | Default | Meaning |
 |---|---:|---|
-| `--n_fft` | `1024` | STFT FFT size |
-| `--hop_length` | `512` | STFT hop length |
-| `--hidden_size` | `256` | Transformer token dimension |
-| `--encoder_num_layers` | `6` | Dual-axis block count |
-| `--encoder_num_heads` | `8` | Attention heads |
-| `--encoder_head_dim` | `64` | Per-head attention dimension |
-| `--lwr_ratio` | `4` | LWR-ALL time downsample ratio |
-| `--condition_negative_prob` | `0.25` | Probability of sampling an absent instrument as a negative target |
+| `--hop_length` | `512` | CQT/model frame hop |
+| `--n_fft` | `2048` | Window-size guard saved for compatibility |
+| `--cqt_n_bins` | `312` | CQT bins before StemConv |
+| `--cqt_bins_per_octave` | `36` | CQT resolution |
+| `--harmonics` | `1,2,3,4,5` | HCQT harmonic channels |
+| `--hidden_size` | `384` | Transformer attention hidden size |
+| `--base_ch` | `64` | StemConv base channels; token dim is `4 * base_ch` |
+| `--encoder_num_layers` | `6` | V1 dual-axis block count |
+| `--encoder_num_heads` | `12` | Attention heads |
+| `--lwr_layers` | `last3` | LWR-enabled Transformer layers: `last3`, `all`, `none`, `0,2,4`, `0-2,5`, or mask `101001` |
+| `--lwr_ratio` | `8` | LWR time downsample ratio for enabled layers |
+| `--lwr_resampling_mode` | `mean` | LWR resampling operator: `mean` or learnable depthwise `conv1d` |
 
-Checkpoints save `architecture_version=2`, `feature_extractor="stft"`, `band_split_type="bs"`, `lwr_mode="all"`, and `lwr_ratio`.
+Checkpoints save `architecture_version=2`, `lwr_layers`, `lwr_ratio`, and `lwr_resampling_mode`.
 
 ## Inference
 
-Inference requires both a V2 checkpoint and the target instrument class:
+Decode all predicted instruments:
+
+```bash
+python -m instrument_agnostic_amt.cli.infer \
+  --checkpoint checkpoints/checkpoint_epoch_100.pth \
+  --audio input_song.wav \
+  --output-midi output.mid
+```
+
+Decode a single instrument class:
 
 ```bash
 python -m instrument_agnostic_amt.cli.infer \
@@ -139,14 +147,11 @@ Batch inference:
 ```bash
 python -m instrument_agnostic_amt.cli.infer \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
-  --instrument guitar \
   --audio-dir ./audio \
   --output-dir ./midi
 ```
 
 Inference runs in overlapping windows by default. `--window-ms` uses the checkpoint training window when available, otherwise 8000 ms, and `--stride-ms` defaults to half the window. Use `--window-batch-size` only when VRAM allows it; `--semi-crf-track-batch-size` controls Semi-CRF track decoding memory inside each window.
-
-The MIDI writer creates one track/program for the requested instrument.
 
 ## Smoke Tests
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -20,12 +21,21 @@ from ..taxonomy.instrument_classes import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run V2 conditioned AMT inference.")
-    parser.add_argument(
-        "--checkpoint", type=Path, required=True, help="Path to a V2 checkpoint"
+    parser = argparse.ArgumentParser(
+        description="Run CQT/StemConv instrument-pitch AMT inference."
     )
     parser.add_argument(
-        "--instrument", type=str, required=True, help="Target instrument class name"
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Path to a CQT/StemConv Semi-CRF checkpoint",
+    )
+
+    parser.add_argument(
+        "--instrument",
+        type=str,
+        default=None,
+        help="Optional instrument class name. When omitted, all instruments are decoded.",
     )
     parser.add_argument("--audio", type=Path, default=None, help="Input audio file")
     parser.add_argument(
@@ -73,6 +83,47 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Chunk size for Semi-CRF track decoding. Defaults to checkpoint value, or 128.",
     )
+    parser.add_argument(
+        "--semi-crf-sparse-decode",
+        action="store_true",
+        help="Decode Semi-CRF paths from a sparse interval candidate set.",
+    )
+    parser.add_argument(
+        "--semi-crf-sparse-topk-per-start",
+        type=int,
+        default=16,
+        help="Sparse decode candidates kept per start frame before Viterbi.",
+    )
+    parser.add_argument(
+        "--semi-crf-sparse-score-threshold",
+        type=float,
+        default=None,
+        help="Drop sparse decode interval candidates below this score.",
+    )
+    parser.add_argument(
+        "--semi-crf-sparse-max-span-ms",
+        type=float,
+        default=None,
+        help="Required for sparse decode; only score intervals up to this duration in milliseconds.",
+    )
+    parser.add_argument(
+        "--instrument-pair-infer-topk",
+        type=int,
+        default=256,
+        help="Gate top-k instrument-pitch pairs decoded per window.",
+    )
+    parser.add_argument(
+        "--instrument-pair-gate-threshold",
+        type=float,
+        default=-3.0,
+        help="Decode instrument-pitch pairs with gate logits above this threshold.",
+    )
+    parser.add_argument(
+        "--instrument-pair-max-pairs",
+        type=int,
+        default=512,
+        help="Maximum instrument-pitch pairs decoded per window after threshold/top-k union.",
+    )
     parser.add_argument("--merge-gap-ms", type=float, default=None)
     parser.add_argument("--merge-onset-ms", type=float, default=20.0)
     parser.add_argument(
@@ -86,6 +137,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--note-bias", type=float, default=0.0)
+    parser.add_argument(
+        "--no-boundary-head",
+        action="store_true",
+        help=(
+            "Ignore the interval boundary head during stitching. Useful for "
+            "checking raw Semi-CRF decoded intervals."
+        ),
+    )
     parser.add_argument("--velocity", type=int, default=100)
     parser.add_argument("--min-midi-note-ms", type=float, default=5.0)
     args = parser.parse_args()
@@ -106,6 +165,22 @@ def parse_args() -> argparse.Namespace:
         and args.semi_crf_track_batch_size <= 0
     ):
         parser.error("--semi-crf-track-batch-size must be positive")
+    if args.semi_crf_sparse_topk_per_start <= 0:
+        parser.error("--semi-crf-sparse-topk-per-start must be positive")
+    if (
+        args.semi_crf_sparse_max_span_ms is not None
+        and args.semi_crf_sparse_max_span_ms <= 0
+    ):
+        parser.error("--semi-crf-sparse-max-span-ms must be positive")
+    if args.semi_crf_sparse_decode and args.semi_crf_sparse_max_span_ms is None:
+        parser.error(
+            "--semi-crf-sparse-decode requires --semi-crf-sparse-max-span-ms "
+            "to avoid dense score construction"
+        )
+    if args.instrument_pair_infer_topk < 0:
+        parser.error("--instrument-pair-infer-topk must be non-negative")
+    if args.instrument_pair_max_pairs <= 0:
+        parser.error("--instrument-pair-max-pairs must be positive")
     if args.merge_gap_ms is not None and args.merge_gap_ms < 0:
         parser.error("--merge-gap-ms must be non-negative")
     if args.merge_onset_ms < 0:
@@ -124,11 +199,18 @@ def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
 def _coerce_model_config(raw_model_config: dict[str, Any]) -> SemiCRFModelConfig:
     allowed = {field.name for field in fields(SemiCRFModelConfig)}
     kwargs = {key: value for key, value in raw_model_config.items() if key in allowed}
-    if int(kwargs.get("architecture_version", 1)) != 2:
-        raise ValueError("This inference entrypoint only supports V2 checkpoints")
-    if "encoder_head_dim" not in kwargs:
-        kwargs["encoder_head_dim"] = int(kwargs.get("hidden_size", 256)) // int(
-            kwargs.get("encoder_num_heads", 8)
+    if "lwr_layers" not in kwargs and "lwr_mode" in raw_model_config:
+        legacy_lwr_mode = str(raw_model_config.get("lwr_mode", "all"))
+        kwargs["lwr_layers"] = "none" if legacy_lwr_mode == "none" else "all"
+    if int(raw_model_config.get("architecture_version", 1)) != 2:
+        raise ValueError("This inference entrypoint requires architecture_version=2.")
+    if (
+        "instrument_pair_gate_dim" not in raw_model_config
+        or "num_pitch_slots" in raw_model_config
+    ):
+        raise ValueError(
+            "This inference entrypoint requires an instrument-pitch pair-gated checkpoint; "
+            "legacy single-condition checkpoints are not compatible."
         )
     kwargs["use_gradient_checkpoint"] = False
     kwargs["spec_augment_params"] = None
@@ -190,6 +272,19 @@ def resolve_inference_settings(
         raise ValueError("stride_ms must be positive")
     if track_batch_size <= 0:
         raise ValueError("semi_crf_track_batch_size must be positive")
+    sparse_max_span_frames = None
+    if args.semi_crf_sparse_max_span_ms is not None:
+        sparse_max_span_frames = max(
+            1,
+            int(
+                math.ceil(
+                    float(args.semi_crf_sparse_max_span_ms)
+                    * float(config.sample_rate)
+                    / 1000.0
+                    / float(config.hop_length)
+                )
+            ),
+        )
     if int(round(window_ms * int(config.sample_rate) / 1000.0)) < int(config.n_fft):
         raise ValueError(f"window_ms={window_ms} is too short for n_fft={config.n_fft}")
     return InferenceSettings(
@@ -202,6 +297,14 @@ def resolve_inference_settings(
         silence_gate_rms_dbfs=args.silence_gate_rms_dbfs,
         note_bias=float(args.note_bias),
         disable_tqdm=bool(args.disable_tqdm),
+        use_boundary_head=not bool(args.no_boundary_head),
+        semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
+        semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
+        semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
+        semi_crf_sparse_max_span_frames=sparse_max_span_frames,
+        instrument_pair_infer_topk=int(args.instrument_pair_infer_topk),
+        instrument_pair_gate_threshold=float(args.instrument_pair_gate_threshold),
+        instrument_pair_max_pairs=int(args.instrument_pair_max_pairs),
     )
 
 
@@ -216,13 +319,21 @@ def resolve_instrument_id(name: str) -> int:
         ) from None
 
 
+def _instrument_label(instrument_id: int | None) -> str:
+    if instrument_id is None:
+        return "all-instruments"
+    if 0 <= int(instrument_id) < len(INSTRUMENT_CLASSES):
+        return INSTRUMENT_CLASSES[int(instrument_id)]
+    return str(instrument_id)
+
+
 def process_file(
     audio_path: Path,
     output_midi_path: Path,
     *,
     model: AudioSemiCRFTransformer,
     config: SemiCRFModelConfig,
-    instrument_id: int,
+    instrument_id: int | None,
     settings: InferenceSettings,
     device: torch.device,
     amp_enabled: bool,
@@ -234,7 +345,7 @@ def process_file(
         model,
         config,
         waveform,
-        condition_instrument_id=instrument_id,
+        instrument_filter_id=instrument_id,
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
@@ -251,10 +362,15 @@ def process_file(
     midi.write(str(output_midi_path))
     print(
         f"wrote {len(notes)} notes: {output_midi_path} "
+        f"instrument={_instrument_label(instrument_id)} "
         f"window_ms={settings.window_ms} stride_ms={settings.stride_ms} "
         f"windows={stats['window_count']} "
         f"decoded_windows={stats['decoded_window_count']} "
-        f"skipped_silent_windows={stats['skipped_silent_window_count']}"
+        f"skipped_silent_windows={stats['skipped_silent_window_count']} "
+        f"selected_pairs={stats['selected_pair_count']} "
+        f"decoded_intervals={stats['decoded_interval_count']} "
+        f"boundary_no_onset={stats['boundary_no_onset_count']} "
+        f"boundary_no_offset={stats['boundary_no_offset_count']}"
     )
 
 
@@ -263,7 +379,9 @@ def main() -> None:
     device = torch.device(args.device)
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
     amp_enabled = bool(args.amp and device.type == "cuda")
-    instrument_id = resolve_instrument_id(args.instrument)
+    instrument_id = (
+        resolve_instrument_id(args.instrument) if args.instrument is not None else None
+    )
     model, config, training_args = load_model(args.checkpoint.resolve(), device=device)
     settings = resolve_inference_settings(config, training_args, args)
 

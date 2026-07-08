@@ -17,6 +17,8 @@ class PitchIntervalTargets:
     onset_offsets: list[list[float]]
     offset_offsets: list[list[float]]
     instrument_sets: list[list[tuple[int, ...]]] = field(default_factory=list)
+    positive_pair_ids: list[int] = field(default_factory=list)
+    pair_presence: torch.Tensor | None = None
 
 
 def count_pitch_intervals(

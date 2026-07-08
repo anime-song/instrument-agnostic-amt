@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 @dataclass
 class PredictedNote:
+    instrument_id: int
     pitch: int
     start_sample: int
     end_sample: int
@@ -25,3 +26,11 @@ class InferenceSettings:
     silence_gate_rms_dbfs: float | None
     note_bias: float
     disable_tqdm: bool
+    use_boundary_head: bool = True
+    semi_crf_sparse_decode: bool = False
+    semi_crf_sparse_topk_per_start: int = 16
+    semi_crf_sparse_score_threshold: float | None = None
+    semi_crf_sparse_max_span_frames: int | None = None
+    instrument_pair_infer_topk: int = 256
+    instrument_pair_gate_threshold: float = -3.0
+    instrument_pair_max_pairs: int = 512

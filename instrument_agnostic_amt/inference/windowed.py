@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from collections import defaultdict
@@ -8,8 +8,16 @@ from typing import Iterable
 import torch
 from tqdm.auto import tqdm
 
-from ..modeling.heads.semi_crf import decode_pitch_intervals
-from ..modeling.model import MIN_MIDI_PITCH, AudioSemiCRFTransformer, SemiCRFModelConfig
+from ..modeling.heads.semi_crf import (
+    decode_pitch_intervals,
+    decode_pitch_intervals_sparse,
+)
+from ..modeling.model import (
+    MIN_MIDI_PITCH,
+    NUM_PITCHES,
+    AudioSemiCRFTransformer,
+    SemiCRFModelConfig,
+)
 from .types import InferenceSettings, PredictedNote
 
 
@@ -84,15 +92,68 @@ def _compute_silent_window_mask(
     return torch.all(rms < float(silence_gate_rms_linear), dim=1)
 
 
-def _decode_boundary_features(
-    boundary_logits: torch.Tensor,
-    entries: list[tuple[int, int, int, int, int]],
+def _select_pair_candidates(
+    pair_gate_logits: torch.Tensor,
     *,
-    batch_size: int,
+    settings: InferenceSettings,
+    instrument_filter_id: int | None,
+) -> list[int]:
+    if pair_gate_logits.dim() != 2:
+        raise ValueError("pair_gate_logits must have shape [I, P]")
+    num_instruments, num_pitches = pair_gate_logits.shape
+    if int(num_pitches) != NUM_PITCHES:
+        raise ValueError(f"expected {NUM_PITCHES} pitches, got {int(num_pitches)}")
+    if instrument_filter_id is not None and not (
+        0 <= int(instrument_filter_id) < int(num_instruments)
+    ):
+        raise ValueError("instrument_filter_id is out of range")
+
+    scores = pair_gate_logits.float().reshape(-1)
+    finite_mask = torch.isfinite(scores)
+    if instrument_filter_id is not None:
+        allowed = torch.zeros_like(finite_mask)
+        start = int(instrument_filter_id) * NUM_PITCHES
+        allowed[start : start + NUM_PITCHES] = True
+        finite_mask = finite_mask & allowed
+    if not bool(torch.any(finite_mask).item()):
+        return []
+
+    candidate_ids: set[int] = set()
+    threshold = float(settings.instrument_pair_gate_threshold)
+    threshold_mask = finite_mask & (scores >= threshold)
+    if bool(torch.any(threshold_mask).item()):
+        candidate_ids.update(
+            int(item) for item in threshold_mask.nonzero().flatten().tolist()
+        )
+
+    topk = max(0, int(settings.instrument_pair_infer_topk))
+    if topk > 0:
+        masked_scores = scores.masked_fill(~finite_mask, float("-inf"))
+        finite_count = int(torch.isfinite(masked_scores).sum().item())
+        if finite_count > 0:
+            top_ids = torch.topk(masked_scores, k=min(topk, finite_count)).indices
+            candidate_ids.update(int(item) for item in top_ids.tolist())
+
+    if not candidate_ids:
+        return []
+    ranked = sorted(
+        candidate_ids,
+        key=lambda pair_id: (-float(scores[int(pair_id)].item()), int(pair_id)),
+    )
+    max_pairs = int(settings.instrument_pair_max_pairs)
+    if max_pairs > 0:
+        ranked = ranked[:max_pairs]
+    return ranked
+
+
+def _decode_flat_boundary_features(
+    boundary_logits: torch.Tensor,
+    entries: list[tuple[int, int, int, int]],
+    *,
     num_tracks: int,
-) -> list[list[list[tuple[bool, bool, float, float]]]]:
-    flags: list[list[list[tuple[bool, bool, float, float]]]] = [
-        [[] for _ in range(num_tracks)] for _ in range(batch_size)
+) -> list[list[tuple[bool, bool, float, float]]]:
+    flags: list[list[tuple[bool, bool, float, float]]] = [
+        [] for _ in range(int(num_tracks))
     ]
     if not entries:
         return flags
@@ -104,8 +165,8 @@ def _decode_boundary_features(
     offset_values = torch.clamp((offset_dist.mean - 0.005) / 0.99, 0.0, 1.0)
 
     for row_index, entry in enumerate(entries):
-        batch_index, track_index, _, _, _ = entry
-        flags[int(batch_index)][int(track_index)].append(
+        track_index, _, _, _ = entry
+        flags[int(track_index)].append(
             (
                 bool(boundary_presence[row_index, 0].item()),
                 bool(boundary_presence[row_index, 1].item()),
@@ -122,61 +183,68 @@ class WindowNoteStitcher:
         *,
         hop_length: int,
         total_audio_frames: int,
-        num_pitch_slots: int,
         velocity: int,
         merge_gap_samples: int,
         merge_onset_samples: int,
     ) -> None:
         self.hop_length = int(hop_length)
         self.total_audio_frames = int(total_audio_frames)
-        self.num_pitch_slots = max(1, int(num_pitch_slots))
         self.velocity = max(1, min(127, int(velocity)))
         self.merge_gap_samples = int(merge_gap_samples)
         self.merge_onset_samples = int(merge_onset_samples)
-        self.notes_by_track: dict[int, list[PredictedNote]] = defaultdict(list)
-        self.last_closed_global_model_frames: list[int] | None = None
+        self.notes_by_pair: dict[int, list[PredictedNote]] = defaultdict(list)
+        self.last_closed_global_model_frames: dict[int, int] = {}
 
     def get_forced_start_positions(
         self,
         *,
+        pair_ids: list[int],
         window_start_frame: int,
-        num_tracks: int,
         valid_model_frames: int,
     ) -> list[int]:
-        self._ensure_track_state(num_tracks)
         if valid_model_frames <= 0:
-            return [0] * int(num_tracks)
+            return [0] * len(pair_ids)
 
         window_model_start = int(
             round(float(window_start_frame) / float(self.hop_length))
         )
-        return [
-            max(
-                0,
-                min(
-                    int(last_closed_frame) - window_model_start,
-                    int(valid_model_frames) - 1,
-                ),
+        positions: list[int] = []
+        for pair_id in pair_ids:
+            last_closed_frame = self.last_closed_global_model_frames.get(
+                int(pair_id), 0
             )
-            for last_closed_frame in self.last_closed_global_model_frames
-        ]
+            positions.append(
+                max(
+                    0,
+                    min(
+                        int(last_closed_frame) - window_model_start,
+                        int(valid_model_frames) - 1,
+                    ),
+                )
+            )
+        return positions
 
     def consume_window(
         self,
         *,
+        pair_ids: list[int],
         intervals_by_track: list[list[tuple[int, int]]],
         boundary_flags_by_track: list[list[tuple[bool, bool, float, float]]] | None,
         window_start_frame: int,
         valid_audio_frames: int,
         valid_model_frames: int,
     ) -> None:
-        self._ensure_track_state(len(intervals_by_track))
+        if len(pair_ids) != len(intervals_by_track):
+            raise ValueError("pair_ids length must match decoded interval tracks")
         window_model_start = int(
             round(float(window_start_frame) / float(self.hop_length))
         )
 
-        for track_index, track_intervals in enumerate(intervals_by_track):
-            track_notes = self.notes_by_track[int(track_index)]
+        for track_index, (pair_id, track_intervals) in enumerate(
+            zip(pair_ids, intervals_by_track)
+        ):
+            pair_id = int(pair_id)
+            track_notes = self.notes_by_pair[pair_id]
             track_boundary_flags = (
                 boundary_flags_by_track[track_index]
                 if boundary_flags_by_track is not None
@@ -191,7 +259,7 @@ class WindowNoteStitcher:
                     else None
                 )
                 note = self._build_interval_note(
-                    track_index=int(track_index),
+                    pair_id=pair_id,
                     begin_frame=int(begin_frame),
                     end_frame=int(end_frame),
                     boundary_flag=boundary_flag,
@@ -221,44 +289,31 @@ class WindowNoteStitcher:
                     local_last_closed_model_frame = int(end_frame)
 
             if local_last_closed_model_frame is not None:
-                self.last_closed_global_model_frames[track_index] = (
+                self.last_closed_global_model_frames[pair_id] = (
                     window_model_start + int(local_last_closed_model_frame)
                 )
 
     def finalize(self) -> list[PredictedNote]:
-        for track_notes in self.notes_by_track.values():
+        for track_notes in self.notes_by_pair.values():
             if track_notes:
                 track_notes[-1].has_offset = True
 
         stitched_notes = sorted(
             [
                 note
-                for track_notes in self.notes_by_track.values()
+                for track_notes in self.notes_by_pair.values()
                 for note in track_notes
                 if note.has_offset
             ],
             key=lambda note: (
-                note.start_sample,
-                note.pitch,
-                note.slot_index,
-                note.end_sample,
+                int(note.start_sample),
+                int(note.instrument_id),
+                int(note.pitch),
+                int(note.slot_index),
+                int(note.end_sample),
             ),
         )
         return self._merge_nearby_notes(stitched_notes)
-
-    def _ensure_track_state(self, num_tracks: int) -> None:
-        if self.last_closed_global_model_frames is None:
-            self.last_closed_global_model_frames = [0] * int(num_tracks)
-            return
-        if len(self.last_closed_global_model_frames) != int(num_tracks):
-            raise ValueError(
-                "num_tracks changed during note stitching: "
-                f"{len(self.last_closed_global_model_frames)} -> {num_tracks}"
-            )
-
-    def _track_to_pitch_slot(self, track_index: int) -> tuple[int, int]:
-        slot_count = max(1, int(self.num_pitch_slots))
-        return int(track_index) // slot_count, int(track_index) % slot_count
 
     @staticmethod
     def _resolve_interval_boundary_flags(
@@ -282,7 +337,7 @@ class WindowNoteStitcher:
     def _build_interval_note(
         self,
         *,
-        track_index: int,
+        pair_id: int,
         begin_frame: int,
         end_frame: int,
         boundary_flag: tuple[bool, bool, float, float] | None,
@@ -320,13 +375,15 @@ class WindowNoteStitcher:
         if start_sample >= window_valid_end:
             return None
 
-        pitch_index, slot_index = self._track_to_pitch_slot(int(track_index))
+        instrument_id = int(pair_id) // NUM_PITCHES
+        pitch_index = int(pair_id) % NUM_PITCHES
         return PredictedNote(
+            instrument_id=int(instrument_id),
             pitch=int(MIN_MIDI_PITCH + pitch_index),
             start_sample=int(start_sample),
             end_sample=int(end_sample),
             velocity=int(self.velocity),
-            slot_index=int(slot_index),
+            slot_index=0,
             has_onset=bool(has_onset),
             has_offset=bool(has_offset),
         )
@@ -353,25 +410,30 @@ class WindowNoteStitcher:
         ordered_notes = sorted(
             notes,
             key=lambda note: (
-                note.pitch,
-                note.slot_index,
-                note.start_sample,
-                note.end_sample,
+                int(note.instrument_id),
+                int(note.pitch),
+                int(note.slot_index),
+                int(note.start_sample),
+                int(note.end_sample),
             ),
         )
         merged: list[PredictedNote] = []
         current = replace(ordered_notes[0])
         for note in ordered_notes[1:]:
+            same_track = (
+                int(note.instrument_id) == int(current.instrument_id)
+                and int(note.pitch) == int(current.pitch)
+                and int(note.slot_index) == int(current.slot_index)
+            )
             can_merge_by_gap = (
-                note.pitch == current.pitch
-                and note.slot_index == current.slot_index
-                and note.start_sample <= current.end_sample + self.merge_gap_samples
+                same_track
+                and int(note.start_sample)
+                <= int(current.end_sample) + self.merge_gap_samples
                 and not note.has_onset
             )
             can_merge_by_onset = (
-                note.pitch == current.pitch
-                and note.slot_index == current.slot_index
-                and abs(note.start_sample - current.start_sample)
+                same_track
+                and abs(int(note.start_sample) - int(current.start_sample))
                 <= self.merge_onset_samples
             )
             if can_merge_by_gap:
@@ -386,10 +448,11 @@ class WindowNoteStitcher:
         return sorted(
             merged,
             key=lambda note: (
-                note.start_sample,
-                note.pitch,
-                note.slot_index,
-                note.end_sample,
+                int(note.start_sample),
+                int(note.instrument_id),
+                int(note.pitch),
+                int(note.slot_index),
+                int(note.end_sample),
             ),
         )
 
@@ -400,15 +463,26 @@ def decode_notes(
     config: SemiCRFModelConfig,
     waveform: torch.Tensor,
     *,
-    condition_instrument_id: int,
+    instrument_filter_id: int | None,
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     settings: InferenceSettings,
     velocity: int,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
-    if waveform.dim() != 2 or int(waveform.shape[0]) != 2:
-        raise ValueError("waveform must have shape [2, audio_frames]")
+    if waveform.dim() != 2:
+        raise ValueError("waveform must have shape [channels, audio_frames]")
+    expected_channels = int(getattr(config, "input_audio_channels", 2))
+    if int(waveform.shape[0]) != expected_channels:
+        if expected_channels == 1 and int(waveform.shape[0]) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        elif expected_channels == 2 and int(waveform.shape[0]) == 1:
+            waveform = waveform.expand(2, -1).contiguous()
+        else:
+            raise ValueError(
+                f"waveform has {int(waveform.shape[0])} channels, "
+                f"expected {expected_channels}"
+            )
 
     sample_rate = int(config.sample_rate)
     total_audio_frames = int(waveform.shape[-1])
@@ -439,7 +513,6 @@ def decode_notes(
     note_stitcher = WindowNoteStitcher(
         hop_length=int(config.hop_length),
         total_audio_frames=total_audio_frames,
-        num_pitch_slots=int(config.num_pitch_slots),
         velocity=int(velocity),
         merge_gap_samples=merge_gap_samples,
         merge_onset_samples=merge_onset_samples,
@@ -447,7 +520,14 @@ def decode_notes(
     silence_gate_linear = _silence_gate_rms_linear(settings.silence_gate_rms_dbfs)
     skipped_silent_window_count = 0
     decoded_window_count = 0
-    use_boundary_head = bool(model.supports_interval_boundaries())
+    selected_pair_count = 0
+    decoded_interval_count = 0
+    boundary_interval_count = 0
+    boundary_no_onset_count = 0
+    boundary_no_offset_count = 0
+    use_boundary_head = bool(
+        settings.use_boundary_head and model.supports_interval_boundaries()
+    )
     progress = tqdm(
         _iter_batches(window_starts, int(settings.window_batch_size)),
         total=math.ceil(len(window_starts) / max(1, int(settings.window_batch_size))),
@@ -496,12 +576,6 @@ def decode_notes(
             dtype=torch.long,
             device=device,
         )
-        condition_ids = torch.full(
-            (len(active_indices),),
-            int(condition_instrument_id),
-            dtype=torch.long,
-            device=device,
-        )
 
         with torch.amp.autocast(
             device_type=device.type,
@@ -510,15 +584,22 @@ def decode_notes(
         ):
             outputs = model(
                 batch_waveform,
-                condition_instrument_ids=condition_ids,
                 valid_audio_frames=valid_audio_frames_tensor,
+                include_aux_outputs=False,
             )
 
-        valid_lengths = outputs["frame_valid_mask"].to(dtype=torch.long).sum(dim=-1)
-        num_tracks = int(outputs["interval_query"].shape[2])
-        boundary_features = outputs.get("interval_features")
-        if boundary_features is None:
-            boundary_features = outputs["pitch_query_features"]
+        interval_features = outputs.get("interval_features")
+        pair_gate_logits = outputs.get("pair_gate_logits")
+        frame_valid_mask = outputs.get("frame_valid_mask")
+        if (
+            interval_features is None
+            or pair_gate_logits is None
+            or frame_valid_mask is None
+        ):
+            raise ValueError(
+                "Filtered V2 inference requires interval_features and pair_gate_logits"
+            )
+        valid_lengths = frame_valid_mask.to(dtype=torch.long).sum(dim=-1)
 
         for sample_index, (start_frame, valid_frames) in enumerate(
             zip(active_batch_starts, active_valid_audio_frames)
@@ -527,37 +608,84 @@ def decode_notes(
             if sample_valid_length <= 0:
                 continue
 
+            pair_ids = _select_pair_candidates(
+                pair_gate_logits[sample_index],
+                settings=settings,
+                instrument_filter_id=instrument_filter_id,
+            )
+            if not pair_ids:
+                continue
+            selected_pair_count += len(pair_ids)
+
             forced_start_pos = note_stitcher.get_forced_start_positions(
+                pair_ids=pair_ids,
                 window_start_frame=int(start_frame),
-                num_tracks=num_tracks,
                 valid_model_frames=sample_valid_length,
             )
-            decoded_intervals = decode_pitch_intervals(
-                outputs["interval_query"][sample_index : sample_index + 1],
-                outputs["interval_key"][sample_index : sample_index + 1],
-                outputs["interval_diag"][sample_index : sample_index + 1],
-                valid_lengths[sample_index : sample_index + 1],
-                length_scaling=str(config.semi_crf_length_scaling),
-                length_penalty=float(config.semi_crf_length_penalty),
-                note_bias=float(settings.note_bias),
-                track_batch_size=int(settings.track_batch_size),
-                forced_start_pos=[forced_start_pos],
-            )[0]
+            pair_features, _, _ = model.build_pair_interval_features(
+                interval_features[sample_index : sample_index + 1],
+                [pair_ids],
+            )
+            interval_query, interval_key, interval_diag = (
+                model.score_pair_interval_features(pair_features)
+            )
+            interval_query_batched = interval_query.unsqueeze(0)
+            interval_key_batched = interval_key.unsqueeze(0)
+            interval_diag_batched = interval_diag.unsqueeze(0)
+
+            if settings.semi_crf_sparse_decode:
+                decoded_intervals = decode_pitch_intervals_sparse(
+                    interval_query_batched,
+                    interval_key_batched,
+                    interval_diag_batched,
+                    valid_lengths[sample_index : sample_index + 1],
+                    length_scaling=str(config.semi_crf_length_scaling),
+                    length_penalty=float(config.semi_crf_length_penalty),
+                    note_bias=float(settings.note_bias),
+                    track_batch_size=int(settings.track_batch_size),
+                    forced_start_pos=[forced_start_pos],
+                    sparse_topk_per_start=int(settings.semi_crf_sparse_topk_per_start),
+                    sparse_score_threshold=settings.semi_crf_sparse_score_threshold,
+                    sparse_max_span_frames=settings.semi_crf_sparse_max_span_frames,
+                )[0]
+            else:
+                decoded_intervals = decode_pitch_intervals(
+                    interval_query_batched,
+                    interval_key_batched,
+                    interval_diag_batched,
+                    valid_lengths[sample_index : sample_index + 1],
+                    length_scaling=str(config.semi_crf_length_scaling),
+                    length_penalty=float(config.semi_crf_length_penalty),
+                    note_bias=float(settings.note_bias),
+                    track_batch_size=int(settings.track_batch_size),
+                    forced_start_pos=[forced_start_pos],
+                )[0]
+
+            decoded_interval_count += sum(len(track) for track in decoded_intervals)
 
             boundary_flags_by_track = None
             if use_boundary_head:
-                boundary_logits, boundary_entries = model.predict_interval_boundaries(
-                    boundary_features[sample_index : sample_index + 1].float(),
-                    [decoded_intervals],
+                boundary_logits, boundary_entries = (
+                    model.predict_flat_interval_boundaries(
+                        pair_features.float(),
+                        decoded_intervals,
+                    )
                 )
-                boundary_flags_by_track = _decode_boundary_features(
+                boundary_interval_count += len(boundary_entries)
+                boundary_flags_by_track = _decode_flat_boundary_features(
                     boundary_logits,
                     boundary_entries,
-                    batch_size=1,
-                    num_tracks=num_tracks,
-                )[0]
+                    num_tracks=len(pair_ids),
+                )
+                for track_flags in boundary_flags_by_track:
+                    for has_onset, has_offset, _, _ in track_flags:
+                        if not has_onset:
+                            boundary_no_onset_count += 1
+                        if not has_offset:
+                            boundary_no_offset_count += 1
 
             note_stitcher.consume_window(
+                pair_ids=pair_ids,
                 intervals_by_track=decoded_intervals,
                 boundary_flags_by_track=boundary_flags_by_track,
                 window_start_frame=int(start_frame),
@@ -574,4 +702,10 @@ def decode_notes(
         "skipped_silent_window_count": int(skipped_silent_window_count),
         "window_audio_frames": int(window_audio_frames),
         "stride_audio_frames": int(stride_audio_frames),
+        "selected_pair_count": int(selected_pair_count),
+        "decoded_interval_count": int(decoded_interval_count),
+        "boundary_interval_count": int(boundary_interval_count),
+        "boundary_no_onset_count": int(boundary_no_onset_count),
+        "boundary_no_offset_count": int(boundary_no_offset_count),
+        "note_count": len(notes),
     }
