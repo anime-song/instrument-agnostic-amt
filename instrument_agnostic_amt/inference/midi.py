@@ -126,6 +126,10 @@ def _instrument_name(instrument_id: int) -> str:
     return "Piano"
 
 
+def _normalize_instrument_class_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 def _is_drum_instrument_id(instrument_id: int) -> bool:
     return _instrument_name(int(instrument_id)).lower() == "drums"
 
@@ -225,13 +229,25 @@ def _remap_overflow_midi_instruments(
     )
 
 
-def _build_instrument(instrument_id: int) -> pretty_midi.Instrument:
+def _build_instrument(
+    instrument_id: int,
+    *,
+    instrument_volumes: dict[str, int] | None,
+) -> pretty_midi.Instrument:
     class_name = _instrument_name(int(instrument_id))
-    return pretty_midi.Instrument(
+    instrument = pretty_midi.Instrument(
         program=get_program_number_from_class_id(int(instrument_id)),
         is_drum=class_name.lower() == "drums",
         name=class_name,
     )
+    if instrument_volumes is not None:
+        class_key = _normalize_instrument_class_name(class_name)
+        volume = instrument_volumes.get(class_key)
+        if volume is not None:
+            instrument.control_changes.append(
+                pretty_midi.ControlChange(number=7, value=int(volume), time=0.0)
+            )
+    return instrument
 
 
 def build_midi(
@@ -241,6 +257,7 @@ def build_midi(
     instrument_id: int | None,
     min_midi_note_ms: float,
     max_midi_melodic_instruments: int = 0,
+    instrument_volumes: dict[str, int] | None = None,
     return_stats: bool = False,
 ) -> pretty_midi.PrettyMIDI | tuple[pretty_midi.PrettyMIDI, dict[str, int]]:
     midi = pretty_midi.PrettyMIDI(resolution=1920)
@@ -282,7 +299,10 @@ def build_midi(
             grouped_notes[int(note.instrument_id)].append(note)
 
     for current_instrument_id in sorted(grouped_notes):
-        instrument = _build_instrument(int(current_instrument_id))
+        instrument = _build_instrument(
+            int(current_instrument_id),
+            instrument_volumes=instrument_volumes,
+        )
         for note in sorted(
             grouped_notes[current_instrument_id],
             key=lambda item: (

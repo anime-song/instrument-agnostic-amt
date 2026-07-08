@@ -20,6 +20,70 @@ from ..taxonomy.instrument_classes import (
 )
 
 
+DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
+    "piano": 105,
+    "electric_piano": 96,
+    "acoustic_guitar": 88,
+    "electric_guitar_clean": 84,
+    "distorted_guitar": 78,
+    "electric_guitar_muted": 68,
+    "guitar_harmonics": 72,
+    "acoustic_bass": 92,
+    "electric_bass": 90,
+    "synth_bass": 86,
+    "drums": 100,
+    "strings": 82,
+    "brass": 84,
+    "sax": 86,
+    "flute_pipe": 84,
+    "choir": 80,
+    "organ": 88,
+    "synth_pad": 76,
+    "synth_lead": 84,
+    "melody": 110,
+    "vocal_harmony": 60,
+}
+
+
+def _normalize_instrument_class_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
+    if not entries:
+        return dict(DEFAULT_INSTRUMENT_VOLUMES)
+
+    available_names = {
+        _normalize_instrument_class_name(class_name): class_name
+        for class_name in INSTRUMENT_CLASSES
+    }
+    volume_map: dict[str, int] = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid --instrument-volume '{entry}'. Expected CLASS=VALUE."
+            )
+        raw_name, raw_value = entry.split("=", 1)
+        class_key = _normalize_instrument_class_name(raw_name)
+        if class_key not in available_names:
+            available = ", ".join(sorted(available_names.keys()))
+            raise ValueError(
+                f"Unknown instrument class '{raw_name}'. Available classes: {available}"
+            )
+        try:
+            volume = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid volume '{raw_value}' for instrument '{raw_name}'."
+            ) from exc
+        if not 0 <= volume <= 127:
+            raise ValueError(
+                f"Volume for instrument '{raw_name}' must be in the range 0-127."
+            )
+        volume_map[class_key] = volume
+    return volume_map
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run CQT/StemConv instrument-pitch AMT inference."
@@ -146,6 +210,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--velocity", type=int, default=100)
+    parser.add_argument(
+        "--instrument-volume",
+        action="append",
+        default=[],
+        metavar="CLASS=VALUE",
+        help=(
+            "Set MIDI CC7 volume (0-127) for a specific instrument class. "
+            "Repeatable, e.g. --instrument-volume piano=90 "
+            "--instrument-volume acoustic_guitar=70. If omitted, a built-in "
+            "per-instrument default mix is used."
+        ),
+    )
     parser.add_argument("--min-midi-note-ms", type=float, default=5.0)
     parser.add_argument(
         "--max-midi-melodic-instruments",
@@ -199,6 +275,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--silence-gate-rms-dbfs must be <= 0")
     if args.max_midi_melodic_instruments < 0:
         parser.error("--max-midi-melodic-instruments must be non-negative")
+    try:
+        args.instrument_volume_map = _parse_instrument_volume_args(
+            args.instrument_volume
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -370,6 +452,7 @@ def process_file(
         instrument_id=instrument_id,
         min_midi_note_ms=float(args.min_midi_note_ms),
         max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
+        instrument_volumes=dict(args.instrument_volume_map),
         return_stats=True,
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
