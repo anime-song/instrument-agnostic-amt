@@ -13,6 +13,7 @@ class PredictedNote:
     slot_index: int = 0
     has_onset: bool = True
     has_offset: bool = True
+    instrument_candidates: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

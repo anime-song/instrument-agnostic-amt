@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 
 import pretty_midi
@@ -126,6 +126,105 @@ def _instrument_name(instrument_id: int) -> str:
     return "Piano"
 
 
+def _is_drum_instrument_id(instrument_id: int) -> bool:
+    return _instrument_name(int(instrument_id)).lower() == "drums"
+
+
+def _midi_instrument_count(notes: list[PredictedNote]) -> int:
+    return len({int(note.instrument_id) for note in notes})
+
+
+def _remap_stats(
+    *,
+    before_count: int,
+    after_count: int,
+    remapped_instrument_count: int,
+    remapped_note_count: int,
+) -> dict[str, int]:
+    return {
+        "midi_instrument_count_before_remap": int(before_count),
+        "midi_instrument_count_after_remap": int(after_count),
+        "remapped_instrument_count": int(remapped_instrument_count),
+        "remapped_note_count": int(remapped_note_count),
+    }
+
+
+def _remap_overflow_midi_instruments(
+    notes: list[PredictedNote],
+    *,
+    max_melodic_instruments: int,
+) -> tuple[list[PredictedNote], dict[str, int]]:
+    before_count = _midi_instrument_count(notes)
+    if not notes or int(max_melodic_instruments) <= 0:
+        return notes, _remap_stats(
+            before_count=before_count,
+            after_count=before_count,
+            remapped_instrument_count=0,
+            remapped_note_count=0,
+        )
+
+    counts = Counter(int(note.instrument_id) for note in notes)
+    melodic_ids = [
+        instrument_id
+        for instrument_id in counts
+        if not _is_drum_instrument_id(int(instrument_id))
+    ]
+    if len(melodic_ids) <= int(max_melodic_instruments):
+        return notes, _remap_stats(
+            before_count=before_count,
+            after_count=before_count,
+            remapped_instrument_count=0,
+            remapped_note_count=0,
+        )
+
+    kept_melodic_ids = set(
+        sorted(melodic_ids, key=lambda inst_id: (-counts[int(inst_id)], int(inst_id)))[
+            : int(max_melodic_instruments)
+        ]
+    )
+    overflow_ids = set(melodic_ids) - kept_melodic_ids
+    fallback_inst_id = sorted(
+        kept_melodic_ids,
+        key=lambda inst_id: (-counts[int(inst_id)], int(inst_id)),
+    )[0]
+
+    remapped_notes: list[PredictedNote] = []
+    remapped_note_count = 0
+    for note in notes:
+        inst_id = int(note.instrument_id)
+        if inst_id not in overflow_ids:
+            remapped_notes.append(note)
+            continue
+
+        replacement_inst_id = None
+        for candidate_id in note.instrument_candidates:
+            candidate_id = int(candidate_id)
+            if candidate_id in kept_melodic_ids:
+                replacement_inst_id = candidate_id
+                break
+        if replacement_inst_id is None:
+            replacement_inst_id = int(fallback_inst_id)
+
+        remapped_notes.append(replace(note, instrument_id=int(replacement_inst_id)))
+        remapped_note_count += 1
+
+    remapped_notes = sorted(
+        remapped_notes,
+        key=lambda note: (
+            int(note.start_sample),
+            int(note.pitch),
+            int(note.instrument_id),
+            int(note.end_sample),
+        ),
+    )
+    return remapped_notes, _remap_stats(
+        before_count=before_count,
+        after_count=_midi_instrument_count(remapped_notes),
+        remapped_instrument_count=len(overflow_ids),
+        remapped_note_count=remapped_note_count,
+    )
+
+
 def _build_instrument(instrument_id: int) -> pretty_midi.Instrument:
     class_name = _instrument_name(int(instrument_id))
     return pretty_midi.Instrument(
@@ -141,7 +240,9 @@ def build_midi(
     sample_rate: int,
     instrument_id: int | None,
     min_midi_note_ms: float,
-) -> pretty_midi.PrettyMIDI:
+    max_midi_melodic_instruments: int = 0,
+    return_stats: bool = False,
+) -> pretty_midi.PrettyMIDI | tuple[pretty_midi.PrettyMIDI, dict[str, int]]:
     midi = pretty_midi.PrettyMIDI(resolution=1920)
     min_midi_note_samples = max(
         0,
@@ -156,6 +257,10 @@ def build_midi(
             for note in export_notes
             if int(note.instrument_id) == int(instrument_id)
         ]
+    export_notes, midi_stats = _remap_overflow_midi_instruments(
+        export_notes,
+        max_melodic_instruments=int(max_midi_melodic_instruments),
+    )
     export_notes = _truncate_overlapping_notes(
         export_notes,
         min_separation_samples=min_separation_samples,
@@ -164,6 +269,9 @@ def build_midi(
         export_notes,
         min_duration_samples=min_midi_note_samples,
         min_separation_samples=min_separation_samples,
+    )
+    midi_stats["midi_instrument_count_after_remap"] = _midi_instrument_count(
+        export_notes
     )
 
     grouped_notes: dict[int, list[PredictedNote]] = defaultdict(list)
@@ -192,4 +300,6 @@ def build_midi(
                 )
             )
         midi.instruments.append(instrument)
+    if return_stats:
+        return midi, midi_stats
     return midi

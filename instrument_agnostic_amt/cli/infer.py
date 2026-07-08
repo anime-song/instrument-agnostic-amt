@@ -147,6 +147,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--velocity", type=int, default=100)
     parser.add_argument("--min-midi-note-ms", type=float, default=5.0)
+    parser.add_argument(
+        "--max-midi-melodic-instruments",
+        type=int,
+        default=15,
+        help=(
+            "Maximum number of non-drum instrument tracks in exported MIDI. "
+            "Extra low-note-count instruments are reassigned by predicted "
+            "instrument confidence rank. Use 0 to disable."
+        ),
+    )
     args = parser.parse_args()
     if args.audio is None and args.audio_dir is None:
         parser.error("one of --audio or --audio-dir is required")
@@ -187,6 +197,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--merge-onset-ms must be non-negative")
     if args.silence_gate_rms_dbfs is not None and args.silence_gate_rms_dbfs > 0:
         parser.error("--silence-gate-rms-dbfs must be <= 0")
+    if args.max_midi_melodic_instruments < 0:
+        parser.error("--max-midi-melodic-instruments must be non-negative")
     return args
 
 
@@ -352,11 +364,13 @@ def process_file(
         settings=settings,
         velocity=int(args.velocity),
     )
-    midi = build_midi(
+    midi, midi_stats = build_midi(
         notes,
         sample_rate=int(config.sample_rate),
         instrument_id=instrument_id,
         min_midi_note_ms=float(args.min_midi_note_ms),
+        max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
+        return_stats=True,
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
     midi.write(str(output_midi_path))
@@ -370,7 +384,11 @@ def process_file(
         f"selected_pairs={stats['selected_pair_count']} "
         f"decoded_intervals={stats['decoded_interval_count']} "
         f"boundary_no_onset={stats['boundary_no_onset_count']} "
-        f"boundary_no_offset={stats['boundary_no_offset_count']}"
+        f"boundary_no_offset={stats['boundary_no_offset_count']} "
+        f"midi_instruments_before_remap={midi_stats['midi_instrument_count_before_remap']} "
+        f"midi_instruments_after_remap={midi_stats['midi_instrument_count_after_remap']} "
+        f"remapped_instruments={midi_stats['remapped_instrument_count']} "
+        f"remapped_notes={midi_stats['remapped_note_count']}"
     )
 
 

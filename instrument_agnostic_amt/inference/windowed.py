@@ -146,6 +146,67 @@ def _select_pair_candidates(
     return ranked
 
 
+def _rank_instrument_candidates_by_pitch(
+    pair_gate_logits: torch.Tensor,
+    *,
+    instrument_filter_id: int | None,
+) -> list[tuple[int, ...]]:
+    if pair_gate_logits.dim() != 2:
+        raise ValueError("pair_gate_logits must have shape [I, P]")
+    num_instruments, num_pitches = pair_gate_logits.shape
+    if int(num_pitches) != NUM_PITCHES:
+        raise ValueError(f"expected {NUM_PITCHES} pitches, got {int(num_pitches)}")
+    if instrument_filter_id is not None:
+        if not 0 <= int(instrument_filter_id) < int(num_instruments):
+            raise ValueError("instrument_filter_id is out of range")
+        return [(int(instrument_filter_id),) for _ in range(NUM_PITCHES)]
+
+    scores = pair_gate_logits.detach().float().cpu()
+    ranked_by_pitch: list[tuple[int, ...]] = []
+    for pitch_index in range(NUM_PITCHES):
+        score_values = [
+            float(scores[instrument_index, pitch_index].item())
+            for instrument_index in range(int(num_instruments))
+        ]
+        finite_ids = [
+            instrument_index
+            for instrument_index, score in enumerate(score_values)
+            if math.isfinite(score)
+        ]
+        if finite_ids:
+            ranked = sorted(
+                finite_ids,
+                key=lambda instrument_index: (
+                    -score_values[int(instrument_index)],
+                    int(instrument_index),
+                ),
+            )
+        else:
+            ranked = []
+        seen = set(ranked)
+        ranked.extend(
+            instrument_index
+            for instrument_index in range(int(num_instruments))
+            if instrument_index not in seen
+        )
+        ranked_by_pitch.append(tuple(int(item) for item in ranked))
+    return ranked_by_pitch
+
+
+def _merge_instrument_candidates(
+    primary: tuple[int, ...], secondary: tuple[int, ...]
+) -> tuple[int, ...]:
+    merged: list[int] = []
+    seen: set[int] = set()
+    for candidate in (*primary, *secondary):
+        candidate_id = int(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        merged.append(candidate_id)
+    return tuple(merged)
+
+
 def _decode_flat_boundary_features(
     boundary_logits: torch.Tensor,
     entries: list[tuple[int, int, int, int]],
@@ -230,6 +291,7 @@ class WindowNoteStitcher:
         pair_ids: list[int],
         intervals_by_track: list[list[tuple[int, int]]],
         boundary_flags_by_track: list[list[tuple[bool, bool, float, float]]] | None,
+        instrument_candidates_by_pair: dict[int, tuple[int, ...]] | None,
         window_start_frame: int,
         valid_audio_frames: int,
         valid_model_frames: int,
@@ -250,6 +312,11 @@ class WindowNoteStitcher:
                 if boundary_flags_by_track is not None
                 else []
             )
+            instrument_candidates = (
+                instrument_candidates_by_pair.get(pair_id, ())
+                if instrument_candidates_by_pair is not None
+                else ()
+            )
             local_last_closed_model_frame: int | None = None
 
             for interval_index, (begin_frame, end_frame) in enumerate(track_intervals):
@@ -263,6 +330,7 @@ class WindowNoteStitcher:
                     begin_frame=int(begin_frame),
                     end_frame=int(end_frame),
                     boundary_flag=boundary_flag,
+                    instrument_candidates=instrument_candidates,
                     window_start_frame=int(window_start_frame),
                     valid_audio_frames=int(valid_audio_frames),
                     valid_model_frames=int(valid_model_frames),
@@ -341,6 +409,7 @@ class WindowNoteStitcher:
         begin_frame: int,
         end_frame: int,
         boundary_flag: tuple[bool, bool, float, float] | None,
+        instrument_candidates: tuple[int, ...],
         window_start_frame: int,
         valid_audio_frames: int,
         valid_model_frames: int,
@@ -377,6 +446,9 @@ class WindowNoteStitcher:
 
         instrument_id = int(pair_id) // NUM_PITCHES
         pitch_index = int(pair_id) % NUM_PITCHES
+        candidates = tuple(int(candidate) for candidate in instrument_candidates)
+        if int(instrument_id) not in candidates:
+            candidates = (int(instrument_id),) + candidates
         return PredictedNote(
             instrument_id=int(instrument_id),
             pitch=int(MIN_MIDI_PITCH + pitch_index),
@@ -386,6 +458,7 @@ class WindowNoteStitcher:
             slot_index=0,
             has_onset=bool(has_onset),
             has_offset=bool(has_offset),
+            instrument_candidates=candidates,
         )
 
     @staticmethod
@@ -397,6 +470,10 @@ class WindowNoteStitcher:
     ) -> None:
         target.end_sample = max(int(target.end_sample), int(source.end_sample))
         target.velocity = max(int(target.velocity), int(source.velocity))
+        target.instrument_candidates = _merge_instrument_candidates(
+            target.instrument_candidates,
+            source.instrument_candidates,
+        )
         target.has_onset = bool(target.has_onset or source.has_onset)
         if overwrite_offset:
             target.has_offset = bool(source.has_offset)
@@ -616,6 +693,14 @@ def decode_notes(
             if not pair_ids:
                 continue
             selected_pair_count += len(pair_ids)
+            candidate_orders_by_pitch = _rank_instrument_candidates_by_pitch(
+                pair_gate_logits[sample_index],
+                instrument_filter_id=instrument_filter_id,
+            )
+            instrument_candidates_by_pair = {
+                int(pair_id): candidate_orders_by_pitch[int(pair_id) % NUM_PITCHES]
+                for pair_id in pair_ids
+            }
 
             forced_start_pos = note_stitcher.get_forced_start_positions(
                 pair_ids=pair_ids,
@@ -688,6 +773,7 @@ def decode_notes(
                 pair_ids=pair_ids,
                 intervals_by_track=decoded_intervals,
                 boundary_flags_by_track=boundary_flags_by_track,
+                instrument_candidates_by_pair=instrument_candidates_by_pair,
                 window_start_frame=int(start_frame),
                 valid_audio_frames=int(valid_frames),
                 valid_model_frames=sample_valid_length,
