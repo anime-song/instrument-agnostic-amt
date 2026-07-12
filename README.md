@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-07-12 | 🎯 Added per-stem instrument class selection. Excluding implausible instruments before probability calculation is expected to reduce instrument misclassification in the stem-separated workflow. |
 | 2026-06-24 | 🥁 Added experimental drum-focused inference model (`--type drums`) |
 | 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |
 | 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
@@ -355,6 +356,8 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
+The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
+
 ### Additional options
 
 ```bash
@@ -385,6 +388,7 @@ python infer.py \
 | `--merge-gap-ms` | 1 hop | Merge threshold for small note gaps |
 | `--merge-onset-ms` | `20.0` | Merge threshold for near-simultaneous onsets |
 | `--max-midi-melodic-instruments` | `15` | Max instrument tracks |
+| `--allowed-instruments` | all classes | Instrument classification candidates. Accepts comma-separated names or repeated arguments; softmax probabilities are renormalized within the selected classes |
 | `--silence-gate-rms-dbfs` | `-72` | RMS threshold to skip silent windows |
 
 ---
