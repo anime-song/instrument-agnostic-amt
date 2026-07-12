@@ -67,6 +67,27 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 - 🔧 **Extensive data augmentation** — Stem mixing, IR reverb, EQ, noise injection, drum addition, and more
 - 🧪 **[Experimental] Instrument classification & multi-track output** — 33+ instrument class head for per-instrument MIDI tracks (accuracy still improving)
 
+## Known Limitations
+
+This project is still under active development. Depending on the source audio and performance, the following issues may occur.
+
+### Instrument classification
+
+Instrument classification and multi-track MIDI output are experimental features.
+
+- During bass transcription, slap bass and synth bass may not be recognized as distinct instrument classes and may instead be classified as `electric bass`.
+- During piano transcription, electric and acoustic pianos are frequently confused due to limited classification accuracy between the two classes.
+- Instruments such as sitar and banjo that bleed into a separated guitar stem may not be assigned to the correct instrument class.
+
+### Transcription accuracy
+
+- Fast vocal passages, swing phrasing, and other complex phrases may produce inaccurate pitches, note boundaries, or durations.
+- In some cases, a single sustained note may be split into multiple short notes (note over-segmentation).
+
+### Stem-separated workflow
+
+- Transcribing separated stems independently may introduce small timing offsets between the resulting MIDI files, causing synchronization issues after they are merged.
+
 ---
 
 ## Architecture
