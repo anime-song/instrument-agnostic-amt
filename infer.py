@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -470,6 +471,49 @@ def resolve_stem_instrument_class_ids(stem_name: str) -> tuple[int, ...] | None:
                 STEM_INSTRUMENT_CLASSES[canonical_name]
             )
     return None
+
+
+def filter_supported_instrument_class_ids(
+    allowed_instrument_ids: tuple[int, ...] | None,
+    *,
+    num_model_classes: int,
+) -> tuple[int, ...] | None:
+    """Drop candidate IDs that are not represented by a checkpoint head."""
+    if allowed_instrument_ids is None:
+        return None
+    if num_model_classes <= 0:
+        raise ValueError("num_model_classes must be positive")
+
+    supported_ids = tuple(
+        class_id
+        for class_id in allowed_instrument_ids
+        if 0 <= class_id < num_model_classes
+    )
+    unsupported_ids = tuple(
+        class_id for class_id in allowed_instrument_ids if class_id not in supported_ids
+    )
+    if unsupported_ids:
+        from instrument_classes import INSTRUMENT_CLASSES
+
+        unsupported_names = [
+            INSTRUMENT_CLASSES[class_id]
+            if 0 <= class_id < len(INSTRUMENT_CLASSES)
+            else str(class_id)
+            for class_id in unsupported_ids
+        ]
+        warnings.warn(
+            f"Checkpoint instrument head has {num_model_classes} classes; "
+            "ignoring unsupported candidate(s): "
+            f"{', '.join(unsupported_names)}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if not supported_ids:
+        raise ValueError(
+            "None of the allowed instrument IDs are supported by the checkpoint: "
+            f"num_model_classes={num_model_classes}, ids={allowed_instrument_ids}"
+        )
+    return supported_ids
 
 
 def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
@@ -1572,6 +1616,11 @@ def run_inference(
 ) -> tuple[list[PredictedNote], dict[str, int], dict[str, np.ndarray]]:
     if waveform.dim() != 2 or int(waveform.shape[0]) != 2:
         raise ValueError("waveform must have shape [2, audio_frames]")
+
+    allowed_instrument_ids = filter_supported_instrument_class_ids(
+        allowed_instrument_ids,
+        num_model_classes=int(model_config.num_instrument_classes),
+    )
 
     sample_rate = int(model_config.sample_rate)
     total_audio_frames = int(waveform.shape[-1])
