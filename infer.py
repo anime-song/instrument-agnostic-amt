@@ -224,7 +224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-onset-ms",
         type=float,
-        default=20.0,
+        default=50.0,
         help="Merge same-pitch notes when their onset difference is below this threshold.",
     )
     parser.add_argument(
