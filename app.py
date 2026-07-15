@@ -53,6 +53,9 @@ class TranskunTranscriber(BaseTranscriber):
             max_midi_melodic_instruments=MAX_MIDI_MELODIC_INSTRUMENTS,
             cleanup_separated_stems=CLEANUP_SEPARATED_STEMS,
             merge_onset_ms=MERGE_ONSET_MS,
+            use_adtof_transcriber=True,
+            use_stft_vocalizer=True,
+            use_transkun=True
         )
         merged_midi_path = Path(stem_pipeline_result["merged_midi_path"])
 

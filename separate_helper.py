@@ -11,11 +11,13 @@ from instrument_classes import INSTRUMENT_CLASSES
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 from adtof_pytorch import transcribe_to_midi
+from transkun_helper import transcribe_with_transkun
 import librosa
 import soundfile as sf
 import numpy as np
 
 from velocity_estimator import estimate_velocities_for_notes, apply_velocities_to_notes
+
 
 
 INSTRUMENT_CLASS_GAIN: dict[str, int] = {  
@@ -208,6 +210,8 @@ def resolve_stem_model_type(stem_name):
         return "guitar"
     if "other" in stem_name:
         return "other"
+    if "piano" in stem_name:
+        return "piano"
     return "default"
 
 
@@ -300,6 +304,9 @@ def run_stem_separated_transcription(
     max_midi_melodic_instruments=15,
     transcribe_drum_stems=True,
     cleanup_separated_stems=False,
+    use_adtof_transcriber=False,
+    use_stft_vocalizer=False,
+    use_transkun=False,
     merge_onset_ms=20.0,
 ):
     """ステム分離 -> 各ステム採譜 -> MIDI マージを 1 回で実行する。"""
@@ -370,6 +377,24 @@ def run_stem_separated_transcription(
             continue
 
         output_midi = stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
+
+        if "drum" in stem_name.lower() and use_adtof_transcriber:
+            print(f"Transcribing drum stem with ADTOF transcriber: {stem_name}")
+            transcribe_to_midi(stem_path, output_midi)
+            song_midi_paths.append(output_midi)
+            continue
+        elif "vocal" in stem_name.lower() and use_stft_vocalizer:
+            print(f"Transcribing vocal stem with STFT transcriber: {stem_name}")
+            from stft_transcriber import wav_to_midi
+            wav_to_midi(stem_path, output_midi)
+            song_midi_paths.append(output_midi)
+            continue
+        elif "piano" in stem_name.lower() and use_transkun:
+            print(f"Transcribing piano stem with Transkun transcriber: {stem_name}")
+            transcribe_with_transkun(stem_path, output_midi)
+            song_midi_paths.append(output_midi)
+            continue
+
         model_type = resolve_stem_model_type(stem_name)
         current_bundle = get_amt_bundle(model_type)
         current_amt_model = current_bundle["amt_model"]
