@@ -391,8 +391,7 @@ def run_stem_separated_transcription(
 
         waveform, _, _ = infer._load_audio(
             Path(stem_path),
-            target_sample_rate=current_amt_config.sample_rate,
-            allowed_instrument_ids=allowed_instrument_ids
+            target_sample_rate=current_amt_config.sample_rate
         )
         notes, _, _ = infer.run_inference(
             model=current_amt_model,
@@ -409,7 +408,8 @@ def run_stem_separated_transcription(
             window_batch_size=window_batch_size,
             max_midi_melodic_instruments=max_midi_melodic_instruments,
             disable_tqdm=True,
-            max_note_seconds=15.0
+            max_note_seconds=15.0,
+            allowed_instrument_ids=allowed_instrument_ids
         )
 
         # Estimate MIDI velocities from audio amplitude

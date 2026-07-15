@@ -25,7 +25,7 @@ WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
 MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
 SKIP_DRUM_STEMS = True  # @param {type:"boolean"}
 CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}
-MERGE_ONSET_MS = 20.0  # @param {type:"number"}
+MERGE_ONSET_MS = 50.0  # @param {type:"number"}
 
 
 
@@ -104,7 +104,7 @@ class UploadedFile(BaseModel):
 # ---------- 页面 ----------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html", {"request": request})
 
 # ---------- 上传 ----------
 @app.post("/upload")

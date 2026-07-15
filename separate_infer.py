@@ -3,7 +3,7 @@ OUTPUT_ROOT = "U:"  # @param {type:"string"}
 WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
 MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
 CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}
-MERGE_ONSET_MS = 20.0  # @param {type:"number"}
+MERGE_ONSET_MS = 50.0  # @param {type:"number"}
 
 from pathlib import Path
 import shutil
