@@ -14,8 +14,8 @@ if not _MERGE_JSON_PATH.exists():
 # 既存の33楽器クラスは sorted(labels.keys()) のIDで保存済みnpzに入っている。
 # 新しい非GMクラスは末尾に追加して、既存IDをずらさない。
 EXTRA_INSTRUMENT_CLASS_PROGRAMS = {
-    "melody": 85,  # 推論結果をMIDIに戻すときの代表音色はSynth Voxにする。
-     "vocal_harmony": 85,
+    "melody": 65,  # 推論結果をMIDIに戻すときの代表音色はAlto Saxにする。
+    "vocal_harmony": 65,
     "wind_chimes": 124,
 }
 
@@ -62,7 +62,8 @@ def _load_instrument_mappings() -> None:
             INSTRUMENT_CLASSES.append(class_name)
 
     NUM_INSTRUMENT_CLASSES = len(INSTRUMENT_CLASSES)
-    _CLASS_NAME_TO_ID = {name: idx for idx, name in enumerate(INSTRUMENT_CLASSES)}
+    _CLASS_NAME_TO_ID = {name: idx for idx,
+                         name in enumerate(INSTRUMENT_CLASSES)}
 
     for class_name, class_info in labels.items():
         default_member = class_info.get("default_member")
