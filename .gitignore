@@ -236,6 +236,7 @@ dataset_config.yaml
 .codex
 *.bat
 beat_chord_dataset/
+batch_process_unlabeled.py
 
 # Output MIDI files
 out/

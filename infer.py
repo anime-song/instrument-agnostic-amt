@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -28,6 +29,7 @@ HF_CHECKPOINT_BASE_URL = (
 MODEL_CHECKPOINT_FILENAMES = {
     "default": "best_model.pth",
     "bass": "best_model_bass.pth",
+    "bass_v2": "best_model_bass_v2.pth",
     "vocal": "best_model_vocal.pth",
     "guitar": "best_model_guitar.pth",
     "vocal_harmony": "best_model_vocal_harmony.pth",
@@ -41,9 +43,7 @@ def _build_checkpoint_url(filename: str) -> str:
     return f"{HF_CHECKPOINT_BASE_URL}/{filename}?download=true"
 
 
-DEFAULT_CHECKPOINT_URL = _build_checkpoint_url(
-    MODEL_CHECKPOINT_FILENAMES["default"]
-)
+DEFAULT_CHECKPOINT_URL = _build_checkpoint_url(MODEL_CHECKPOINT_FILENAMES["default"])
 
 
 @dataclass
@@ -89,8 +89,35 @@ def _normalize_instrument_probability_mode(mode: str | None) -> str:
     raise ValueError(f"Unsupported instrument probability mode: {mode}")
 
 
-def _instrument_probabilities(logits: torch.Tensor, *, mode: str) -> torch.Tensor:
+def _instrument_probabilities(
+    logits: torch.Tensor,
+    *,
+    mode: str,
+    allowed_instrument_ids: tuple[int, ...] | None = None,
+) -> torch.Tensor:
     probability_mode = _normalize_instrument_probability_mode(mode)
+    if allowed_instrument_ids is not None:
+        if not allowed_instrument_ids:
+            raise ValueError("allowed_instrument_ids must not be empty")
+        num_classes = int(logits.shape[-1])
+        if any(
+            class_id < 0 or class_id >= num_classes
+            for class_id in allowed_instrument_ids
+        ):
+            raise ValueError(
+                "allowed_instrument_ids contains an ID outside the model output: "
+                f"num_classes={num_classes}, ids={allowed_instrument_ids}"
+            )
+        selected_ids = list(allowed_instrument_ids)
+        selected_logits = logits[..., selected_ids]
+        if probability_mode == "softmax":
+            selected_probabilities = torch.softmax(selected_logits, dim=-1)
+        else:
+            selected_probabilities = torch.sigmoid(selected_logits)
+        probabilities = torch.zeros_like(logits)
+        probabilities[..., selected_ids] = selected_probabilities
+        return probabilities
+
     if probability_mode == "softmax":
         return torch.softmax(logits, dim=-1)
     return torch.sigmoid(logits)
@@ -130,7 +157,57 @@ DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
     "synth_pad": 76,
     "synth_lead": 84,
     "melody": 110,
-    "vocal_harmony": 60
+    "vocal_harmony": 60,
+}
+
+DEFAULT_MIDI_PROGRAM_OVERRIDES: dict[str, int] = {
+    "acoustic_guitar": 25,
+}
+
+# Instrument classes that are plausible for each source produced by the
+# six-stem separator used by Colab_Inference.ipynb. Keeping this mapping in
+# infer.py also makes the same filtering available to other inference clients.
+STEM_INSTRUMENT_CLASSES: dict[str, tuple[str, ...]] = {
+    "drums": ("drums", "wind_chimes", "timpani"),
+    "bass": (
+        "acoustic_bass",
+        "electric_bass",
+        "slap_bass",
+        "synth_bass",
+    ),
+    "vocals": ("melody", "vocal_harmony", "choir"),
+    "guitar": (
+        "acoustic_guitar",
+        "electric_guitar_clean",
+        "electric_guitar_muted",
+        "distorted_guitar",
+        "guitar_harmonics",
+        "ethnic",
+    ),
+    "piano": ("piano", "electric_piano", "plucked_keyboard"),
+    "other": (
+        "accordion_family",
+        "brass",
+        "chromatic_percussion",
+        "ethnic",
+        "flute_pipe",
+        "harmonica",
+        "orchestra_hit",
+        "orchestral_harp",
+        "orchestral_woodwind",
+        "organ",
+        "percussive_fx",
+        "pizzicato_strings",
+        "plucked_keyboard",
+        "sax",
+        "sound_fx",
+        "strings",
+        "synth_fx",
+        "synth_lead",
+        "synth_pad",
+        "timpani",
+        "wind_chimes",
+    ),
 }
 
 
@@ -148,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         "--type",
         choices=list(MODEL_CHECKPOINT_FILENAMES.keys()),
         default="default",
-        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' for bass-focused model, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'drums' for drum-focused model, 'other' for other-instrument-focused model.",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' or 'bass_v2' for bass-focused models, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'drums' for drum-focused model, 'other' for other-instrument-focused model.",
     )
 
     # 単一ファイルモード
@@ -222,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-onset-ms",
         type=float,
-        default=20.0,
+        default=50.0,
         help="Merge same-pitch notes when their onset difference is below this threshold.",
     )
     parser.add_argument(
@@ -272,6 +349,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--allowed-instruments",
+        action="append",
+        default=[],
+        metavar="CLASS[,CLASS...]",
+        help=(
+            "Restrict note instrument classification to these classes. "
+            "Repeatable and/or comma-separated, for example "
+            "--allowed-instruments acoustic_bass,electric_bass,synth_bass. "
+            "Softmax probabilities are recalculated over only these classes."
+        ),
+    )
+    parser.add_argument(
         "--silence-gate-rms-dbfs",
         type=float,
         default=-72,
@@ -308,6 +397,9 @@ def parse_args() -> argparse.Namespace:
         args.instrument_volume_map = _parse_instrument_volume_args(
             args.instrument_volume
         )
+        args.allowed_instrument_ids = _parse_allowed_instrument_args(
+            args.allowed_instruments
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -316,6 +408,113 @@ def parse_args() -> argparse.Namespace:
 
 def _normalize_instrument_class_name(name: str) -> str:
     return name.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _instrument_class_ids_from_names(class_names: Iterable[str]) -> tuple[int, ...]:
+    from instrument_classes import INSTRUMENT_CLASSES
+
+    available_names = {
+        _normalize_instrument_class_name(class_name): class_id
+        for class_id, class_name in enumerate(INSTRUMENT_CLASSES)
+    }
+    class_ids: list[int] = []
+    unknown_names: list[str] = []
+    for raw_name in class_names:
+        normalized_name = _normalize_instrument_class_name(raw_name)
+        if normalized_name not in available_names:
+            unknown_names.append(raw_name)
+            continue
+        class_id = int(available_names[normalized_name])
+        if class_id not in class_ids:
+            class_ids.append(class_id)
+
+    if unknown_names:
+        available = ", ".join(sorted(available_names))
+        raise ValueError(
+            f"Unknown instrument class(es): {', '.join(unknown_names)}. "
+            f"Available classes: {available}"
+        )
+    if not class_ids:
+        raise ValueError("At least one allowed instrument class is required.")
+    return tuple(class_ids)
+
+
+def _parse_allowed_instrument_args(entries: list[str]) -> tuple[int, ...] | None:
+    if not entries:
+        return None
+    class_names = [
+        class_name
+        for entry in entries
+        for class_name in entry.split(",")
+        if class_name.strip()
+    ]
+    return _instrument_class_ids_from_names(class_names)
+
+
+def resolve_stem_instrument_class_ids(stem_name: str) -> tuple[int, ...] | None:
+    """Return the allowed instrument IDs for a separated stem.
+
+    Unknown stem names return ``None`` so callers retain the original
+    all-instrument behavior instead of accidentally discarding valid classes.
+    """
+    normalized_stem_name = _normalize_instrument_class_name(stem_name)
+    aliases = (
+        ("drum", "drums"),
+        ("bass", "bass"),
+        ("vocal", "vocals"),
+        ("guitar", "guitar"),
+        ("piano", "piano"),
+        ("other", "other"),
+    )
+    for fragment, canonical_name in aliases:
+        if fragment in normalized_stem_name:
+            return _instrument_class_ids_from_names(
+                STEM_INSTRUMENT_CLASSES[canonical_name]
+            )
+    return None
+
+
+def filter_supported_instrument_class_ids(
+    allowed_instrument_ids: tuple[int, ...] | None,
+    *,
+    num_model_classes: int,
+) -> tuple[int, ...] | None:
+    """Drop candidate IDs that are not represented by a checkpoint head."""
+    if allowed_instrument_ids is None:
+        return None
+    if num_model_classes <= 0:
+        raise ValueError("num_model_classes must be positive")
+
+    supported_ids = tuple(
+        class_id
+        for class_id in allowed_instrument_ids
+        if 0 <= class_id < num_model_classes
+    )
+    unsupported_ids = tuple(
+        class_id for class_id in allowed_instrument_ids if class_id not in supported_ids
+    )
+    if unsupported_ids:
+        from instrument_classes import INSTRUMENT_CLASSES
+
+        unsupported_names = [
+            INSTRUMENT_CLASSES[class_id]
+            if 0 <= class_id < len(INSTRUMENT_CLASSES)
+            else str(class_id)
+            for class_id in unsupported_ids
+        ]
+        warnings.warn(
+            f"Checkpoint instrument head has {num_model_classes} classes; "
+            "ignoring unsupported candidate(s): "
+            f"{', '.join(unsupported_names)}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if not supported_ids:
+        raise ValueError(
+            "None of the allowed instrument IDs are supported by the checkpoint: "
+            f"num_model_classes={num_model_classes}, ids={allowed_instrument_ids}"
+        )
+    return supported_ids
 
 
 def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
@@ -608,6 +807,7 @@ class PitchFirstNoteStitcher:
         merge_gap_frames: int,
         merge_onset_frames: int,
         instrument_probability_mode: str,
+        allowed_instrument_ids: tuple[int, ...] | None,
     ) -> None:
         # 1. 推論設定
         self.hop_length = int(hop_length)
@@ -619,6 +819,7 @@ class PitchFirstNoteStitcher:
         self.instrument_probability_mode = _normalize_instrument_probability_mode(
             instrument_probability_mode
         )
+        self.allowed_instrument_ids = allowed_instrument_ids
 
         # 2. 窓またぎ状態
         self.notes_by_track: dict[int, list[PredictedNote]] = defaultdict(list)
@@ -819,6 +1020,7 @@ class PitchFirstNoteStitcher:
             _instrument_probabilities(
                 note_logits,
                 mode=self.instrument_probability_mode,
+                allowed_instrument_ids=self.allowed_instrument_ids,
             )
             .sum(dim=0)
             .float()
@@ -984,13 +1186,15 @@ class PitchFirstNoteStitcher:
     ) -> list[PredictedNote]:
         """集約済みの楽器確率から、最終的な楽器IDと候補順を確定する。"""
         finalized_notes: list[PredictedNote] = []
+        candidate_ids = self.allowed_instrument_ids
         for note in notes:
             if note.instrument_prob_sum is None or note.instrument_frame_count <= 0:
+                fallback_id = int(candidate_ids[0]) if candidate_ids else 0
                 finalized_notes.append(
                     replace(
                         note,
-                        instrument_id=0,
-                        instrument_candidates=(0,),
+                        instrument_id=fallback_id,
+                        instrument_candidates=(fallback_id,),
                         instrument_prob_sum=None,
                         instrument_frame_count=0,
                     )
@@ -998,8 +1202,16 @@ class PitchFirstNoteStitcher:
                 continue
 
             note_probs = note.instrument_prob_sum / float(note.instrument_frame_count)
-            order = np.argsort(-note_probs.astype(np.float64, copy=False))
-            instrument_candidates = tuple(int(index) for index in order.tolist())
+            if candidate_ids is None:
+                order = np.argsort(-note_probs.astype(np.float64, copy=False))
+                instrument_candidates = tuple(int(index) for index in order.tolist())
+            else:
+                instrument_candidates = tuple(
+                    sorted(
+                        candidate_ids,
+                        key=lambda class_id: -float(note_probs[class_id]),
+                    )
+                )
             instrument_id = (
                 int(instrument_candidates[0]) if instrument_candidates else 0
             )
@@ -1057,6 +1269,7 @@ def _decode_interval_instrument_logits(
     batch_size: int,
     num_tracks: int,
     probability_mode: str,
+    allowed_instrument_ids: tuple[int, ...] | None,
 ) -> list[list[list[tuple[np.ndarray, int]]]]:
     stats: list[list[list[tuple[np.ndarray, int]]]] = [
         [[] for _ in range(num_tracks)] for _ in range(batch_size)
@@ -1068,6 +1281,7 @@ def _decode_interval_instrument_logits(
         _instrument_probabilities(
             interval_instrument_logits.float(),
             mode=probability_mode,
+            allowed_instrument_ids=allowed_instrument_ids,
         )
         .detach()
         .cpu()
@@ -1330,13 +1544,16 @@ def _build_midi(
             if 0 <= inst_id < len(INSTRUMENT_CLASSES)
             else "Piano"
         )
-        prog_num = get_program_number_from_class_id(inst_id)
+        class_key = _normalize_instrument_class_name(class_name)
+        prog_num = DEFAULT_MIDI_PROGRAM_OVERRIDES.get(
+            class_key,
+            get_program_number_from_class_id(inst_id),
+        )
         is_drum = class_name.lower() == "drums"
 
         instrument = pretty_midi.Instrument(
             program=prog_num, is_drum=is_drum, name=class_name
         )
-        class_key = _normalize_instrument_class_name(class_name)
         if instrument_volumes and class_key in instrument_volumes:
             instrument.control_changes.append(
                 pretty_midi.ControlChange(
@@ -1396,9 +1613,15 @@ def run_inference(
     window_batch_size: int,
     max_midi_melodic_instruments: int,
     disable_tqdm: bool,
+    allowed_instrument_ids: tuple[int, ...] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int], dict[str, np.ndarray]]:
     if waveform.dim() != 2 or int(waveform.shape[0]) != 2:
         raise ValueError("waveform must have shape [2, audio_frames]")
+
+    allowed_instrument_ids = filter_supported_instrument_class_ids(
+        allowed_instrument_ids,
+        num_model_classes=int(model_config.num_instrument_classes),
+    )
 
     sample_rate = int(model_config.sample_rate)
     total_audio_frames = int(waveform.shape[-1])
@@ -1451,6 +1674,7 @@ def run_inference(
         merge_gap_frames=merge_gap_frames,
         merge_onset_frames=merge_onset_frames,
         instrument_probability_mode=settings.instrument_probability_mode,
+        allowed_instrument_ids=allowed_instrument_ids,
     )
 
     # 2. ノート処理とは独立に、補助タスク用ロジットの集約バッファを用意する。
@@ -1595,6 +1819,7 @@ def run_inference(
                 batch_size=len(active_batch_starts),
                 num_tracks=num_tracks,
                 probability_mode=settings.instrument_probability_mode,
+                allowed_instrument_ids=allowed_instrument_ids,
             )
 
         sample_logits_batch = outputs.get("instrument_logits")
@@ -1793,6 +2018,9 @@ def run_inference(
             "merge_onset_frames": int(merge_onset_frames),
             "removed_long_note_count": int(removed_long_note_count),
             "max_note_frames": int(max_note_frames),
+            "allowed_instrument_count": (
+                len(allowed_instrument_ids) if allowed_instrument_ids is not None else 0
+            ),
             **remap_stats,
         },
         aggregated_logits,
@@ -1858,6 +2086,7 @@ def _process_single_file(
         window_batch_size=int(args.window_batch_size),
         max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
         disable_tqdm=bool(args.disable_tqdm),
+        allowed_instrument_ids=args.allowed_instrument_ids,
     )
 
     midi = _build_midi(
@@ -1916,6 +2145,7 @@ def _process_single_file(
         f"midi_instruments_after_remap={stats['midi_instrument_count_after_remap']} "
         f"remapped_instruments={stats['remapped_instrument_count']} "
         f"remapped_notes={stats['remapped_note_count']} "
+        f"allowed_instruments={stats['allowed_instrument_count'] or 'all'} "
         f"silence_gate_rms_dbfs={args.silence_gate_rms_dbfs} "
         f"output_midi={output_midi_path}"
     )

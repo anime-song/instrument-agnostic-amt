@@ -7,6 +7,7 @@ import pretty_midi
 import torch
 
 import infer
+from instrument_classes import INSTRUMENT_CLASSES
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 from adtof_pytorch import transcribe_to_midi
@@ -91,7 +92,7 @@ def merge_midis_logic(midi_paths, output_file, max_melodic=15):
         for inst in pm.instruments:
             if "drum" in path.stem.lower():
                 inst.is_drum = True
-            key = (inst.program, inst.is_drum)
+            key = (inst.program, inst.is_drum, inst.name)
             filtered_notes = [n for n in inst.notes if (n.end - n.start) < 15.0]
             all_notes[key].extend(filtered_notes)
             all_ccs[key].extend(inst.control_changes)
@@ -158,6 +159,8 @@ def merge_midis_logic(midi_paths, output_file, max_melodic=15):
     master_pm.instruments = final_instruments
     for inst in master_pm.instruments:
         inst.notes.sort(key=lambda note: note.start)
+        inst.control_changes.sort(key=lambda x: x.time)
+        inst.pitch_bends.sort(key=lambda x: x.time)
     master_pm.write(str(output_file))
 
 
@@ -189,6 +192,22 @@ def resolve_stem_paths(*, song_path, stem_dir, stem_names):
                 break
 
     return resolved
+
+def resolve_stem_model_type(stem_name):
+    """Choose the AMT model type for a separated stem."""
+    stem_name = stem_name.lower()
+    if "drum" in stem_name:
+        return "drums"
+    if "bass" in stem_name:
+        return "bass_v2"
+    if "vocal" in stem_name:
+        return "vocal_harmony"
+    if "guitar" in stem_name:
+        return "guitar"
+    if "other" in stem_name:
+        return "other"
+    return "default"
+
 
 def prepare_audio_for_stem_separation(audio_path, *, temp_dir):
     """Stem Separation 向けに入力音声を一時的に 2ch WAV へそろえる。"""
@@ -277,6 +296,7 @@ def run_stem_separated_transcription(
     output_root="colab_outputs",
     window_batch_size=4,
     max_midi_melodic_instruments=15,
+    transcribe_drum_stems=True,
     cleanup_separated_stems=False,
     merge_onset_ms=20.0,
 ):
@@ -294,30 +314,15 @@ def run_stem_separated_transcription(
     sep_model = bundle["sep_model"]
     sep_dtype = bundle["sep_dtype"]
 
-    bass_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="bass")
-    bass_amt_model = bass_bundle["amt_model"]
-    bass_amt_config = bass_bundle["amt_config"]
-    bass_amt_settings = bass_bundle["amt_settings"]
+    amt_bundles = {"default": bundle}
 
-    vocal_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="vocal_harmony")
-    vocal_amt_model = vocal_bundle["amt_model"]
-    vocal_amt_config = vocal_bundle["amt_config"]
-    vocal_amt_settings = vocal_bundle["amt_settings"]
-
-    guitar_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="guitar")
-    guitar_amt_model = guitar_bundle["amt_model"]
-    guitar_amt_config = guitar_bundle["amt_config"]
-    guitar_amt_settings = guitar_bundle["amt_settings"]
-
-    other_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="other")
-    other_amt_model = other_bundle["amt_model"]
-    other_amt_config = other_bundle["amt_config"]
-    other_amt_settings = other_bundle["amt_settings"]
-
-    drums_bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="drums")
-    drums_amt_model = drums_bundle["amt_model"]
-    drums_amt_config = drums_bundle["amt_config"]
-    drums_amt_settings = drums_bundle["amt_settings"]
+    def get_amt_bundle(model_type):
+        if model_type not in amt_bundles:
+            amt_bundles[model_type] = get_stem_pipeline_models(
+                checkpoint_path=checkpoint_path,
+                model_type=model_type,
+            )
+        return amt_bundles[model_type]
 
     # 1. 出力先を曲ごとに分ける。
     run_root = Path(output_root) / audio_file.stem
@@ -358,41 +363,36 @@ def run_stem_separated_transcription(
     # 4. ドラム以外の各ステムを順に採譜する。
     song_midi_paths = []
     for stem_name, stem_path in sorted(stems.items()):
+        if not transcribe_drum_stems and "drum" in stem_name.lower():
+            print(f"Skipping drum stem: {stem_name}")
+            continue
 
         output_midi = stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
-        print(f"Transcribing stem: {stem_name}")
-        if "drum" in stem_name.lower():
-            # print(f"Transcribe drum stem using ADTOF: {stem_name}")
-            # transcribe_to_midi(stem_path, output_midi)
-            # song_midi_paths.append(output_midi)
-            # continue
-            current_amt_model = drums_amt_model
-            current_amt_config = drums_amt_config
-            current_amt_settings = drums_amt_settings
-        elif "bass" in stem_name.lower():
-            current_amt_model = bass_amt_model
-            current_amt_config = bass_amt_config
-            current_amt_settings = bass_amt_settings
-        elif "vocal" in stem_name.lower():
-            current_amt_model = vocal_amt_model
-            current_amt_config = vocal_amt_config
-            current_amt_settings = vocal_amt_settings
-        elif "guitar" in stem_name.lower():
-            current_amt_model = guitar_amt_model
-            current_amt_config = guitar_amt_config
-            current_amt_settings = guitar_amt_settings
-        elif "other" in stem_name.lower():
-            current_amt_model = other_amt_model
-            current_amt_config = other_amt_config
-            current_amt_settings = other_amt_settings
-        else:
-            current_amt_model = amt_model
-            current_amt_config = amt_config
-            current_amt_settings = amt_settings
+        model_type = resolve_stem_model_type(stem_name)
+        current_bundle = get_amt_bundle(model_type)
+        current_amt_model = current_bundle["amt_model"]
+        current_amt_config = current_bundle["amt_config"]
+        current_amt_settings = current_bundle["amt_settings"]
+
+        allowed_instrument_ids = infer.resolve_stem_instrument_class_ids(stem_name)
+        allowed_instrument_ids = infer.filter_supported_instrument_class_ids(
+            allowed_instrument_ids,
+            num_model_classes=current_amt_config.num_instrument_classes,
+        )
+        allowed_instrument_names = (
+            [INSTRUMENT_CLASSES[class_id] for class_id in allowed_instrument_ids]
+            if allowed_instrument_ids is not None
+            else ['all']
+        )
+        print(
+            f'Transcribing stem: {stem_name} (model={model_type}, '
+            f'instruments={",".join(allowed_instrument_names)})'
+        )
 
         waveform, _, _ = infer._load_audio(
             Path(stem_path),
             target_sample_rate=current_amt_config.sample_rate,
+            allowed_instrument_ids=allowed_instrument_ids
         )
         notes, _, _ = infer.run_inference(
             model=current_amt_model,

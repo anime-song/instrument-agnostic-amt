@@ -46,6 +46,8 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`), with improved note detection and improved slap bass classification in the instrument classification output.<br>⚠️ A bug in the annotation tool used to create the training data caused onset misalignment and degraded accuracy. The bug has been fixed, and the model will be retrained using the corrected data. |
+| 2026-07-12 | 🎯 Added per-stem instrument class selection. Excluding implausible instruments before probability calculation is expected to reduce instrument misclassification in the stem-separated workflow. |
 | 2026-06-24 | 🥁 Added experimental drum-focused inference model (`--type drums`) |
 | 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |
 | 2026-05-31 | 🎤 Added vocal harmony model (`--type vocal_harmony`). Added `vocal_harmony` class to the instrument taxonomy to identify harmony.<br>🧩 Added Pitch Slot feature to predict overlapping note intervals simultaneously. |
@@ -66,6 +68,27 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 - 🎼 **HCQT features** — 5 harmonics × stereo 2ch Harmonic CQT captures rich pitch information
 - 🔧 **Extensive data augmentation** — Stem mixing, IR reverb, EQ, noise injection, drum addition, and more
 - 🧪 **[Experimental] Instrument classification & multi-track output** — 33+ instrument class head for per-instrument MIDI tracks (accuracy still improving)
+
+## Known Limitations
+
+This project is still under active development. Depending on the source audio and performance, the following issues may occur.
+
+### Instrument classification
+
+Instrument classification and multi-track MIDI output are experimental features.
+
+- During bass transcription, slap bass and synth bass may not be recognized as distinct instrument classes and may instead be classified as `electric bass`.
+- During piano transcription, electric and acoustic pianos are frequently confused due to limited classification accuracy between the two classes.
+- Instruments such as sitar and banjo that bleed into a separated guitar stem may not be assigned to the correct instrument class.
+
+### Transcription accuracy
+
+- Fast vocal passages, swing phrasing, and other complex phrases may produce inaccurate pitches, note boundaries, or durations.
+- In some cases, a single sustained note may be split into multiple short notes (note over-segmentation).
+
+### Stem-separated workflow
+
+- Transcribing separated stems independently may introduce small timing offsets between the resulting MIDI files, causing synchronization issues after they are merged.
 
 ---
 
@@ -334,6 +357,8 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
+The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
+
 ### Additional options
 
 ```bash
@@ -354,7 +379,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: fine-tuned for bass. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |
@@ -364,6 +389,7 @@ python infer.py \
 | `--merge-gap-ms` | 1 hop | Merge threshold for small note gaps |
 | `--merge-onset-ms` | `20.0` | Merge threshold for near-simultaneous onsets |
 | `--max-midi-melodic-instruments` | `15` | Max instrument tracks |
+| `--allowed-instruments` | all classes | Instrument classification candidates. Accepts comma-separated names or repeated arguments; softmax probabilities are renormalized within the selected classes |
 | `--silence-gate-rms-dbfs` | `-72` | RMS threshold to skip silent windows |
 
 ---
