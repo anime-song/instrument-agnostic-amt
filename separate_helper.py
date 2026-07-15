@@ -68,6 +68,8 @@ INSTRUMENT_CLASS_GAIN: dict[str, int] = {
     "melody": 120,  
 }
 
+MELODY_GAIN = {"melody": 120}  # melody stem の音量を上げるための特別設定
+
 
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
 STEM_PIPELINE_CACHE = {}
@@ -423,7 +425,7 @@ def run_stem_separated_transcription(
             )
             apply_velocities_to_notes(notes, estimated_velocities)
 
-        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=None)
+        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=MELODY_GAIN)
         midi.write(str(output_midi))
         song_midi_paths.append(output_midi)
 
