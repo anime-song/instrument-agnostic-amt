@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import argparse
 import csv
+import io
 import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
+import mido
 import numpy as np
 import pretty_midi
 import soundfile as sf
@@ -37,6 +41,132 @@ WIND_CHIMES_TRACK_KEYWORDS = (
     "wind bell",
     "w.chime",
 )
+PRETTY_MIDI_SAFE_MAX_TICK = 1_000_000
+
+
+def compute_largest_tick(midi_file: mido.MidiFile) -> int:
+    """MIDI全体で最も大きい絶対tick位置を返す。"""
+    return max(
+        (sum(int(message.time) for message in track) for track in midi_file.tracks),
+        default=0,
+    )
+
+
+def choose_safe_ticks_per_beat(
+    original_ticks_per_beat: int,
+    largest_tick: int,
+    *,
+    target_max_tick: int = PRETTY_MIDI_SAFE_MAX_TICK,
+) -> int:
+    """最大tickを目標以下に写像できる最大のPPQを返す。"""
+    if original_ticks_per_beat < 1:
+        raise ValueError(
+            "SMPTE time divisionまたは不正なticks_per_beatは処理できません: "
+            f"ticks_per_beat={original_ticks_per_beat}"
+        )
+    if target_max_tick < 1:
+        raise ValueError("target_max_tick は 1 以上にしてください。")
+    if largest_tick <= target_max_tick:
+        return int(original_ticks_per_beat)
+
+    return max(
+        1,
+        min(
+            int(original_ticks_per_beat),
+            int(original_ticks_per_beat) * int(target_max_tick) // int(largest_tick),
+        ),
+    )
+
+
+def scale_absolute_tick(
+    absolute_tick: int,
+    *,
+    original_ticks_per_beat: int,
+    output_ticks_per_beat: int,
+) -> int:
+    """絶対tickをPPQ比で最も近い整数tickへ丸める。"""
+    numerator = int(absolute_tick) * int(output_ticks_per_beat)
+    quotient, remainder = divmod(numerator, int(original_ticks_per_beat))
+    if remainder * 2 >= int(original_ticks_per_beat):
+        quotient += 1
+    return quotient
+
+
+def build_pretty_midi_safe_copy(
+    midi_file: mido.MidiFile,
+    *,
+    target_max_tick: int = PRETTY_MIDI_SAFE_MAX_TICK,
+) -> mido.MidiFile:
+    """
+    pretty_midi用に、イベントの絶対位置を保ちながらPPQを下げたコピーを返す。
+
+    各delta tickを個別に丸めず、絶対tickを一度だけPPQ比で写像してから
+    delta tickへ戻すため、イベント数に応じた丸め誤差の累積は発生しない。
+    """
+    largest_tick = compute_largest_tick(midi_file)
+    output_ticks_per_beat = choose_safe_ticks_per_beat(
+        midi_file.ticks_per_beat,
+        largest_tick,
+        target_max_tick=target_max_tick,
+    )
+    safe_midi = mido.MidiFile(
+        type=midi_file.type,
+        ticks_per_beat=output_ticks_per_beat,
+        charset=midi_file.charset,
+        clip=midi_file.clip,
+    )
+
+    for track in midi_file.tracks:
+        safe_track = mido.MidiTrack()
+        source_absolute_tick = 0
+        output_absolute_tick = 0
+        for message in track:
+            source_absolute_tick += int(message.time)
+            scaled_absolute_tick = scale_absolute_tick(
+                source_absolute_tick,
+                original_ticks_per_beat=midi_file.ticks_per_beat,
+                output_ticks_per_beat=output_ticks_per_beat,
+            )
+            scaled_absolute_tick = max(output_absolute_tick, scaled_absolute_tick)
+            safe_track.append(
+                message.copy(time=scaled_absolute_tick - output_absolute_tick)
+            )
+            output_absolute_tick = scaled_absolute_tick
+        safe_midi.tracks.append(safe_track)
+
+    pretty_midi_max_tick = int(pretty_midi.pretty_midi.MAX_TICK)
+    safe_largest_tick = compute_largest_tick(safe_midi)
+    if safe_largest_tick + 1 > pretty_midi_max_tick:
+        raise ValueError(
+            "PPQを1まで下げてもpretty_midiの最大tick制限を満たせません: "
+            f"largest_tick={safe_largest_tick}, limit={pretty_midi_max_tick}"
+        )
+    return safe_midi
+
+
+def load_pretty_midi_safely(mid_path: Path) -> pretty_midi.PrettyMIDI:
+    """高tick MIDIだけをメモリ上で安全なPPQへ写像して読み込む。"""
+    try:
+        return pretty_midi.PrettyMIDI(str(mid_path))
+    except ValueError:
+        midi_file = mido.MidiFile(str(mid_path))
+        largest_tick = compute_largest_tick(midi_file)
+        if largest_tick + 1 <= int(pretty_midi.pretty_midi.MAX_TICK):
+            raise
+
+        safe_midi = build_pretty_midi_safe_copy(midi_file)
+        logger.info(
+            "高tick MIDIをメモリ上で安全化: %s (tick=%d -> %d, PPQ=%d -> %d)",
+            mid_path,
+            largest_tick,
+            compute_largest_tick(safe_midi),
+            midi_file.ticks_per_beat,
+            safe_midi.ticks_per_beat,
+        )
+        midi_buffer = io.BytesIO()
+        safe_midi.save(file=midi_buffer)
+        midi_buffer.seek(0)
+        return pretty_midi.PrettyMIDI(midi_buffer)
 
 
 def is_vocal_harmony_track(instrument: pretty_midi.Instrument) -> bool:
@@ -130,7 +260,7 @@ def process_stem(
     midi_data = None
     if mid_path is not None and mid_path.exists():
         try:
-            midi_data = pretty_midi.PrettyMIDI(str(mid_path))
+            midi_data = load_pretty_midi_safely(mid_path)
         except Exception as e:
             logger.warning(f"Failed to parse MIDI {mid_path}: {e}")
 
