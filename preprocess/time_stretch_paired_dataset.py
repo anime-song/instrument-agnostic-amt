@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from bisect import bisect_right
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -26,7 +25,6 @@ import soundfile as sf
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_MIDI_TICK = 1_000_000
 DEFAULT_TEMPO = 500_000
 MAX_TEMPO_VALUE = 16_777_215
 DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac")
@@ -53,7 +51,6 @@ class RuntimeTimeStretchConfig:
     speed_rates: tuple[float, ...]
     workers: int
     overwrite: bool
-    max_midi_tick: int
 
     @classmethod
     def from_arguments(cls, arguments: argparse.Namespace) -> RuntimeTimeStretchConfig:
@@ -108,7 +105,6 @@ class RuntimeTimeStretchConfig:
             ),
             workers=arguments.workers,
             overwrite=arguments.overwrite,
-            max_midi_tick=arguments.max_midi_tick,
         )
         runtime_config.validate(
             min_speed=arguments.min_speed,
@@ -175,8 +171,6 @@ class RuntimeTimeStretchConfig:
         """実行前に最低限の前提を検証する。"""
         if self.workers < 1:
             raise ValueError("--workers は 1 以上にしてください。")
-        if self.max_midi_tick < 1:
-            raise ValueError("--max_midi_tick は 1 以上にしてください。")
         if min_speed <= 0.0 or max_speed <= 0.0:
             raise ValueError("--min_speed と --max_speed は 0 より大きくしてください。")
         if speed_step <= 0.0:
@@ -207,7 +201,6 @@ class MidiTask:
     input_path: Path
     output_dir: Path
     speed_rates: tuple[float, ...]
-    max_midi_tick: int
 
 
 @dataclass
@@ -216,30 +209,7 @@ class TaskResult:
 
     success_count: int = 0
     skipped_count: int = 0
-    normalized_original_count: int = 0
     error_messages: list[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class TempoSegments:
-    """絶対tickから絶対秒へ変換するためのテンポ区間情報。"""
-
-    start_ticks: tuple[int, ...]
-    start_seconds: tuple[float, ...]
-    tempos: tuple[int, ...]
-
-    def seconds_at_tick(self, absolute_tick: int, *, ticks_per_beat: int) -> float:
-        """指定した絶対tick位置の絶対秒を返す。"""
-        segment_index = max(0, bisect_right(self.start_ticks, int(absolute_tick)) - 1)
-        segment_start_tick = self.start_ticks[segment_index]
-        segment_start_second = self.start_seconds[segment_index]
-        segment_tempo = self.tempos[segment_index]
-        delta_tick = int(absolute_tick) - segment_start_tick
-        return float(segment_start_second) + mido.tick2second(
-            delta_tick,
-            ticks_per_beat,
-            segment_tempo,
-        )
 
 
 def format_rate_tag(speed_rate: float) -> str:
@@ -333,12 +303,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite", action="store_true", help="既存の生成ファイルを上書きする"
     )
-    parser.add_argument(
-        "--max_midi_tick",
-        type=int,
-        default=DEFAULT_MAX_MIDI_TICK,
-        help="生成するMIDIの最大tick目安。大きすぎるMIDIはこの値以下になるよう解像度を下げる",
-    )
     parser.add_argument("--audio-only", action="store_true", help="音声だけを生成する")
     parser.add_argument("--midi-only", action="store_true", help="MIDIだけを生成する")
     arguments = parser.parse_args()
@@ -409,215 +373,72 @@ def get_temporary_output_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
 
 
-def compute_largest_tick(midi_file: mido.MidiFile) -> int:
-    """MIDI全体で最も大きい絶対tick位置を返す。"""
-    largest_tick = 0
-    for track in midi_file.tracks:
-        absolute_tick = 0
-        for message in track:
-            absolute_tick += int(message.time)
-        largest_tick = max(largest_tick, absolute_tick)
-    return largest_tick
+def scale_tempo(tempo: int, speed_rate: float) -> int:
+    """速度倍率に合わせてtempo値を変換し、MIDIの表現可能範囲を検証する。"""
+    if speed_rate <= 0.0:
+        raise ValueError("speed_rate は 0 より大きくしてください。")
 
-
-def compute_tick_divisor(largest_tick: int, max_midi_tick: int) -> int:
-    """最大tickが目標以下になるように解像度の縮小率を決める。"""
-    if largest_tick <= max_midi_tick:
-        return 1
-    return (largest_tick + max_midi_tick - 1) // max_midi_tick
-
-
-def scale_tick_value(tick_value: int, divisor: int) -> int:
-    """delta tickを縮小後の整数tickへ丸める。"""
-    if divisor <= 1 or tick_value <= 0:
-        return int(tick_value)
-    return max(1, int(round(tick_value / divisor)))
-
-
-def build_tick_normalized_midi(
-    midi_file: mido.MidiFile,
-    max_midi_tick: int,
-) -> mido.MidiFile:
-    """最大tickだけを抑えるためにdelta tickと解像度を縮小したMIDIを返す。"""
-    largest_tick = compute_largest_tick(midi_file)
-    divisor = compute_tick_divisor(largest_tick, max_midi_tick)
-    new_ticks_per_beat = max(1, int(round(midi_file.ticks_per_beat / divisor)))
-
-    normalized_midi = mido.MidiFile(
-        type=midi_file.type,
-        ticks_per_beat=new_ticks_per_beat,
-    )
-    for track in midi_file.tracks:
-        new_track = mido.MidiTrack()
-        for message in track:
-            new_track.append(
-                message.copy(time=scale_tick_value(int(message.time), divisor))
-            )
-        normalized_midi.tracks.append(new_track)
-    return normalized_midi
-
-
-def build_tempo_segments(midi_file: mido.MidiFile) -> TempoSegments:
-    """MIDI全体のテンポイベントから絶対秒変換用の区間情報を構築する。"""
-    raw_tempo_changes: list[tuple[int, int, int, int]] = []
-    for track_index, track in enumerate(midi_file.tracks):
-        absolute_tick = 0
-        for message_index, message in enumerate(track):
-            absolute_tick += int(message.time)
-            if message.type == "set_tempo":
-                raw_tempo_changes.append(
-                    (
-                        absolute_tick,
-                        track_index,
-                        message_index,
-                        int(message.tempo),
-                    )
-                )
-
-    if not raw_tempo_changes:
-        raw_tempo_changes.append((0, 0, 0, DEFAULT_TEMPO))
-
-    raw_tempo_changes.sort(key=lambda item: (item[0], item[1], item[2]))
-
-    collapsed_tempo_changes: list[tuple[int, int]] = []
-    for absolute_tick, _, _, tempo in raw_tempo_changes:
-        if collapsed_tempo_changes and collapsed_tempo_changes[-1][0] == absolute_tick:
-            collapsed_tempo_changes[-1] = (absolute_tick, tempo)
-        else:
-            collapsed_tempo_changes.append((absolute_tick, tempo))
-
-    if collapsed_tempo_changes[0][0] != 0:
-        collapsed_tempo_changes.insert(0, (0, DEFAULT_TEMPO))
-
-    start_ticks: list[int] = []
-    start_seconds: list[float] = []
-    tempos: list[int] = []
-
-    elapsed_seconds = 0.0
-    previous_tick = int(collapsed_tempo_changes[0][0])
-    previous_tempo = int(collapsed_tempo_changes[0][1])
-    start_ticks.append(previous_tick)
-    start_seconds.append(0.0)
-    tempos.append(previous_tempo)
-
-    for absolute_tick, tempo in collapsed_tempo_changes[1:]:
-        elapsed_seconds += mido.tick2second(
-            int(absolute_tick) - previous_tick,
-            midi_file.ticks_per_beat,
-            previous_tempo,
+    scaled_tempo = int(round(int(tempo) / float(speed_rate)))
+    if not 1 <= scaled_tempo <= MAX_TEMPO_VALUE:
+        raise ValueError(
+            "time stretch後のtempoがMIDIの表現可能範囲外です: "
+            f"tempo={tempo}, speed_rate={speed_rate}, scaled_tempo={scaled_tempo}"
         )
-        start_ticks.append(int(absolute_tick))
-        start_seconds.append(float(elapsed_seconds))
-        tempos.append(int(tempo))
-        previous_tick = int(absolute_tick)
-        previous_tempo = int(tempo)
-
-    return TempoSegments(
-        start_ticks=tuple(start_ticks),
-        start_seconds=tuple(start_seconds),
-        tempos=tuple(tempos),
-    )
+    return scaled_tempo
 
 
-def choose_output_ticks_per_beat(
-    original_ticks_per_beat: int,
-    stretched_duration_seconds: float,
-    max_midi_tick: int,
-) -> int:
-    """固定テンポで再配置したときに最大tickを超えない解像度を選ぶ。"""
-    if stretched_duration_seconds <= 0.0:
-        return max(1, int(original_ticks_per_beat))
-
-    max_allowed_ticks_per_beat = int(
-        max_midi_tick * DEFAULT_TEMPO / (stretched_duration_seconds * 1_000_000.0)
-    )
-    if max_allowed_ticks_per_beat < 1:
-        max_allowed_ticks_per_beat = 1
-    return max(1, min(int(original_ticks_per_beat), max_allowed_ticks_per_beat))
-
-
-def seconds_to_output_tick(
-    absolute_second: float,
-    *,
-    ticks_per_beat: int,
-) -> int:
-    """固定テンポの出力MIDI上で絶対秒を絶対tickへ変換する。"""
-    if absolute_second <= 0.0:
-        return 0
-    return max(
-        0,
-        int(round(mido.second2tick(absolute_second, ticks_per_beat, DEFAULT_TEMPO))),
-    )
+def has_tempo_at_tick_zero(midi_file: mido.MidiFile) -> bool:
+    """いずれかのトラックのtick 0にtempoイベントがあるかを返す。"""
+    for track in midi_file.tracks:
+        absolute_tick = 0
+        for message in track:
+            absolute_tick += int(message.time)
+            if absolute_tick > 0:
+                break
+            if message.type == "set_tempo":
+                return True
+    return False
 
 
 def build_time_stretched_midi(
     midi_file: mido.MidiFile,
     speed_rate: float,
-    max_midi_tick: int,
 ) -> mido.MidiFile:
     """
     MIDIを指定速度倍率に合わせてtime stretchした新しいMIDIを返す。
 
-    注釈: 実時間ベースでアライメントを保つため、元MIDIのtempo mapから各イベントの
-    絶対秒位置を求め、それをtime stretch後の秒位置として固定テンポMIDIへ再配置する。
-    元のtempo変化は保持せず、出力では先頭に一定テンポを1つだけ置く。
+    delta tick、ticks_per_beat、tempo mapの位置を保持し、tempo値だけを変換する。
+    これによりイベントを再量子化せず、実時間を音声と同じ倍率だけ伸縮する。
     """
-    largest_tick = compute_largest_tick(midi_file)
-    tempo_segments = build_tempo_segments(midi_file)
-    stretch_multiplier = 1.0 / float(speed_rate)
-    stretched_duration_seconds = (
-        tempo_segments.seconds_at_tick(
-            largest_tick,
-            ticks_per_beat=midi_file.ticks_per_beat,
-        )
-        * stretch_multiplier
-    )
-    new_ticks_per_beat = choose_output_ticks_per_beat(
-        midi_file.ticks_per_beat,
-        stretched_duration_seconds,
-        max_midi_tick,
-    )
-
     stretched_midi = mido.MidiFile(
         type=midi_file.type,
-        ticks_per_beat=new_ticks_per_beat,
+        ticks_per_beat=midi_file.ticks_per_beat,
+        charset=midi_file.charset,
+        clip=midi_file.clip,
     )
 
     for track in midi_file.tracks:
         new_track = mido.MidiTrack()
-        absolute_tick = 0
-        previous_output_tick = 0
         for message in track:
-            absolute_tick += int(message.time)
             if message.type == "set_tempo":
+                new_track.append(
+                    message.copy(tempo=scale_tempo(message.tempo, speed_rate))
+                )
                 continue
-
-            absolute_second = tempo_segments.seconds_at_tick(
-                absolute_tick,
-                ticks_per_beat=midi_file.ticks_per_beat,
-            )
-            stretched_second = absolute_second * stretch_multiplier
-            output_tick = seconds_to_output_tick(
-                stretched_second,
-                ticks_per_beat=new_ticks_per_beat,
-            )
-
-            output_tick = max(previous_output_tick, output_tick)
-            delta_tick = output_tick - previous_output_tick
-            previous_output_tick = output_tick
-            new_track.append(message.copy(time=delta_tick))
+            new_track.append(message.copy())
         stretched_midi.tracks.append(new_track)
 
     if not stretched_midi.tracks:
         stretched_midi.tracks.append(mido.MidiTrack())
-    stretched_midi.tracks[0].insert(
-        0,
-        mido.MetaMessage(
-            "set_tempo",
-            tempo=min(MAX_TEMPO_VALUE, max(1, DEFAULT_TEMPO)),
-            time=0,
-        ),
-    )
+    if not has_tempo_at_tick_zero(midi_file):
+        stretched_midi.tracks[0].insert(
+            0,
+            mido.MetaMessage(
+                "set_tempo",
+                tempo=scale_tempo(DEFAULT_TEMPO, speed_rate),
+                time=0,
+            ),
+        )
     return stretched_midi
 
 
@@ -658,22 +479,6 @@ def write_stretched_midi(output_path: Path, midi_data: mido.MidiFile) -> None:
         if temp_output_path.exists():
             temp_output_path.unlink()
         raise
-
-
-def normalize_original_midi_if_needed(task: MidiTask, midi_data: mido.MidiFile) -> int:
-    """
-    元MIDIの解像度が高すぎる場合、元ファイル自体を低解像度化して上書きする。
-    `stretch_1.0` は生成せず、オリジナルを正規化済みの基準ファイルとして扱う。
-    """
-    if compute_largest_tick(midi_data) <= task.max_midi_tick:
-        return 0
-
-    normalized_midi = build_tick_normalized_midi(
-        midi_file=midi_data,
-        max_midi_tick=task.max_midi_tick,
-    )
-    write_stretched_midi(task.input_path, normalized_midi)
-    return 1
 
 
 def process_audio_task(task: AudioTask, overwrite: bool) -> TaskResult:
@@ -730,25 +535,13 @@ def process_midi_task(task: MidiTask, overwrite: bool) -> TaskResult:
         task.speed_rates,
         overwrite=overwrite,
     )
+    if not pending_speed_rates:
+        return result
 
     try:
         midi_data = mido.MidiFile(str(task.input_path))
     except (OSError, RuntimeError, ValueError) as exception:
         result.error_messages.append(f"{task.input_path.name} load: {exception}")
-        return result
-
-    try:
-        result.normalized_original_count = normalize_original_midi_if_needed(
-            task,
-            midi_data,
-        )
-    except (OSError, RuntimeError, ValueError) as exception:
-        result.error_messages.append(
-            f"{task.input_path.name} normalize_original: {exception}"
-        )
-        return result
-
-    if not pending_speed_rates:
         return result
 
     task.output_dir.mkdir(parents=True, exist_ok=True)
@@ -758,7 +551,6 @@ def process_midi_task(task: MidiTask, overwrite: bool) -> TaskResult:
             stretched_midi = build_time_stretched_midi(
                 midi_file=midi_data,
                 speed_rate=speed_rate,
-                max_midi_tick=task.max_midi_tick,
             )
             write_stretched_midi(output_path, stretched_midi)
             result.success_count += 1
@@ -892,22 +684,17 @@ class TimeStretchDatasetRunner:
                     path,
                 ),
                 speed_rates=self.runtime_config.speed_rates,
-                max_midi_tick=self.runtime_config.max_midi_tick,
             )
             for path in midi_files
         ]
         logger.info("MIDI処理対象: %d ファイル", len(midi_tasks))
-        (
-            midi_success,
-            midi_skipped,
-            midi_normalized_original,
-            midi_errors,
-        ) = self.execute_midi_tasks(midi_tasks)
+        midi_success, midi_skipped, midi_errors = self.execute_midi_tasks(
+            midi_tasks
+        )
         logger.info(
-            "MIDI処理完了: success=%d, skipped=%d, normalized_original=%d, errors=%d",
+            "MIDI処理完了: success=%d, skipped=%d, errors=%d",
             midi_success,
             midi_skipped,
-            midi_normalized_original,
             len(midi_errors),
         )
         self.log_error_messages(midi_errors)
@@ -950,11 +737,10 @@ class TimeStretchDatasetRunner:
 
     def execute_midi_tasks(
         self, tasks: list[MidiTask]
-    ) -> tuple[int, int, int, list[str]]:
+    ) -> tuple[int, int, list[str]]:
         """MIDIタスク群を並列実行して結果を集計する。"""
         total_success = 0
         total_skipped = 0
-        total_normalized_original = 0
         all_errors: list[str] = []
 
         with ProcessPoolExecutor(max_workers=self.runtime_config.workers) as executor:
@@ -970,10 +756,9 @@ class TimeStretchDatasetRunner:
                 result = future.result()
                 total_success += result.success_count
                 total_skipped += result.skipped_count
-                total_normalized_original += result.normalized_original_count
                 all_errors.extend(result.error_messages)
 
-        return total_success, total_skipped, total_normalized_original, all_errors
+        return total_success, total_skipped, all_errors
 
     def log_pairing_summary(
         self, audio_files: list[Path], midi_files: list[Path]
