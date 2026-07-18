@@ -616,9 +616,7 @@ class PitchShiftDatasetRunner:
             for path in midi_files
         ]
         logger.info("MIDI処理対象: %d ファイル", len(midi_tasks))
-        midi_success, midi_skipped, midi_errors = self.execute_midi_tasks(
-            midi_tasks
-        )
+        midi_success, midi_skipped, midi_errors = self.execute_midi_tasks(midi_tasks)
         logger.info(
             "MIDI完了: 成功 %d, スキップ %d, エラー %d",
             midi_success,
@@ -663,9 +661,7 @@ class PitchShiftDatasetRunner:
 
         return total_success, total_skipped, all_errors
 
-    def execute_midi_tasks(
-        self, tasks: list[MidiTask]
-    ) -> tuple[int, int, list[str]]:
+    def execute_midi_tasks(self, tasks: list[MidiTask]) -> tuple[int, int, list[str]]:
         """MIDIタスク群を並列実行して結果を集計する。"""
         total_success = 0
         total_skipped = 0
