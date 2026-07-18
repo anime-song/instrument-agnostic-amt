@@ -46,7 +46,8 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
-| 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`), with improved note detection and improved slap bass classification in the instrument classification output.<br>⚠️ A bug in the annotation tool used to create the training data caused onset misalignment and degraded accuracy. The bug has been fixed, and the model will be retrained using the corrected data. |
+| 2026-07-16 | 🐛 Fixed a bug in the data augmentation pipeline that caused note timing misalignment, then retrained the bass v2 model (`--type bass_v2`) after the fix. The retrained `bass_v2` improves note detection accuracy and fixes the issue where notes were over-segmented into multiple short notes. These improvements apply only to `bass_v2`. |
+| 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`), with improved slap bass classification in the instrument classification output. |
 | 2026-07-12 | 🎯 Added per-stem instrument class selection. Excluding implausible instruments before probability calculation is expected to reduce instrument misclassification in the stem-separated workflow. |
 | 2026-06-24 | 🥁 Added experimental drum-focused inference model (`--type drums`) |
 | 2026-06-05 | 🎻 Added other-instrument-focused model (`--type other`) |

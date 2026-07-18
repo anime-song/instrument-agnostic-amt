@@ -6,6 +6,9 @@ from typing import Any
 import numpy as np
 
 
+UNIFORM_WINDOW_SAMPLING_PROBABILITY = 0.5
+
+
 @dataclass(frozen=True)
 class ActiveWindowSegment:
     """active 区間サンプリング用の一定密度セグメント。"""
@@ -77,7 +80,10 @@ class StemWindowSelector:
         if not stems:
             return 0
 
-        if not selected_group.get("active_window_sampling", False):
+        if (
+            not selected_group.get("active_window_sampling", False)
+            or rng.random() < UNIFORM_WINDOW_SAMPLING_PROBABILITY
+        ):
             max_effective_end_ms = max(
                 min(int(stem["duration_ms"]), int(stem["end_note_ms"]))
                 for stem in stems
@@ -100,7 +106,10 @@ class StemWindowSelector:
         group = self.dataset_groups_by_name.get(group_name, {})
         profile = self._get_active_window_profile(stem)
 
-        if not group.get("active_window_sampling", False):
+        if (
+            not group.get("active_window_sampling", False)
+            or rng.random() < UNIFORM_WINDOW_SAMPLING_PROBABILITY
+        ):
             if profile.max_start_ms <= 0:
                 return 0
             return rng.randint(0, profile.max_start_ms)
