@@ -8,6 +8,8 @@ einops
 tqdm
 soundfile
 pretty_midi
+mido
+mir_eval
 scipy
 wandb
 audiomentations

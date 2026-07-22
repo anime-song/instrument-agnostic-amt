@@ -18,6 +18,7 @@ from ..modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from .instruments import effective_instrument_ids
 from .types import InferenceSettings, PredictedNote
 
 
@@ -103,18 +104,19 @@ def _select_pair_candidates(
     num_instruments, num_pitches = pair_gate_logits.shape
     if int(num_pitches) != NUM_PITCHES:
         raise ValueError(f"expected {NUM_PITCHES} pitches, got {int(num_pitches)}")
-    if instrument_filter_id is not None and not (
-        0 <= int(instrument_filter_id) < int(num_instruments)
-    ):
-        raise ValueError("instrument_filter_id is out of range")
+    candidate_instrument_ids = effective_instrument_ids(
+        num_model_classes=int(num_instruments),
+        allowed_instrument_ids=settings.allowed_instrument_ids,
+        instrument_filter_id=instrument_filter_id,
+    )
 
     scores = pair_gate_logits.float().reshape(-1)
     finite_mask = torch.isfinite(scores)
-    if instrument_filter_id is not None:
-        allowed = torch.zeros_like(finite_mask)
-        start = int(instrument_filter_id) * NUM_PITCHES
+    allowed = torch.zeros_like(finite_mask)
+    for instrument_id in candidate_instrument_ids:
+        start = int(instrument_id) * NUM_PITCHES
         allowed[start : start + NUM_PITCHES] = True
-        finite_mask = finite_mask & allowed
+    finite_mask = finite_mask & allowed
     if not bool(torch.any(finite_mask).item()):
         return []
 
@@ -149,6 +151,7 @@ def _select_pair_candidates(
 def _rank_instrument_candidates_by_pitch(
     pair_gate_logits: torch.Tensor,
     *,
+    settings: InferenceSettings,
     instrument_filter_id: int | None,
 ) -> list[tuple[int, ...]]:
     if pair_gate_logits.dim() != 2:
@@ -156,37 +159,37 @@ def _rank_instrument_candidates_by_pitch(
     num_instruments, num_pitches = pair_gate_logits.shape
     if int(num_pitches) != NUM_PITCHES:
         raise ValueError(f"expected {NUM_PITCHES} pitches, got {int(num_pitches)}")
-    if instrument_filter_id is not None:
-        if not 0 <= int(instrument_filter_id) < int(num_instruments):
-            raise ValueError("instrument_filter_id is out of range")
-        return [(int(instrument_filter_id),) for _ in range(NUM_PITCHES)]
+    candidate_instrument_ids = effective_instrument_ids(
+        num_model_classes=int(num_instruments),
+        allowed_instrument_ids=settings.allowed_instrument_ids,
+        instrument_filter_id=instrument_filter_id,
+    )
+    if len(candidate_instrument_ids) == 1:
+        return [candidate_instrument_ids for _ in range(NUM_PITCHES)]
 
     scores = pair_gate_logits.detach().float().cpu()
     ranked_by_pitch: list[tuple[int, ...]] = []
     for pitch_index in range(NUM_PITCHES):
-        score_values = [
-            float(scores[instrument_index, pitch_index].item())
-            for instrument_index in range(int(num_instruments))
-        ]
+        score_values = {
+            instrument_index: float(scores[instrument_index, pitch_index].item())
+            for instrument_index in candidate_instrument_ids
+        }
         finite_ids = [
             instrument_index
-            for instrument_index, score in enumerate(score_values)
-            if math.isfinite(score)
+            for instrument_index in candidate_instrument_ids
+            if math.isfinite(score_values[instrument_index])
         ]
-        if finite_ids:
-            ranked = sorted(
-                finite_ids,
-                key=lambda instrument_index: (
-                    -score_values[int(instrument_index)],
-                    int(instrument_index),
-                ),
-            )
-        else:
-            ranked = []
+        ranked = sorted(
+            finite_ids,
+            key=lambda instrument_index: (
+                -score_values[int(instrument_index)],
+                int(instrument_index),
+            ),
+        )
         seen = set(ranked)
         ranked.extend(
             instrument_index
-            for instrument_index in range(int(num_instruments))
+            for instrument_index in candidate_instrument_ids
             if instrument_index not in seen
         )
         ranked_by_pitch.append(tuple(int(item) for item in ranked))
@@ -709,6 +712,7 @@ def decode_notes(
             selected_pair_count += len(pair_ids)
             candidate_orders_by_pitch = _rank_instrument_candidates_by_pitch(
                 pair_gate_logits[sample_index],
+                settings=settings,
                 instrument_filter_id=instrument_filter_id,
             )
             instrument_candidates_by_pair = {

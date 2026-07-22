@@ -18,6 +18,11 @@ from instrument_agnostic_amt.cli.infer import (
     resolve_inference_settings,
 )
 from instrument_agnostic_amt.inference.audio import load_audio
+from instrument_agnostic_amt.inference.instruments import (
+    STEM_INSTRUMENT_CLASSES,
+    filter_supported_instrument_class_ids,
+    resolve_stem_instrument_class_ids,
+)
 from instrument_agnostic_amt.inference.midi import build_midi
 from instrument_agnostic_amt.inference.windowed import decode_notes
 
@@ -76,6 +81,7 @@ def run_inference(
     silence_gate_rms_dbfs=-72.0,
     window_batch_size=1,
     disable_tqdm=False,
+    allowed_instrument_ids=None,
     **_,
 ):
     settings = replace(
@@ -85,6 +91,10 @@ def run_inference(
         silence_gate_rms_dbfs=silence_gate_rms_dbfs,
         window_batch_size=int(window_batch_size),
         disable_tqdm=bool(disable_tqdm),
+        allowed_instrument_ids=filter_supported_instrument_class_ids(
+            allowed_instrument_ids,
+            num_model_classes=int(model_config.num_instrument_classes),
+        ),
     )
     notes, stats = decode_notes(
         model,
@@ -119,4 +129,3 @@ def _build_midi(
 
 if __name__ == "__main__":
     main()
-

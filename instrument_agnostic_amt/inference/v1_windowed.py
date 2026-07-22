@@ -12,6 +12,7 @@ from ..modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from .instruments import effective_instrument_ids
 from .types import InferenceSettings, PredictedNote
 from .windowed import (
     WindowNoteStitcher,
@@ -49,18 +50,23 @@ def _decode_instrument_map(
     entries: list[tuple[int, int, int, int, int]],
     *,
     probability_mode: str,
+    allowed_instrument_ids: tuple[int, ...],
 ) -> dict[tuple[int, int, int], tuple[int, tuple[int, ...]]]:
     if not entries:
         return {}
+    selected_logits = logits.float()[..., list(allowed_instrument_ids)]
     probabilities = (
-        torch.softmax(logits.float(), dim=-1)
+        torch.softmax(selected_logits, dim=-1)
         if probability_mode == "softmax"
-        else torch.sigmoid(logits.float())
+        else torch.sigmoid(selected_logits)
     )
     order = probabilities.argsort(dim=-1, descending=True)
     decoded = {}
     for index, entry in enumerate(entries):
-        candidates = tuple(int(value) for value in order[index].tolist())
+        candidates = tuple(
+            int(allowed_instrument_ids[int(value)])
+            for value in order[index].tolist()
+        )
         decoded[(entry[0], entry[1], entry[2])] = (candidates[0], candidates)
     return decoded
 
@@ -85,6 +91,11 @@ def decode_v1_notes(
     if int(waveform.shape[0]) != 2:
         raise ValueError("the V1 backbone requires mono or stereo input")
 
+    candidate_instrument_ids = effective_instrument_ids(
+        num_model_classes=int(config.num_instrument_classes),
+        allowed_instrument_ids=settings.allowed_instrument_ids,
+        instrument_filter_id=instrument_filter_id,
+    )
     sample_rate = int(config.sample_rate)
     total_frames = int(waveform.shape[-1])
     window_frames = int(round(settings.window_ms * sample_rate / 1000.0))
@@ -224,6 +235,7 @@ def decode_v1_notes(
                 logits,
                 entries,
                 probability_mode=settings.instrument_probability_mode,
+                allowed_instrument_ids=candidate_instrument_ids,
             )
 
         frame_logits = outputs.get("instrument_logits")
@@ -242,11 +254,18 @@ def decode_v1_notes(
                         logits = frame_logits[
                             batch_index, begin : end + 1, pitch_index
                         ].float().mean(dim=0)
-                        candidates_tensor = logits.argsort(descending=True)
-                        candidates = tuple(int(value) for value in candidates_tensor.tolist())
+                        selected_logits = logits[list(candidate_instrument_ids)]
+                        candidates_tensor = selected_logits.argsort(descending=True)
+                        candidates = tuple(
+                            int(candidate_instrument_ids[int(value)])
+                            for value in candidates_tensor.tolist()
+                        )
                         predicted = (candidates[0], candidates)
                     if predicted is None:
-                        predicted = (0, (0,))
+                        predicted = (
+                            candidate_instrument_ids[0],
+                            candidate_instrument_ids,
+                        )
                     instrument, candidates = predicted
                     has_offset = (
                         bool(boundary_flag[1])

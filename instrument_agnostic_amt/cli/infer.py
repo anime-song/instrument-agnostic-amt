@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,11 @@ import torch
 from tqdm.auto import tqdm
 
 from ..inference.audio import collect_audio_files, load_audio
+from ..inference.instruments import (
+    filter_supported_instrument_class_ids,
+    normalize_instrument_class_name,
+    parse_allowed_instrument_args,
+)
 from ..inference.midi import build_midi
 from ..inference.types import InferenceSettings
 from ..inference.windowed import decode_notes
@@ -32,8 +38,10 @@ HF_CHECKPOINT_BASE_URL = (
 MODEL_CHECKPOINT_FILENAMES = {
     "default": "best_model.pth",
     "bass": "best_model_bass.pth",
+    "bass_v2": "best_model_bass_v2.pth",
     "vocal": "best_model_vocal.pth",
     "guitar": "best_model_guitar.pth",
+    "guitar_v1_5": "best_model_guitar_v1_5.pth",
     "vocal_harmony": "best_model_vocal_harmony.pth",
     "drums": "best_model_drums.pth",
     "other": "best_model_other.pth",
@@ -60,25 +68,25 @@ DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
     "distorted_guitar": 78,
     "electric_guitar_muted": 68,
     "guitar_harmonics": 72,
-    "acoustic_bass": 92,
-    "electric_bass": 90,
-    "synth_bass": 86,
+    "acoustic_bass": 100,
+    "electric_bass": 100,
+    "synth_bass": 100,
     "drums": 100,
     "strings": 82,
-    "brass": 84,
-    "sax": 86,
+    "brass": 100,
+    "sax": 100,
     "flute_pipe": 84,
     "choir": 80,
     "organ": 88,
     "synth_pad": 76,
-    "synth_lead": 84,
-    "melody": 110,
+    "synth_lead": 76,
+    "melody": 120,
     "vocal_harmony": 60,
 }
 
 
 def _normalize_instrument_class_name(name: str) -> str:
-    return name.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalize_instrument_class_name(name)
 
 
 def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
@@ -137,7 +145,17 @@ def parse_args() -> argparse.Namespace:
         "--instrument",
         type=str,
         default=None,
-        help="Optional instrument class name. When omitted, all instruments are decoded.",
+        help="Optional single instrument class. When omitted, all allowed instruments are decoded.",
+    )
+    parser.add_argument(
+        "--allowed-instruments",
+        action="append",
+        default=[],
+        metavar="CLASS[,CLASS...]",
+        help=(
+            "Restrict instrument classification to these classes. Repeatable "
+            "and/or comma-separated. Softmax is recalculated over this subset."
+        ),
     )
     parser.add_argument("--audio", type=Path, default=None, help="Input audio file")
     parser.add_argument(
@@ -227,7 +245,7 @@ def parse_args() -> argparse.Namespace:
         help="Maximum instrument-pitch pairs decoded per window after threshold/top-k union.",
     )
     parser.add_argument("--merge-gap-ms", type=float, default=None)
-    parser.add_argument("--merge-onset-ms", type=float, default=20.0)
+    parser.add_argument("--merge-onset-ms", type=float, default=50.0)
     parser.add_argument(
         "--silence-gate-rms-dbfs",
         type=float,
@@ -278,6 +296,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--audio and --audio-dir cannot be used together")
     if args.output_midi is not None and args.audio_dir is not None:
         parser.error("--output-midi cannot be used with --audio-dir")
+    if args.instrument is not None and args.allowed_instruments:
+        parser.error("--instrument and --allowed-instruments cannot be used together")
     if args.window_ms is not None and args.window_ms <= 0:
         parser.error("--window-ms must be positive")
     if args.stride_ms is not None and args.stride_ms <= 0:
@@ -316,6 +336,9 @@ def parse_args() -> argparse.Namespace:
     try:
         args.instrument_volume_map = _parse_instrument_volume_args(
             args.instrument_volume
+        )
+        args.allowed_instrument_ids = parse_allowed_instrument_args(
+            args.allowed_instruments
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -498,6 +521,18 @@ def main() -> None:
     checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
     model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
     settings = resolve_inference_settings(config, training_args, args)
+    requested_instrument_ids = (
+        (int(instrument_id),)
+        if instrument_id is not None
+        else args.allowed_instrument_ids
+    )
+    settings = replace(
+        settings,
+        allowed_instrument_ids=filter_supported_instrument_class_ids(
+            requested_instrument_ids,
+            num_model_classes=int(config.num_instrument_classes),
+        ),
+    )
 
     if args.audio_dir is not None:
         audio_dir = args.audio_dir.resolve()

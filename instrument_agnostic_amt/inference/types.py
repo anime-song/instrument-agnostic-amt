@@ -36,3 +36,4 @@ class InferenceSettings:
     instrument_pair_infer_topk: int = 256
     instrument_pair_gate_threshold: float = -3.0
     instrument_pair_max_pairs: int = 512
+    allowed_instrument_ids: tuple[int, ...] | None = None
