@@ -1,84 +1,223 @@
-# Instrument-Agnostic AMT
+# Instrument-Agnostic Automatic Music Transcription
 
-このブランチは、入力スタックとdual-axis TransformerをV1相当のCQT/StemConvへ戻しつつ、出力側は現在のinstrument-pitch pair gate + Semi-CRF interval decoderを残したシンプルなAMTモデルです。重複するinstrument-pitch区間を表現できます。
+**楽器を問わない自動採譜モデル** — Neural Semi-CRF ベース
 
-現在の構成:
+[English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
 
-```text
-waveform
-  -> HCQT / RecursiveCQT
-  -> StemConv (時間解像度は維持)
-  -> V1 dual-axis Transformer blocks
-       band axis -> time axis
-       LWR layer-wise time resampling, default ratio 4
-  -> pitch query features
-  -> instrument-pitch pair gate
-  -> flat Semi-CRF interval decoding + boundary head
-  -> MIDI tracks
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://youtu.be/aXi4b672a6M">
+        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="採譜結果例" width="480">
+      </a>
+      <br>
+      <strong>採譜結果例</strong>
+    </td>
+    <td align="center">
+      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
+        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="元動画" width="480">
+      </a>
+      <br>
+      <strong>元動画</strong>
+    </td>
+  </tr>
+</table>
+
+> **動画について**: 上の画像はクリックできるサムネイルです。クリックすると YouTube で動画を見られます。
+
+> **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、最後に MIDI をマージする** オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。
+
+---
+
+## 概要
+
+このプロジェクトは、オーディオファイルから MIDI を生成する**楽器非依存の自動採譜 (AMT)** モデルです。
+[Basic Pitch](https://github.com/spotify/basic-pitch) と同じように、楽器の種類を区別せず、ピアノでもギターでもボーカルでも音高があればひとつのモデルでまとめて採譜します。
+
+アーキテクチャは [**Transkun**](https://github.com/Yujia-Yan/Transkun)（Yujia Yan 氏）の Neural Semi-CRF がベースです。
+もともとピアノ採譜用だったこの仕組みを、楽器を問わず使える汎用モデルに拡張しています。
+
+> **Note**: 楽器を識別してマルチトラック MIDI として出力する機能もありますが、これは**実験的 (Experimental)** な追加機能です。分類精度はまだ十分ではなく、メインの機能はあくまで「楽器を区別しないピッチ検出」です。
+
+> **Note**: ドラム専用モデル（`--type drums`）は**実験的 (Experimental)** です。精度や挙動は今後変わる可能性があります。
+
+> **Warning**: エレキギター（特に歪みサウンド）への汎化はまだ弱く、採譜精度が低くなる傾向があります。また、学習データの少ないエスニック楽器（三味線、シタール等）についても同様です。
+
+### 更新履歴
+
+| 日付 | 内容 |
+|---|---|
+| 2026-06-24 | 🥁 推論用のドラム専用モデルを追加（`--type drums`、実験的 / Experimental） |
+| 2026-06-05 | 🎻 その他楽器専用モデルを追加（`--type other`） |
+| 2026-05-31 | 🎤 ボーカルハモリモデルを追加（`--type vocal_harmony`）。ハモリを識別できるように楽器一覧に `vocal_harmony` クラスを追加。<br>🧩 重複するノート区間を同時に予測できる Pitch Slot 機能を追加。 |
+| 2026-05-20 | 🎸 ギター専用モデルを追加（`--type guitar`） |
+| 2026-05-18 | 📦 ピッチシフト・タイムストレッチ用の前処理スクリプトを追加 |
+| 2026-05-17 | 🎤 ボーカル専用モデルを追加（`--type vocal`） |
+| 2026-05-16 | 🎸 ベース専用モデルを追加（`--type bass`） |
+| 2026-05-09 | 🔧 ウィンドウ間のノート結合処理を修正 / ビート・コード学習を追加 |
+| 2026-05-09 | 🎼 ステム分離→採譜→マージのワークフローを Colab に追加 |
+| 2026-05-06 | 🥁 ドラム判定を強化 / 新しいオーグメンテーションを追加 |
+| 2026-05-05 | ✨ EMA・楽器ロスマスク・フォルダ一括推論を追加 |
+| 2026-05-03 | 🚀 初回リリース — マルチ楽器 AMT モデル & Colab ノートブック公開 |
+
+### 特徴
+
+- 🎹 **楽器を問わない採譜** — ピアノ、ギター、ベース、ボーカル、ストリングス、管楽器など
+- 🧠 **Neural Semi-CRF + Pitch Slot** — ピッチごとに最適なノート区間を Viterbi で一括デコード。Pitch Slot により同じ音程の重複ノートも同時に予測可能
+- 🎼 **HCQT 特徴量** — 5つの倍音 × ステレオ 2ch の Harmonic CQT で音高情報をしっかり捉える
+- 🔧 **豊富なデータ拡張** — ステムの混ぜ合わせ、IR リバーブ、EQ、ノイズ、ドラム追加など
+- 🧪 **[実験的] 楽器識別 & マルチトラック出力** — 33+ 楽器クラスの分類ヘッド付き（精度は改善中）
+
+---
+
+## アーキテクチャ
+
+```
+オーディオ波形 [B, 2, T]
+        │
+        ▼
+┌─────────────────────────────┐
+│  AudioFeatureExtractor      │
+│  (Harmonic CQT × 5倍音)    │   → [B, 10, F=312, T]
+│  + SpecAugment (学習時)     │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│  StemConv                   │
+│  (2D CNN ダウンサンプリング) │   → [B, D, T/8, F/4]
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│  Backbone (Dual-Axis        │
+│  Transformer × N層)         │
+│  + Pitch Query Embedding    │   → バンド特徴量 + ピッチ別特徴量
+│  + Transposed ConvUpsample  │
+└─────────────────────────────┘
+        │
+        ├──────────────────────────┐
+        ▼                          ▼
+┌───────────────────┐   ┌───────────────────────┐
+│ Interval Adapter  │   │ Instrument Adapter    │
+│ + IntervalScorer  │   │ + 楽器分類ヘッド(33cls)│
+│   (Q, K, Diag)    │   └───────────────────────┘
+└───────────────────┘
+        │
+        ▼
+┌───────────────────────────────┐
+│ Neural Semi-CRF               │
+│ (ピッチ別 Viterbi デコード)   │  → ピッチ毎のノート区間 [begin, end]
+│ + Boundary Predictor          │  → Onset/Offset の有無 & サブフレーム補正
+└───────────────────────────────┘
+        │
+        ▼
+    MIDI 出力
 ```
 
-削除したもの:
+### Dual-Axis Transformer
 
-- Source-separation BS-RoFormer stem-splitter backbone
-- stem splitter / V1 partial checkpoint initialization helper
-- previous spectral band-splitting input path
-- beat / chord auxiliary head
-- framewise instrument classifier / interval instrument predictor
+バックボーンでは 2 種類のトークンを同時に処理します:
 
-## ディレクトリ構成
+- **バンドトークン**: CNN stem が出力した周波数帯域の特徴量
+- **ピッチクエリトークン**: MIDI ピッチ（21〜108）に対応する学習可能な埋め込み
 
-```text
+各レイヤーで **バンド軸 Transformer**（各タイムステップ内で全トークンにアテンド）と **時間軸 Transformer**（各トークンの時系列にアテンド）を交互に適用し、周波数情報とピッチ情報を効率よく統合します。
+
+### Neural Semi-CRF
+
+88 本のピッチトラックをそれぞれ独立した Semi-CRF としてモデル化します:
+
+- **Pitch Slot** — 同じピッチで音が重なる区間（ユニゾン等）を予測できるよう、複数のスロットを並列処理
+- **インターバルスコア** — Query と Key のバイリニアアテンションで算出
+- **対角スコア** — 1フレームだけのノート用の加算バイアス
+- **Viterbi デコード** — 重複しないノート区間の最適解をグローバルに探索
+- **境界予測ヘッド** — Onset/Offset の有無とサブフレームレベルのタイミング補正を予測
+
+---
+
+## プロジェクト構成
+
+```
 instrument_agnostic_amt/
-  cli/
-    train.py
-    infer.py
-  data/
-    augmentation.py
-    dataset.py
-    sampling.py
-  modeling/
-    features/cqt.py
-    features/spec_augment.py
-    blocks/lwr.py
-    blocks/axis_transformer.py
-    blocks/transformer.py
-    heads/semi_crf.py
-    heads/interval_boundaries.py
-    model.py
-  taxonomy/
-    instrument_classes.py
-    instrument_merge.json
-    gm_instrument_classes.json
-  training/
-    losses.py
-configs/
-  datasets/
-    dataset_config.yaml
-    ...
-preprocess/
-  prepare_dataset.py
-  resample_only.py
-  ...
+├── train.py                    # 学習ループ（AMP、W&B、ウォームアップ対応）
+├── infer.py                    # 推論: オーディオ → MIDI
+├── dataset.py                  # StemDataset（ステムの混ぜ合わせ等のオーグメンテーション）
+├── losses.py                   # ロス計算: Semi-CRF NLL + 境界 + 楽器分類
+├── augmentation.py             # AudioAugmentor（EQ、ピッチシフト、リバーブ、ノイズ等）
+├── instrument_classes.py       # 楽器クラスのマッピング（GM program ↔ クラスID）
+├── instrument_merge.json       # 楽器分類の定義
+├── gm_instrument_classes.json  # General MIDI メタデータ
+├── dataset_config.yaml         # データセットの重み付け設定
+├── requirements.txt            # 依存パッケージ
+│
+├── models/
+│   ├── model.py                # AudioSemiCRFTransformer（モデル本体）
+│   ├── transcription_model.py  # 特徴抽出、StemConv、Backbone
+│   ├── transformer.py          # RoPE 付き Transformer
+│   ├── cqt.py                  # RecursiveCQT（再帰ダウンサンプリングによる高速 CQT）
+│   ├── semi_crf.py             # Neural Semi-CRF（前向き-後ろ向き、Viterbi、ロス）
+│   ├── interval_boundaries.py  # インターバル境界の特徴量収集
+│   └── spec_augment.py         # SpecAugment & MiniBatch Mixture Masking
+│
+└── preprocess/
+    ├── prepare_dataset.py      # オーディオ/MIDI ペアから manifest.csv を生成
+    ├── resample_only.py        # まとめてリサンプリング
+    └── apply_ir_augmentation.py # IR コンボリューションでリバーブ付きステムを事前生成
 ```
+
+---
 
 ## インストール
 
+### 必要なもの
+
+- Python 3.10+
+- CUDA 対応 GPU（VRAM 12GB 以上推奨）
+
 ```bash
+# クローン
+git clone https://github.com/anime-song/instrument-agnostic-amt.git
+cd instrument-agnostic-amt
+
+# 仮想環境
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate   # Windows
+
+# 依存パッケージ
 pip install -r requirements.txt
 ```
 
-Windows PowerShell:
+> `audiomentations` は学習時のオーグメンテーションで使います。推論だけなら入れなくても動きます。
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+---
 
 ## データ準備
 
-stem音声と対応するMIDIを用意し、manifestを作ります。
+### 1. ファイルの配置
+
+ステムオーディオと対応する MIDI ファイルを以下のように配置します:
+
+```
+stems/          # オーディオファイル (.wav / .flac)
+  ├── song1__piano.wav
+  ├── song1__guitar.wav
+  ├── song2__vocal.wav
+  └── ...
+
+stem_midis/     # 対応する MIDI
+  ├── song1__piano.mid
+  ├── song1__guitar.mid
+  ├── song2__vocal.mid
+  └── ...
+```
+
+**命名規則**: `<曲名>__<楽器名>.wav`
+- `__`（アンダースコア 2 つ）が曲名と楽器名の区切り
+- 同じ曲名を持つステムは同一曲のパートとして扱われます
+
+### 2. マニフェスト生成
 
 ```bash
 python preprocess/prepare_dataset.py \
@@ -88,13 +227,28 @@ python preprocess/prepare_dataset.py \
   --manifest_path ./manifest.csv
 ```
 
-Semi-CRFのtrackはinstrument-pitch pair targetから選ぶため、学習には信頼できる楽器ラベルが必要です。
+これで以下が生成されます:
+- **`stem_npz/`**: ノート情報の前処理済みファイル（開始/終了時刻、ピッチ、ベロシティ、楽器ID）
+- **`manifest.csv`**: データセットのインデックス
+
+### 3. （任意）リサンプリング
+
+オーディオファイルが 22050 Hz でない場合:
+
+```bash
+python preprocess/resample_only.py \
+  --input_dir ./raw_stems \
+  --output_dir ./stems \
+  --target_sr 22050
+```
 
 ## 学習
 
+### 基本
+
 ```bash
-python -m instrument_agnostic_amt.cli.train \
-  --dataset_config configs/datasets/dataset_config.yaml \
+python train.py \
+  --manifest_path manifest.csv \
   --batch_size 8 \
   --lr 5e-4 \
   --epochs 3000 \
@@ -102,61 +256,142 @@ python -m instrument_agnostic_amt.cli.train \
   --wandb
 ```
 
-主なアーキテクチャ引数:
+### フルオーグメンテーション
 
-| Argument | Default | Meaning |
-|---|---:|---|
-| `--hop_length` | `512` | CQT/model frame hop |
-| `--n_fft` | `2048` | 互換用に保存するwindow-size guard |
-| `--cqt_n_bins` | `312` | StemConv前のCQT bins |
-| `--cqt_bins_per_octave` | `36` | CQT resolution |
-| `--harmonics` | `1,2,3,4,5` | HCQT harmonic channels |
-| `--hidden_size` | `384` | Transformer attention hidden size |
-| `--base_ch` | `64` | StemConv base channels。token dimは`4 * base_ch` |
-| `--encoder_num_layers` | `6` | V1 dual-axis block count |
-| `--encoder_num_heads` | `12` | Attention heads |
-| `--lwr_layers` | `last3` | LWRを入れるTransformer layer: `last3`, `all`, `none`, `0,2,4`, `0-2,5`, mask `101001` |
-| `--lwr_ratio` | `8` | 有効化された層のLWR time downsample ratio |
-| `--lwr_resampling_mode` | `mean` | LWRのresampling operator: `mean` または学習可能なdepthwise `conv1d` |
+```bash
+python train.py \
+  --dataset_config dataset_config.yaml \
+  --batch_size 8 \
+  --lr 5e-4 \
+  --warmup_steps 1000 \
+  --epochs 3000 \
+  --ir_folder ./IRs \
+  --noise_folder ./noise \
+  --drum_folder ./drum_stems \
+  --p_augment 1.0 \
+  --p_intra_drop 0.3 \
+  --p_cross_mix 0.5 \
+  --p_drum_mix 0.1 \
+  --sa_p 0.5 --sa_freq_max 10 --sa_time_max 20 --sa_num_freq 2 --sa_num_time 2 \
+  --wandb --project_name instrument_agnostic_amt
+```
 
-checkpointには`architecture_version=2`, `lwr_layers`, `lwr_ratio`, `lwr_resampling_mode`が保存されます。
+### 主な引数
+
+| 引数 | デフォルト | 説明 |
+|---|---|---|
+| `--dataset_config` | `dataset_config.yaml` | 重み付きマルチデータセット設定 |
+| `--batch_size` | `8` | バッチサイズ |
+| `--lr` | `5e-4` | 学習率 (AdamW) |
+| `--warmup_steps` | `1000` | LR ウォームアップのステップ数 |
+| `--window_ms` | `8000` | 入力ウィンドウの長さ (ms) |
+| `--p_intra_drop` | `0.3` | 曲内のステムをランダムに落とす確率 |
+| `--p_cross_mix` | `0.5` | 別の曲からステムを混ぜる確率 |
+| `--p_augment` | `1.0` | オーディオ拡張を適用する確率 |
+| `--init-from` | `None` | 重み初期化用のチェックポイント |
+| `--no_amp` | `false` | 混合精度を無効化 |
+
+### マルチデータセット設定
+
+`dataset_config.yaml` で複数データセットを重み付きで混合できます:
+
+```yaml
+datasets:
+  - name: main
+    manifest: manifest.csv
+    weight: 0.2
+    use_for_cross_aug: true
+
+  - name: maestro
+    manifest: other_db/maestro_manifest.csv
+    weight: 0.05
+    use_for_cross_aug: true
+
+  - name: musicnet
+    manifest: other_db/musicnet_manifest.csv
+    weight: 0.5
+    use_for_cross_aug: false  # cross-stem ミキシングには使わない
+```
+
+---
 
 ## 推論
 
-全楽器をdecode:
+### 基本
 
 ```bash
-python -m instrument_agnostic_amt.cli.infer \
+python infer.py --audio input_song.wav
+```
+
+> **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
+
+### Google Colab のステム分離ワークフロー
+
+Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
+
+1. 入力した曲をステム分離する
+2. 各ステムを個別に採譜する
+3. ステムごとの MIDI を最後に 1 本へマージする
+
+この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
+
+### その他のオプション
+
+```bash
+python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
-  --output-midi output.mid
+  --output-midi output.mid \
+  --amp \
+  --window-ms 8000 \
+  --stride-ms 4000 \
+  --window-batch-size 4 \
+  --velocity 100 \
+  --max-midi-melodic-instruments 15
 ```
 
-単一楽器クラスだけdecode:
+### 主な引数
 
-```bash
-python -m instrument_agnostic_amt.cli.infer \
-  --checkpoint checkpoints/checkpoint_epoch_100.pth \
-  --instrument piano \
-  --audio input_song.wav \
-  --output-midi output.mid
-```
+| 引数 | デフォルト | 説明 |
+|---|---|---|
+| `--checkpoint` | (自動) | 学習済みモデルのパス。指定しない場合は HF から自動取得 |
+| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: ベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: ギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
+| `--audio` | （必須） | 入力オーディオのパス |
+| `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
+| `--amp` | `false` | 混合精度推論を有効化 |
+| `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
+| `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
+| `--window-batch-size` | `1` | まとめて処理するウィンドウ数 |
+| `--merge-gap-ms` | 1 hop 分 | ノート間ギャップのマージ閾値 |
+| `--merge-onset-ms` | `20.0` | 近いオンセットのマージ閾値 |
+| `--max-midi-melodic-instruments` | `15` | 楽器トラックの上限 |
+| `--silence-gate-rms-dbfs` | `-72` | 無音スキップの RMS 閾値 |
 
-フォルダ一括推論:
+---
 
-```bash
-python -m instrument_agnostic_amt.cli.infer \
-  --checkpoint checkpoints/checkpoint_epoch_100.pth \
-  --audio-dir ./audio \
-  --output-dir ./midi
-```
+## データ拡張
 
-推論はデフォルトでoverlapありのwindow推論です。`--window-ms`はcheckpointに保存された学習windowを優先し、無い場合は8000 msです。`--stride-ms`は未指定ならwindowの半分になります。`--window-batch-size`はVRAMに余裕がある場合だけ上げてください。`--semi-crf-track-batch-size`は各window内のSemi-CRF decodeメモリを調整します。
+学習時には複数のオーグメンテーションを組み合わせて汎化性能を高めています:
 
-## Smoke Test
+### ステムレベル
+- **イントラステムドロップ** — 同じ曲のステムをランダムに落とし、パートが少ない状況をシミュレート
+- **クロスステムミキシング** — 別の曲から異なる楽器のステムを混合
+- **ドラム追加** — ドラムがない曲にドラムトラックをランダムに追加
 
-```bash
-python -m compileall instrument_agnostic_amt
-python -m instrument_agnostic_amt.cli.train --help
-python -m instrument_agnostic_amt.cli.infer --help
-```
+### オーディオレベル
+- **7 バンド EQ** — 録音環境やミックスの違いをシミュレート
+- **マイクロピッチシフト** — ±0.2 半音のチューニング変動
+- **IR リバーブ** — 実際のインパルスレスポンスによる部屋鳴りの付加
+- **ノイズ注入** — ガウスノイズや環境音
+- **ステレオ操作** — チャンネルスワップ、ランダムパンニング
+- **ゲインランダム化** — ステムごと ±6 dB
+
+### スペクトログラムレベル
+- **SpecAugment** — CQT 特徴量に対する時間・周波数マスキング
+- **ハーモニックドロップアウト** — 倍音チャンネルをランダムにドロップ（基本波は保持）
+
+---
+
+## ライセンス
+
+[MIT License](LICENSE)

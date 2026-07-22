@@ -27,7 +27,12 @@ from .notes import (
     split_window_notes,
 )
 from .sampling import StemWindowSelector
-from .targets import build_frame_note_targets, build_pitch_interval_targets
+from .targets import (
+    build_frame_instrument_targets,
+    build_frame_note_targets,
+    build_interval_targets,
+)
+from ..modeling.model import normalize_semi_crf_version
 from ..taxonomy.instrument_classes import (
     NUM_INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -84,6 +89,8 @@ class StemDataset(Dataset):
         n_fft: int = 1024,
         hop_length: int = 512,
         sample_rate: int = 22050,
+        semi_crf_version: str = 'v1',
+        num_pitch_slots: int = 1,
         p_intra_drop: float = 0.2,
         p_cross_mix: float = 0.1,
         p_cross_mix_decay: float = 0.3,
@@ -101,6 +108,8 @@ class StemDataset(Dataset):
         self.n_fft = int(n_fft)
         self.hop_length = int(hop_length)
         self.sample_rate = int(sample_rate)
+        self.semi_crf_version = normalize_semi_crf_version(semi_crf_version)
+        self.num_pitch_slots = max(1, int(num_pitch_slots))
         # Probability of dropping stems from the same song.
         self.p_intra_drop = float(p_intra_drop)
         # Probability of mixing stems from other songs.
@@ -170,7 +179,7 @@ class StemDataset(Dataset):
 
         if not self.dataset_groups:
             raise ValueError(
-                "No usable dataset groups found for V2 filtered instrument-pitch training"
+                f"No usable dataset groups found for Semi-CRF {self.semi_crf_version}"
             )
 
         self.dataset_groups_by_name = {
@@ -270,9 +279,9 @@ class StemDataset(Dataset):
             # Track existing songs so we can collect only newly loaded ones.
             dataset_name = dataset_entry.get("name", manifest_rel)
             mask_inst = bool(dataset_entry.get("mask_instrument_loss", False))
-            if mask_inst:
+            if mask_inst and self.semi_crf_version == "v2":
                 logger.info(
-                    "Skipping dataset group %s for V2 filtered instrument-pitch training because mask_instrument_loss=true",
+                    "Skipping dataset group %s for V2 because mask_instrument_loss=true",
                     dataset_entry.get("name", manifest_rel),
                 )
                 continue
@@ -468,7 +477,9 @@ class StemDataset(Dataset):
             return True
 
         merged_notes = concat_window_notes(*current_note_groups, *candidate_note_groups)
-        interval_targets = build_pitch_interval_targets(
+        interval_targets = build_interval_targets(
+            semi_crf_version=self.semi_crf_version,
+            num_pitch_slots=self.num_pitch_slots,
             active_start_ms=merged_notes.start_ms,
             active_end_ms=merged_notes.end_ms,
             active_pitch=merged_notes.pitch,
@@ -479,7 +490,11 @@ class StemDataset(Dataset):
             hop_length=self.hop_length,
             num_frames=self.model_frames,
         )
-        positive_pair_count = len(interval_targets.positive_pair_ids)
+        positive_pair_count = (
+            len(interval_targets.positive_pair_ids)
+            if self.semi_crf_version == "v2"
+            else sum(bool(track) for track in interval_targets.intervals)
+        )
         interval_count = sum(len(track) for track in interval_targets.intervals)
         if max_positive_pairs > 0 and positive_pair_count > max_positive_pairs:
             return False
@@ -675,7 +690,23 @@ class StemDataset(Dataset):
             num_frames=self.model_frames,
         )
 
-        interval_targets = build_pitch_interval_targets(
+        frame_instrument_targets = (
+            build_frame_instrument_targets(
+                active_start_ms=merged_notes.start_ms,
+                active_end_ms=merged_notes.end_ms,
+                active_pitch=merged_notes.pitch,
+                active_instrument=merged_notes.instrument,
+                sample_rate=self.sample_rate,
+                hop_length=self.hop_length,
+                num_frames=self.model_frames,
+            )
+            if self.semi_crf_version == "v1"
+            else None
+        )
+
+        interval_targets = build_interval_targets(
+            semi_crf_version=self.semi_crf_version,
+            num_pitch_slots=self.num_pitch_slots,
             active_start_ms=merged_notes.start_ms,
             active_end_ms=merged_notes.end_ms,
             active_pitch=merged_notes.pitch,
@@ -700,7 +731,7 @@ class StemDataset(Dataset):
             valid_audio_ms = 0
         valid_audio_frames_val = int(round(valid_audio_ms * self.sample_rate / 1000.0))
 
-        # V2 filtered training excludes mask_instrument_loss=true groups while loading configs.
+        # V1 masks only instrument loss; V2 excludes such groups during config loading.
         mask_instrument_loss = any(
             stem.get("mask_instrument_loss", False)
             for stem, _ in mixed_stems_with_offset
@@ -711,6 +742,7 @@ class StemDataset(Dataset):
             "window_start_ms": window_start_ms,
             "audio": audio_tensor,
             "frame_active_targets": frame_active_targets,
+            "frame_instrument_targets": frame_instrument_targets,
             "interval_targets": interval_targets,
             "valid_audio_frames": valid_audio_frames_val,
             "mask_instrument_loss": mask_instrument_loss,

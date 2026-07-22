@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from ..modeling.heads.interval_boundaries import PitchIntervalTargets
 from ..modeling.heads.semi_crf import compute_flat_interval_loss
 from ..modeling.model import AudioSemiCRFTransformer, NUM_PITCHES
+from .v1_losses import compute_v1_losses
 
 
 def _stack_pair_presence(
@@ -18,10 +19,15 @@ def _stack_pair_presence(
 ) -> torch.Tensor:
     rows = []
     for target in interval_targets:
-        if target.pair_presence is None:
-            rows.append(torch.zeros((num_instruments, NUM_PITCHES), dtype=torch.bool))
-        else:
-            rows.append(target.pair_presence.to(dtype=torch.bool, device="cpu"))
+        row = torch.zeros((num_instruments, NUM_PITCHES), dtype=torch.bool)
+        if target.pair_presence is not None:
+            presence = target.pair_presence.to(dtype=torch.bool, device="cpu")
+            copy_instruments = min(int(presence.shape[0]), int(num_instruments))
+            copy_pitches = min(int(presence.shape[1]), NUM_PITCHES)
+            row[:copy_instruments, :copy_pitches] = presence[
+                :copy_instruments, :copy_pitches
+            ]
+        rows.append(row)
     return torch.stack(rows, dim=0).to(device=device)
 
 
@@ -192,7 +198,7 @@ def _gather_flat_boundary_targets(
     return has_onset, has_offset, onset_offsets, offset_offsets
 
 
-def compute_losses(
+def _compute_v2_losses(
     outputs: dict[str, torch.Tensor | None],
     batch: dict[str, Any],
     args: Any | None = None,
@@ -378,3 +384,18 @@ def compute_losses(
         "interval_offset_loss": interval_offset_loss,
         "interval_boundary_interval_count": interval_boundary_interval_count,
     }
+
+
+
+
+def compute_losses(
+    outputs: dict[str, torch.Tensor | None],
+    batch: dict[str, Any],
+    args: Any | None = None,
+    model: AudioSemiCRFTransformer | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if model is None:
+        raise ValueError("compute_losses requires the model")
+    if model.semi_crf_version == "v1":
+        return compute_v1_losses(outputs, batch, args=args, model=model)
+    return _compute_v2_losses(outputs, batch, args=args, model=model)

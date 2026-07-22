@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from collections import defaultdict
@@ -547,6 +547,20 @@ def decode_notes(
     settings: InferenceSettings,
     velocity: int,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
+    if config.semi_crf_version == "v1":
+        from .v1_windowed import decode_v1_notes
+
+        return decode_v1_notes(
+            model,
+            config,
+            waveform,
+            instrument_filter_id=instrument_filter_id,
+            device=device,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            settings=settings,
+            velocity=velocity,
+        )
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
     expected_channels = int(getattr(config, "input_audio_channels", 2))

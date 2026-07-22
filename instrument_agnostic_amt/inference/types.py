@@ -28,6 +28,7 @@ class InferenceSettings:
     note_bias: float
     disable_tqdm: bool
     use_boundary_head: bool = True
+    instrument_probability_mode: str = "sigmoid"
     semi_crf_sparse_decode: bool = False
     semi_crf_sparse_topk_per_start: int = 16
     semi_crf_sparse_score_threshold: float | None = None

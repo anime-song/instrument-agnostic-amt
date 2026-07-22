@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +12,44 @@ from ..inference.audio import collect_audio_files, load_audio
 from ..inference.midi import build_midi
 from ..inference.types import InferenceSettings
 from ..inference.windowed import decode_notes
+from ..modeling.checkpoints import (
+    coerce_model_config,
+    extract_model_config,
+    extract_training_args,
+    load_checkpoint,
+    load_compatible_weights,
+)
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
 )
+
+
+HF_CHECKPOINT_BASE_URL = (
+    "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
+)
+MODEL_CHECKPOINT_FILENAMES = {
+    "default": "best_model.pth",
+    "bass": "best_model_bass.pth",
+    "vocal": "best_model_vocal.pth",
+    "guitar": "best_model_guitar.pth",
+    "vocal_harmony": "best_model_vocal_harmony.pth",
+    "drums": "best_model_drums.pth",
+    "other": "best_model_other.pth",
+}
+
+
+def _ensure_checkpoint(checkpoint_path: Path | None, model_type: str = "default") -> Path:
+    filename = MODEL_CHECKPOINT_FILENAMES[model_type]
+    if checkpoint_path is None:
+        checkpoint_path = Path("checkpoints") / filename
+    if not checkpoint_path.exists():
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{HF_CHECKPOINT_BASE_URL}/{filename}?download=true"
+        print(f"Checkpoint not found at {checkpoint_path}. Downloading from Hugging Face...")
+        torch.hub.download_url_to_file(url, str(checkpoint_path))
+    return checkpoint_path
 
 
 DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
@@ -86,13 +118,19 @@ def _parse_instrument_volume_args(entries: list[str]) -> dict[str, int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run CQT/StemConv instrument-pitch AMT inference."
+        description="Run V1-compatible or overlap-capable V2 AMT inference."
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        required=True,
-        help="Path to a CQT/StemConv Semi-CRF checkpoint",
+        default=None,
+        help="Checkpoint path. The selected --type is downloaded when omitted.",
+    )
+    parser.add_argument(
+        "--type",
+        choices=tuple(MODEL_CHECKPOINT_FILENAMES),
+        default="default",
+        help="Pretrained V1 model type used when --checkpoint is omitted.",
     )
 
     parser.add_argument(
@@ -290,59 +328,30 @@ def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
     return torch.float16
 
 
-def _coerce_model_config(raw_model_config: dict[str, Any]) -> SemiCRFModelConfig:
-    allowed = {field.name for field in fields(SemiCRFModelConfig)}
-    kwargs = {key: value for key, value in raw_model_config.items() if key in allowed}
-    if "lwr_layers" not in kwargs and "lwr_mode" in raw_model_config:
-        legacy_lwr_mode = str(raw_model_config.get("lwr_mode", "all"))
-        kwargs["lwr_layers"] = "none" if legacy_lwr_mode == "none" else "all"
-    if int(raw_model_config.get("architecture_version", 1)) != 2:
-        raise ValueError("This inference entrypoint requires architecture_version=2.")
-    if (
-        "instrument_pair_gate_dim" not in raw_model_config
-        or "num_pitch_slots" in raw_model_config
-    ):
-        raise ValueError(
-            "This inference entrypoint requires an instrument-pitch pair-gated checkpoint; "
-            "legacy single-condition checkpoints are not compatible."
-        )
-    kwargs["use_gradient_checkpoint"] = False
-    kwargs["spec_augment_params"] = None
-    return SemiCRFModelConfig(**kwargs)
-
-
 def load_model(
     checkpoint_path: Path, *, device: torch.device
 ) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig, dict[str, Any]]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
-    raw_config = checkpoint.get("model_config")
-    raw_run_config = checkpoint.get("config")
-    if raw_config is None and isinstance(raw_run_config, dict):
-        raw_config = raw_run_config.get("model_config")
-    if not isinstance(raw_config, dict):
-        raise ValueError("Checkpoint does not contain model_config")
-    config = _coerce_model_config(raw_config)
+    checkpoint = load_checkpoint(checkpoint_path)
+    config = coerce_model_config(
+        extract_model_config(checkpoint),
+        for_inference=True,
+    )
     model = AudioSemiCRFTransformer(config)
-    state_dict = checkpoint.get("ema_state_dict") or checkpoint.get("model_state_dict")
-    if state_dict is None:
-        state_dict = checkpoint
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    if incompatible.missing_keys:
-        print(f"Missing keys while loading checkpoint: {incompatible.missing_keys}")
-    if incompatible.unexpected_keys:
-        print(
-            f"Unexpected keys while loading checkpoint: {incompatible.unexpected_keys}"
-        )
+    report = load_compatible_weights(
+        model,
+        checkpoint,
+        prefer_ema=True,
+        require_complete_backbone=True,
+    )
+    if report.missing_keys:
+        print(f"Missing keys while loading checkpoint: {report.missing_keys}")
+    if report.unexpected_keys:
+        print(f"Skipped checkpoint keys: {report.unexpected_keys}")
+    if report.shape_mismatches:
+        print(f"Skipped shape-mismatched keys: {report.shape_mismatches}")
     model.to(device)
     model.eval()
-    training_args = (
-        raw_run_config.get("args", {}) if isinstance(raw_run_config, dict) else {}
-    )
-    if not isinstance(training_args, dict):
-        training_args = {}
-    return model, config, training_args
+    return model, config, extract_training_args(checkpoint)
 
 
 def resolve_inference_settings(
@@ -392,6 +401,9 @@ def resolve_inference_settings(
         note_bias=float(args.note_bias),
         disable_tqdm=bool(args.disable_tqdm),
         use_boundary_head=not bool(args.no_boundary_head),
+        instrument_probability_mode=(
+            "softmax" if training_args.get("instrument_loss_type") == "ce" else "sigmoid"
+        ),
         semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
         semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
         semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
@@ -483,7 +495,8 @@ def main() -> None:
     instrument_id = (
         resolve_instrument_id(args.instrument) if args.instrument is not None else None
     )
-    model, config, training_args = load_model(args.checkpoint.resolve(), device=device)
+    checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
+    model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
     settings = resolve_inference_settings(config, training_args, args)
 
     if args.audio_dir is not None:
