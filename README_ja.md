@@ -338,6 +338,28 @@ datasets:
     use_for_cross_aug: false  # cross-stem ミキシングには使わない
 ```
 
+別々のmanifestに同じ曲からレンダリングしたstemが入っている場合は、
+オプションの `group` を指定します:
+
+```yaml
+datasets:
+  - name: rendered_piano
+    group: single_stems
+    manifest: piano_stem_manifest.csv
+    allow_multi_stem_same_song: true
+
+  - name: rendered_strings
+    group: single_stems
+    manifest: strings_stem_manifest.csv
+    allow_multi_stem_same_song: true
+```
+
+`group` とCSVの `song_name` が同じentryは、1つの仮想的な曲として扱われます。
+そのため `allow_multi_stem_same_song: true` なら、manifestをまたいでstemを
+選択できます。weight、augmentation設定、cross-augmentationへの使用可否は
+従来どおり各entry単位です。`group` を省略した場合は `name` が使われ、
+既存の分離された挙動を維持します。
+
 ---
 
 ## 推論

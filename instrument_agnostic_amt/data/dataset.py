@@ -78,6 +78,7 @@ class StemDataset(Dataset):
     """
     Load stem audio/MIDI pairs and build all-instrument AMT samples.
     Supports weighted multi-dataset sampling from a dataset_config YAML file.
+    Dataset entries may share a song-identity group across manifests.
     """
 
     def __init__(
@@ -150,19 +151,21 @@ class StemDataset(Dataset):
             tuple[str, str], dict[int, dict[str, Any]]
         ] = defaultdict(dict)
 
-        # Dataset groups: [{name, song_names, weight}, ...].
+        # Dataset entries: [{name, group, song_names, weight}, ...].
         self.dataset_groups: list[dict] = []
 
         if dataset_config_path is not None and Path(dataset_config_path).exists():
             self._load_config(dataset_config_path)
         else:
             # Without a YAML config, train from a single manifest.
-            self._load_manifest(manifest_path)
-            primary_songs = list(self.stems_by_song.keys())
+            source_stems_by_song = self._load_manifest(manifest_path)
+            primary_songs = list(source_stems_by_song)
             self.dataset_groups.append(
                 {
                     "name": "main",
+                    "group": "main",
                     "song_names": primary_songs,
+                    "source_stems_by_song": source_stems_by_song,
                     "weight": 1.0,
                     "use_for_cross_aug": True,
                     "active_window_sampling": False,
@@ -210,6 +213,7 @@ class StemDataset(Dataset):
             probability = group["weight"] / total_weight * 100
             logger.info(
                 f"Dataset '{group['name']}': {len(group['song_names'])} songs, "
+                f"group={group.get('group', group['name'])}, "
                 f"weight={group['weight']}, prob={probability:.1f}%, "
                 f"cross_aug={group.get('use_for_cross_aug', True)}, "
                 f"active_window={group.get('active_window_sampling', False)}, "
@@ -265,6 +269,7 @@ class StemDataset(Dataset):
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
+        dataset_names: set[str] = set()
         for dataset_entry in config.get("datasets", []):
             manifest_rel = dataset_entry["manifest"]
             manifest_full = config_dir / manifest_rel
@@ -276,8 +281,26 @@ class StemDataset(Dataset):
                 logger.warning(f"Manifest not found, skipping: {manifest_full}")
                 continue
 
-            # Track existing songs so we can collect only newly loaded ones.
-            dataset_name = dataset_entry.get("name", manifest_rel)
+            dataset_name = str(dataset_entry.get("name", manifest_rel)).strip()
+            if not dataset_name:
+                raise ValueError("Dataset name must not be empty")
+            if dataset_name in dataset_names:
+                raise ValueError(f"Duplicate dataset name: {dataset_name}")
+            dataset_names.add(dataset_name)
+
+            # group is a virtual folder for song identity. Entries without it
+            # retain the old dataset-name prefix and therefore cannot collide.
+            raw_song_group_name = dataset_entry.get("group")
+            song_group_name = (
+                dataset_name
+                if raw_song_group_name is None
+                else str(raw_song_group_name).strip()
+            )
+            if not song_group_name:
+                raise ValueError(
+                    f"Dataset '{dataset_name}' has an empty group"
+                )
+
             mask_inst = bool(dataset_entry.get("mask_instrument_loss", False))
             if mask_inst and self.semi_crf_version == "v2":
                 logger.info(
@@ -289,21 +312,28 @@ class StemDataset(Dataset):
                 dataset_entry.get("distortion_augmentations", []) or []
             )
             harmony_config = _build_harmony_augmentation_config(dataset_entry)
-            existing_songs = set(self.stems_by_song.keys())
-            self._load_manifest(
+            source_stems_by_song = self._load_manifest(
                 manifest_full,
-                song_name_prefix=dataset_name,
+                song_name_prefix=song_group_name,
                 mask_instrument_loss=mask_inst,
-                dataset_group_name=str(dataset_name),
+                dataset_group_name=dataset_name,
+                song_group_name=song_group_name,
             )
-            new_songs = [
-                name for name in self.stems_by_song if name not in existing_songs
-            ]
+            song_names = list(source_stems_by_song)
+            if not song_names:
+                logger.warning(
+                    "Manifest has no rows, skipping dataset '%s': %s",
+                    dataset_name,
+                    manifest_full,
+                )
+                continue
 
             self.dataset_groups.append(
                 {
-                    "name": dataset_entry.get("name", manifest_rel),
-                    "song_names": new_songs,
+                    "name": dataset_name,
+                    "group": song_group_name,
+                    "song_names": song_names,
+                    "source_stems_by_song": source_stems_by_song,
                     "weight": float(dataset_entry.get("weight", 1.0)),
                     "use_for_cross_aug": bool(
                         dataset_entry.get("use_for_cross_aug", True)
@@ -322,7 +352,7 @@ class StemDataset(Dataset):
                     "harmony_config": harmony_config,
                 }
             )
-            self.group_augmentors[str(dataset_name)] = self._build_audio_augmentor(
+            self.group_augmentors[dataset_name] = self._build_audio_augmentor(
                 distortion_augmentations=distortion_augmentations
             )
 
@@ -332,10 +362,12 @@ class StemDataset(Dataset):
         song_name_prefix: str = "",
         mask_instrument_loss: bool = False,
         dataset_group_name: str = "main",
-    ):
-        """Load a manifest CSV into stems_by_song and all_stems."""
+        song_group_name: str = "main",
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Load a manifest and return its own stems indexed by shared song key."""
         manifest_path = Path(manifest_path)
         manifest_dir = manifest_path.parent
+        source_stems_by_song: dict[str, list[dict[str, Any]]] = defaultdict(list)
         with open(manifest_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -350,7 +382,8 @@ class StemDataset(Dataset):
                 pitch_shift_group_key = wav_rel_no_suffix.with_name(
                     pitch_shift_base_name
                 ).as_posix()
-                # Prefix song names to avoid collisions between datasets.
+                # A shared group prefix intentionally merges the same song_name
+                # across manifests; the dataset name remains separate metadata.
                 song_name = row["song_name"]
                 if song_name_prefix:
                     song_name = f"{song_name_prefix}/{song_name}"
@@ -364,15 +397,19 @@ class StemDataset(Dataset):
                     "note_count": int(row["note_count"]),
                     "mask_instrument_loss": mask_instrument_loss,
                     "dataset_group_name": str(dataset_group_name),
+                    "song_group_name": str(song_group_name),
                     "pitch_shift_value": pitch_shift_value,
                     "pitch_shift_group_key": pitch_shift_group_key,
                 }
                 self.stems_by_song[song_name].append(stem_info)
+                source_stems_by_song[song_name].append(stem_info)
                 self.all_stems.append(stem_info)
                 pitch_shift_group = self.pitch_shift_stems_by_group[
                     (str(dataset_group_name), pitch_shift_group_key)
                 ]
                 pitch_shift_group[pitch_shift_value] = stem_info
+
+        return dict(source_stems_by_song)
 
     def set_epoch(self, epoch: int):
         """Set epoch for deterministic per-epoch sampling."""
@@ -562,7 +599,12 @@ class StemDataset(Dataset):
                     if cross_group is None:
                         break
                     cross_song_name = rng.choice(cross_group["song_names"])
-                    extra_stem = rng.choice(self.stems_by_song[cross_song_name])
+                    source_stems = cross_group.get(
+                        "source_stems_by_song", {}
+                    ).get(cross_song_name)
+                    if not source_stems:
+                        source_stems = self.stems_by_song[cross_song_name]
+                    extra_stem = rng.choice(source_stems)
 
                     if extra_stem["song_name"] != song_name:
                         extra_instrument_keys = self._get_stem_instrument_keys(

@@ -337,6 +337,28 @@ datasets:
     use_for_cross_aug: false  # Don't use for cross-stem mixing
 ```
 
+Use the optional `group` key when separate manifests contain stems rendered
+from the same songs:
+
+```yaml
+datasets:
+  - name: rendered_piano
+    group: single_stems
+    manifest: piano_stem_manifest.csv
+    allow_multi_stem_same_song: true
+
+  - name: rendered_strings
+    group: single_stems
+    manifest: strings_stem_manifest.csv
+    allow_multi_stem_same_song: true
+```
+
+Entries with the same `group` and CSV `song_name` share one virtual song.
+Consequently, `allow_multi_stem_same_song: true` can select stems across those
+manifests. Dataset weights, augmentation settings, and cross-augmentation
+eligibility remain per entry. Omitting `group` preserves the previous isolated
+behavior by using `name` as the group.
+
 ---
 
 ## Inference
