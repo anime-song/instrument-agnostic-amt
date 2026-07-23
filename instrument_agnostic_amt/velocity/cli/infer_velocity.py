@@ -153,7 +153,11 @@ def predict_velocity_for_stem_midis(
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
 ) -> Path | dict[str, Path]:
-    """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。"""
+    """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
+
+    Velocity-only推論ではCC7 VolumeとCC11 Expressionを127へ固定し、学習renderと
+    同じ基準でノートVelocityを唯一の可変音量表現にする。
+    """
     if device is None:
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -311,7 +315,30 @@ def predict_velocity_for_stem_midis(
     for idx, (note, _, _, _, _, _) in enumerate(flat_notes):
         note.velocity = int(predicted_velocities[idx])
 
-    # 旧joint checkpointを明示的に指定した場合だけCC#7へ反映する。
+    if not apply_stem_gain_to_cc7:
+        for pm_obj in loaded_midi_objs.values():
+            for inst in pm_obj.instruments:
+                inst.control_changes = [
+                    control
+                    for control in inst.control_changes
+                    if int(control.number) not in (7, 11)
+                ]
+                inst.control_changes.extend(
+                    [
+                        pretty_midi.ControlChange(
+                            number=7,
+                            value=127,
+                            time=0.0,
+                        ),
+                        pretty_midi.ControlChange(
+                            number=11,
+                            value=127,
+                            time=0.0,
+                        ),
+                    ]
+                )
+
+    # 旧joint checkpointを明示的に指定した場合だけ予測gainをCC#7へ反映する。
     stem_gain_by_name: dict[str, float] = {}
     if predicted_stem_gains_db_list:
         mean_stem_gains = np.mean(np.stack(predicted_stem_gains_db_list, axis=0), axis=0)

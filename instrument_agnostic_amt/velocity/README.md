@@ -198,7 +198,8 @@ velocity modelのcheckpointとAMT modelのcheckpointは別管理です。まずh
 1～127のvelocityを分類します。分類分布の期待値にも補助lossを掛けます。
 HCQT backboneで消える全体レベルを補うため、velocity headには局所的な絶対dBFS特徴も
 渡します。既定model configではstem gain headを作らず、lossもvelocityだけです。
-旧checkpointとの読み込み互換性は維持していますが、CC#7 gainの反映は明示指定時だけです。
+推論MIDIは学習renderと同じくCC7/CC11を127固定にします。旧checkpointとの読み込み
+互換性は維持していますが、予測stem gainのCC7反映は明示指定時だけです。
 
 通常学習では `--dry-run` を外します。checkpointは既定では
 `velocity/artifacts/checkpoints_velocity_only/` に保存されます。旧joint checkpointとは

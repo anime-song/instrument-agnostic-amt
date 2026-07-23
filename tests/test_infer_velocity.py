@@ -164,3 +164,45 @@ def test_predict_velocity_for_single_midi(
     for inst in output_midi.instruments:
         for note in inst.notes:
             assert 1 <= note.velocity <= 127
+
+
+def test_velocity_only_inference_fixes_loudness_controls_at_maximum(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    for midi_path in mock_stem_midis.values():
+        midi = pretty_midi.PrettyMIDI(str(midi_path))
+        for instrument in midi.instruments:
+            instrument.control_changes.extend(
+                [
+                    pretty_midi.ControlChange(number=7, value=72, time=0.0),
+                    pretty_midi.ControlChange(number=11, value=91, time=0.0),
+                    pretty_midi.ControlChange(number=64, value=127, time=0.1),
+                ]
+            )
+        midi.write(str(midi_path))
+
+    output_path = tmp_path / "velocity_only.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+    )
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    controls = [
+        (control.number, control.value, control.time)
+        for instrument in output.instruments
+        for control in instrument.control_changes
+    ]
+    instrument_count = len(output.instruments)
+    assert controls.count((7, 127, 0.0)) == instrument_count
+    assert controls.count((11, 127, 0.0)) == instrument_count
+    assert all(number not in (7, 11) or value == 127 for number, value, _ in controls)
+    assert any(number == 64 for number, _, _ in controls)
