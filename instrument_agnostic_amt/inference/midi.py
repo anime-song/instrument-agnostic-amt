@@ -12,8 +12,11 @@ from ..taxonomy.instrument_classes import (
 from .types import PredictedNote
 
 
-def _note_group_key(note: PredictedNote) -> tuple[int, int, int]:
-    return int(note.instrument_id), int(note.pitch), int(note.slot_index)
+def _midi_note_group_key(note: PredictedNote) -> tuple[int, int]:
+    # Pitch slots are an internal model representation. MIDI note-off events
+    # cannot identify which overlapping note instance on the same
+    # channel/pitch should end, so all slots must share one export group.
+    return int(note.instrument_id), int(note.pitch)
 
 
 def _truncate_overlapping_notes(
@@ -29,14 +32,14 @@ def _truncate_overlapping_notes(
         key=lambda note: (
             int(note.instrument_id),
             int(note.pitch),
-            int(note.slot_index),
             int(note.start_sample),
             int(note.end_sample),
+            int(note.slot_index),
         ),
     )
-    by_track: dict[tuple[int, int, int], list[PredictedNote]] = defaultdict(list)
+    by_track: dict[tuple[int, int], list[PredictedNote]] = defaultdict(list)
     for note in ordered_notes:
-        track_notes = by_track.setdefault(_note_group_key(note), [])
+        track_notes = by_track.setdefault(_midi_note_group_key(note), [])
         if track_notes:
             previous_note = track_notes[-1]
             separation_samples = max(1, int(min_separation_samples))
@@ -86,11 +89,12 @@ def _enforce_minimum_note_duration(
         key=lambda item: (
             int(item.instrument_id),
             int(item.pitch),
-            int(item.slot_index),
             int(item.start_sample),
+            int(item.end_sample),
+            int(item.slot_index),
         ),
     ):
-        by_track[_note_group_key(note)].append(note)
+        by_track[_midi_note_group_key(note)].append(note)
 
     adjusted_notes: list[PredictedNote] = []
     for track_notes in by_track.values():

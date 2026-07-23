@@ -142,30 +142,6 @@ def _resolve_stem_files(
     return resolved_stems
 
 
-def _sanitize_midi_notes(
-    pm_obj: pretty_midi.PrettyMIDI,
-    *,
-    min_duration_seconds: float = 0.005,
-    max_duration_seconds: float = 15.0,
-) -> None:
-    """MIDIオブジェクト内の極小長ノートや異常長ノートをクレンジング・補正する。"""
-    for inst in pm_obj.instruments:
-        cleaned_notes: list[pretty_midi.Note] = []
-        for note in inst.notes:
-            duration = float(note.end - note.start)
-            if duration <= 0.001 or note.end <= note.start:
-                note.end = note.start + min_duration_seconds
-            elif duration < min_duration_seconds:
-                note.end = note.start + min_duration_seconds
-
-            if (note.end - note.start) > max_duration_seconds:
-                note.end = note.start + max_duration_seconds
-
-            cleaned_notes.append(note)
-
-        inst.notes = sorted(cleaned_notes, key=lambda n: n.start)
-
-
 def predict_velocity_for_stem_midis(
     stem_midis: Mapping[str, Path | str],
     stem_audios: Mapping[str, Path | str] | Path | str,
@@ -242,7 +218,6 @@ def predict_velocity_for_stem_midis(
             stem_index = 0
 
         pm_obj = pretty_midi.PrettyMIDI(str(midi_path))
-        _sanitize_midi_notes(pm_obj)
         loaded_midi_objs[stem_name] = pm_obj
 
         for inst in pm_obj.instruments:
@@ -364,7 +339,6 @@ def predict_velocity_for_stem_midis(
         merged_midi.instruments = []
 
         for stem_name, pm_obj in loaded_midi_objs.items():
-            _sanitize_midi_notes(pm_obj)
             for inst in pm_obj.instruments:
                 merged_midi.instruments.append(inst)
 
@@ -375,7 +349,6 @@ def predict_velocity_for_stem_midis(
     else:
         updated_stem_paths: dict[str, Path] = {}
         for stem_name, pm_obj in loaded_midi_objs.items():
-            _sanitize_midi_notes(pm_obj)
             original_path = resolved_midis[stem_name]
             out_path = original_path.parent / f"{original_path.stem}_velocity.mid"
             pm_obj.write(str(out_path))
@@ -400,7 +373,6 @@ def predict_velocity_for_midi(
         raise FileNotFoundError(f"MIDI file not found: {midi_file_path}")
 
     pm_obj = pretty_midi.PrettyMIDI(str(midi_file_path))
-    _sanitize_midi_notes(pm_obj)
     resolved_audios = _resolve_stem_files(stems)
 
     stem_midis: dict[str, Path] = {}
