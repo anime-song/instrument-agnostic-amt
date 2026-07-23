@@ -115,7 +115,7 @@ def _build_midi(
     *,
     sample_rate: int,
     instrument_volumes=None,
-    min_midi_note_ms: float = 0.0,
+    min_midi_note_ms: float = 5.0,
 ):
     return build_midi(
         notes,
