@@ -1,6 +1,12 @@
 import os
+import sys
+import pathlib
 import argparse
 import torch
+
+# Windows環境下でLinux/Colab等で作成された PosixPath オブジェクトを含むチェックポイントを読み込めるようにパッチ
+if sys.platform == "win32":
+    pathlib.PosixPath = pathlib.WindowsPath
 
 
 def distill_model(input_path, output_path):
@@ -9,7 +15,7 @@ def distill_model(input_path, output_path):
         return
 
     print(f"Loading {input_path}...")
-    checkpoint = torch.load(input_path, map_location="cpu")
+    checkpoint = torch.load(input_path, map_location="cpu", weights_only=False)
 
     # 抽出するデータの選別
     # EMAの重みがあればそれを優先し、なければ通常の重みを使用する
