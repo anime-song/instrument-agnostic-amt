@@ -30,12 +30,12 @@ VELOCITY_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ROOT = VELOCITY_ROOT / "artifacts" / "synthetic"
 DEFAULT_MODEL_CONFIG = VELOCITY_ROOT / "configs" / "model.json"
 DEFAULT_SYNTHETIC_CONFIG = VELOCITY_ROOT / "configs" / "synthetic.json"
-DEFAULT_OUTPUT_DIR = VELOCITY_ROOT / "artifacts" / "checkpoints"
+DEFAULT_OUTPUT_DIR = VELOCITY_ROOT / "artifacts" / "checkpoints_velocity_only"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the post-AMT note velocity and relative stem-gain model."
+        description="Train the post-AMT note velocity model."
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--model-config", type=Path, default=DEFAULT_MODEL_CONFIG)
@@ -81,7 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--velocity-ce-weight", type=float, default=1.0)
     parser.add_argument("--velocity-expected-weight", type=float, default=0.25)
-    parser.add_argument("--stem-gain-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--stem-gain-weight",
+        type=float,
+        default=0.0,
+        help="Legacy opt-in weight for relative stem-gain supervision.",
+    )
     parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--gain-huber-delta-db", type=float, default=1.0)
     args = parser.parse_args()
@@ -126,6 +131,7 @@ def _make_dataset(
         split_seed=args.split_seed,
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
+        use_gain_augmentation=data_config.use_gain_augmentation,
         gain_jitter_std_db=data_config.gain_jitter_std_db,
         gain_clip_db=data_config.gain_clip_db,
         master_gain_min_db=data_config.master_gain_min_db,
@@ -153,11 +159,13 @@ def _make_loader(
 
 
 def _format_metrics(metrics: Mapping[str, float]) -> str:
-    return (
+    text = (
         f"loss={metrics.get('loss', 0.0):.4f}, "
-        f"velocity_mae={metrics.get('velocity_mae', 0.0):.2f}, "
-        f"gain_mae_db={metrics.get('stem_gain_mae_db', 0.0):.2f}"
+        f"velocity_mae={metrics.get('velocity_mae', 0.0):.2f}"
     )
+    if metrics.get("stem_gain_count", 0.0) > 0.0:
+        text += f", gain_mae_db={metrics.get('stem_gain_mae_db', 0.0):.2f}"
+    return text
 
 
 def _run_epoch(
@@ -243,7 +251,14 @@ def _save_checkpoint(
     torch.save(
         {
             "checkpoint_format_version": 1,
-            "task": "velocity_and_relative_stem_gain",
+            "task": (
+                "velocity_and_relative_stem_gain"
+                if (
+                    model_config.predict_stem_gain
+                    and loss_config.stem_gain_weight > 0.0
+                )
+                else "note_velocity"
+            ),
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -287,6 +302,10 @@ def main() -> None:
         label_smoothing=args.label_smoothing,
         gain_huber_delta_db=args.gain_huber_delta_db,
     )
+    if loss_config.stem_gain_weight > 0.0 and not model_config.predict_stem_gain:
+        raise ValueError(
+            "--stem-gain-weight requires predict_stem_gain=true in model config"
+        )
     data_config = load_synthetic_config(args.synthetic_config)
     model = VelocityPredictionModel(model_config)
     if args.init_amt is not None:

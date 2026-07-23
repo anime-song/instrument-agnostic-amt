@@ -36,6 +36,9 @@ class VelocityModelConfig:
     num_stem_classes: int = 7
     note_hidden_size: int = 256
     local_frame_offsets: tuple[int, ...] = (-2, -1, 0, 1, 2, 4)
+    # Defaults preserve checkpoints written before these options were added.
+    use_absolute_velocity_energy: bool = False
+    predict_stem_gain: bool = True
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0 or self.hop_length <= 0:
@@ -85,7 +88,7 @@ def _masked_mean(
 
 
 class VelocityPredictionModel(nn.Module):
-    """Predict per-note MIDI velocity and song-relative stem gain.
+    """Predict per-note MIDI velocity and, optionally, relative stem gain.
 
     The AMT V1 HCQT backbone is shared architecturally, but this model and its
     checkpoints remain separate from the transcription model.  MIDI notes act
@@ -148,8 +151,8 @@ class VelocityPredictionModel(nn.Module):
             nn.Linear(hidden, hidden),
         )
 
-        # Three relative log-energy channels are appended to normalized HCQT
-        # features so velocity cues are not discarded by spectrogram scaling.
+        # Three log-energy channels are appended because the HCQT backbone
+        # normalizes away overall level. New velocity-only models retain dBFS.
         self.local_audio_projection = nn.Linear(backbone_dim + 3, hidden)
         self.local_attention = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -164,18 +167,22 @@ class VelocityPredictionModel(nn.Module):
         )
         self.velocity_head = nn.Linear(hidden, 127)
 
-        self.global_audio_projection = nn.Sequential(
-            nn.Linear(backbone_dim, hidden),
-            nn.GELU(),
-        )
-        self.stem_gain_head = nn.Sequential(
-            nn.Linear(hidden * 2 + 24 + 2, hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Linear(hidden // 2, 1),
-        )
+        if config.predict_stem_gain:
+            self.global_audio_projection: nn.Module | None = nn.Sequential(
+                nn.Linear(backbone_dim, hidden),
+                nn.GELU(),
+            )
+            self.stem_gain_head: nn.Module | None = nn.Sequential(
+                nn.Linear(hidden * 2 + 24 + 2, hidden),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(hidden, hidden // 2),
+                nn.GELU(),
+                nn.Linear(hidden // 2, 1),
+            )
+        else:
+            self.global_audio_projection = None
+            self.stem_gain_head = None
         self.register_buffer(
             "local_offsets",
             torch.tensor(config.local_frame_offsets, dtype=torch.float32),
@@ -241,6 +248,9 @@ class VelocityPredictionModel(nn.Module):
         log_energy = log_energy.transpose(1, 2).reshape(
             batch_size, stem_count, num_frames, 3
         )
+        if self.config.use_absolute_velocity_energy:
+            # float audio dBFS: -100 dB maps to -2 and 0 dB maps to +2.
+            return ((log_energy + 50.0) / 25.0).clamp(-2.0, 2.0)
         center = _masked_mean(log_energy, frame_valid_mask, dim=2).unsqueeze(2)
         return (log_energy - center).clamp(-60.0, 60.0) / 30.0
 
@@ -470,48 +480,55 @@ class VelocityPredictionModel(nn.Module):
             torch.softmax(velocity_logits, dim=-1) * velocity_values
         ).sum(dim=-1)
 
-        global_frames = pitch_features.mean(dim=3)
-        global_audio = _masked_mean(global_frames, frame_valid_mask, dim=2)
-        global_audio = self.global_audio_projection(global_audio)
-        num_stems = int(stem_class_id.shape[1])
-        stem_note_features, stem_note_counts = self._pool_stem_notes(
-            note_features,
-            note_stem_index=note_stem_index,
-            note_mask=note_mask,
-            num_stems=num_stems,
-        )
-        safe_stem_class = torch.where(
-            (stem_class_id >= 0)
-            & (stem_class_id < self.config.num_stem_classes),
-            stem_class_id,
-            torch.full_like(stem_class_id, self.config.num_stem_classes),
-        )
-        observed_relative_level = self._observed_relative_stem_level(
-            audio,
-            valid_audio_frames=valid_audio_frames,
-            stem_mask=stem_mask,
-        )
-        stem_features = torch.cat(
-            (
-                global_audio,
-                stem_note_features,
-                self.stem_embedding(safe_stem_class),
-                torch.log1p(stem_note_counts),
-                observed_relative_level,
-            ),
-            dim=-1,
-        )
-        raw_stem_gain_db = self.stem_gain_head(stem_features).squeeze(-1)
-        gain_center = _masked_mean(raw_stem_gain_db, stem_mask, dim=1).unsqueeze(1)
-        stem_gain_db = (raw_stem_gain_db - gain_center) * stem_mask.to(
-            dtype=raw_stem_gain_db.dtype
-        )
         outputs = {
             "velocity_logits": velocity_logits,
             "velocity_expected": velocity_expected,
-            "stem_gain_db": stem_gain_db,
-            "raw_stem_gain_db": raw_stem_gain_db,
         }
+        if self.stem_gain_head is not None and self.global_audio_projection is not None:
+            global_frames = pitch_features.mean(dim=3)
+            global_audio = _masked_mean(global_frames, frame_valid_mask, dim=2)
+            global_audio = self.global_audio_projection(global_audio)
+            num_stems = int(stem_class_id.shape[1])
+            stem_note_features, stem_note_counts = self._pool_stem_notes(
+                note_features,
+                note_stem_index=note_stem_index,
+                note_mask=note_mask,
+                num_stems=num_stems,
+            )
+            safe_stem_class = torch.where(
+                (stem_class_id >= 0)
+                & (stem_class_id < self.config.num_stem_classes),
+                stem_class_id,
+                torch.full_like(stem_class_id, self.config.num_stem_classes),
+            )
+            observed_relative_level = self._observed_relative_stem_level(
+                audio,
+                valid_audio_frames=valid_audio_frames,
+                stem_mask=stem_mask,
+            )
+            stem_features = torch.cat(
+                (
+                    global_audio,
+                    stem_note_features,
+                    self.stem_embedding(safe_stem_class),
+                    torch.log1p(stem_note_counts),
+                    observed_relative_level,
+                ),
+                dim=-1,
+            )
+            raw_stem_gain_db = self.stem_gain_head(stem_features).squeeze(-1)
+            gain_center = _masked_mean(
+                raw_stem_gain_db, stem_mask, dim=1
+            ).unsqueeze(1)
+            stem_gain_db = (raw_stem_gain_db - gain_center) * stem_mask.to(
+                dtype=raw_stem_gain_db.dtype
+            )
+            outputs.update(
+                {
+                    "stem_gain_db": stem_gain_db,
+                    "raw_stem_gain_db": raw_stem_gain_db,
+                }
+            )
         if include_aux_outputs:
             outputs.update(
                 {

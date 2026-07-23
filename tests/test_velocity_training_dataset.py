@@ -139,6 +139,7 @@ def test_velocity_dataset_resamples_windows_and_collates(tmp_path: Path) -> None
         sample_rate=22_050,
         window_seconds=1.0,
         hop_seconds=1.0,
+        use_gain_augmentation=True,
         gain_jitter_std_db=0.0,
         master_gain_min_db=0.0,
         master_gain_max_db=0.0,
@@ -165,6 +166,26 @@ def test_velocity_dataset_resamples_windows_and_collates(tmp_path: Path) -> None
     assert batch["note_mask"].sum(dim=1).tolist() == [2, 3]
     assert batch["stem_gain_db"].shape == (2, 2)
     assert batch["stem_gain_mask"].all()
+
+
+def test_velocity_dataset_uses_unmodified_render_level_by_default(
+    tmp_path: Path,
+) -> None:
+    root = _build_training_root(tmp_path)
+    dataset = SyntheticStemVelocityDataset(
+        root,
+        split="all",
+        sample_rate=22_050,
+        window_seconds=1.0,
+        hop_seconds=1.0,
+    )
+
+    first = dataset[0]
+
+    assert first["stem_gain_db"].tolist() == [0.0, 0.0]
+    assert first["master_gain_db"] == 0.0
+    assert np.isclose(float(first["audio"][0].abs().max()), 0.1, atol=2e-3)
+    assert np.isclose(float(first["audio"][1].abs().max()), 0.1, atol=2e-3)
 
 
 def test_velocity_dataset_uses_duration_seconds_from_manifest(
@@ -205,4 +226,3 @@ def test_velocity_dataset_uses_duration_seconds_from_manifest(
 
     assert dataset.examples[0].duration_seconds == 1.5
     assert info_call_count == 0
-

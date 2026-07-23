@@ -223,11 +223,15 @@ def prepare_synthetic_plan(
                 rng=example_rng,
                 config=config,
             )
-            master_gain_db = float(
-                example_rng.uniform(
-                    config.master_gain_min_db,
-                    config.master_gain_max_db,
+            master_gain_db = (
+                float(
+                    example_rng.uniform(
+                        config.master_gain_min_db,
+                        config.master_gain_max_db,
+                    )
                 )
+                if config.use_gain_augmentation
+                else 0.0
             )
             example_rows.append(
                 {

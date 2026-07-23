@@ -1,7 +1,7 @@
-# Velocity / mix-balance pipeline
+# Velocity pipeline
 
 このディレクトリは、AMT本体のノート検出学習とは独立した後段処理です。
-入力はステム音声とAMT出力MIDI、出力はノート強度とステム間レベルの教師候補です。
+入力はステム音声とAMT出力MIDI、出力はノート単位のvelocityです。
 
 ```text
 velocity/
@@ -12,7 +12,7 @@ velocity/
 │   ├── calibration.py    # 対象SoundFont用velocity sweep MIDI
 │   └── curve.py          # sweep WAVの測定と単調velocity curve fitting
 ├── synthesis/
-│   ├── sampling.py       # 擬似rankからtarget velocity・stem gainをサンプル
+│   ├── sampling.py       # 擬似rankからtarget velocityをサンプル
 │   ├── midi.py           # render用target MIDIを作成
 │   ├── plan.py           # 曲・variation単位の合成ジョブを準備
 │   └── mix.py            # render済みステムをgain付きでmix
@@ -151,8 +151,10 @@ python -m instrument_agnostic_amt.velocity.cli.resample_rendered_stems `
 作成は不要です。`assemble_synthetic_dataset` は音声比較などで明示的にmixtureが
 必要な場合だけ使う任意工程です。rendered stemは学習入力なので削除しません。
 
-Datasetは同じ曲・同じ時間窓の全stemをセットで読み、stem別gainと全stem共通の
-master gainを毎回オンライン生成します。velocity教師はgain変更後も同じです。
+rendered stemはすべて `render_synth_gain`（既定0.5）の同じ固定値で生成され、stemごとの
+ランダムgainはrender時には入りません。Datasetも既定ではrendered stemを0 dBのまま読み、
+stem別gainやmaster gainを追加しません。そのため音声レベルとvelocity教師の基準が固定されます。
+旧joint学習を再現するときだけ `use_gain_augmentation: true` を設定します。
 mixtureとpeak limiterを経由しないため、学習と推論のどちらも分離stem音声が入力に
 なります。sample rate不一致時のDataset fallbackは残していますが、通常は変換済み
 22.05 kHz WAVをそのまま読みます。
@@ -172,8 +174,8 @@ variationが別splitへ漏れません。長い曲は固定長windowとして読
 - stemごとのstereo音声と有効フレーム数
 - onset順のMIDI note query（時刻、pitch、program、drum、stem）
 - ノート単位の正解velocityと生成経路
-- オンライン生成したstem単位の相対gain、class、active mask
-- 全stem共通のmaster gain
+- stem単位のclass、active mask（gain教師は旧joint checkpointとの互換用）
+- 固定0 dBのstem gainとmaster gain
 
 `collate_velocity_batch` はnote数とstem数をbatch内最大値へpadし、`note_mask`、
 `stem_mask`、`stem_gain_mask` を作ります。
@@ -194,15 +196,13 @@ velocity modelのcheckpointとAMT modelのcheckpointは別管理です。まずh
 
 モデルは各ノートが属する分離stemからpitch/onset位置の局所音響特徴を読み、
 1～127のvelocityを分類します。分類分布の期待値にも補助lossを掛けます。
-velocity側はstem内正規化特徴、gain側は正規化前のstem levelも使用します。
-stem gainは全stem共通gainを除いた相対dBとして回帰します。
-
-ここでいうstem gainは `bass/drums/guitar/other/piano/vocals` のbus単位です。
-`other` MIDI内に複数track/programがあっても、velocityはノート単位ですがgainは
-`other`全体で1値です。
+HCQT backboneで消える全体レベルを補うため、velocity headには局所的な絶対dBFS特徴も
+渡します。既定model configではstem gain headを作らず、lossもvelocityだけです。
+旧checkpointとの読み込み互換性は維持していますが、CC#7 gainの反映は明示指定時だけです。
 
 通常学習では `--dry-run` を外します。checkpointは既定では
-`velocity/artifacts/checkpoints/` に保存されます。
+`velocity/artifacts/checkpoints_velocity_only/` に保存されます。旧joint checkpointとは
+別ディレクトリなので、最初は `--resume` ではなくAMT checkpointから開始してください。
 
 ## 実装の境界
 

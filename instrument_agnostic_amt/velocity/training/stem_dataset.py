@@ -142,7 +142,7 @@ def _load_audio_window(
 
 
 class SyntheticStemVelocityDataset(Dataset):
-    """Aligned separated stems with online gain augmentation and MIDI targets."""
+    """Aligned separated stems at a fixed render level with MIDI targets."""
 
     def __init__(
         self,
@@ -155,6 +155,7 @@ class SyntheticStemVelocityDataset(Dataset):
         split_seed: int = 42,
         train_fraction: float = 0.9,
         validation_fraction: float = 0.05,
+        use_gain_augmentation: bool = False,
         gain_jitter_std_db: float = 2.5,
         gain_clip_db: float = 18.0,
         master_gain_min_db: float = -12.0,
@@ -185,6 +186,7 @@ class SyntheticStemVelocityDataset(Dataset):
         self.window_seconds = float(window_seconds)
         self.hop_seconds = float(hop_seconds)
         self.window_frames = int(round(self.window_seconds * self.sample_rate))
+        self.use_gain_augmentation = bool(use_gain_augmentation)
         self.gain_jitter_std_db = float(gain_jitter_std_db)
         self.gain_clip_db = float(gain_clip_db)
         self.master_gain_min_db = float(master_gain_min_db)
@@ -356,6 +358,8 @@ class SyntheticStemVelocityDataset(Dataset):
         return arrays
 
     def _sample_gains(self, stems: tuple[StemAudioRecord, ...]) -> tuple[torch.Tensor, float]:
+        if not self.use_gain_augmentation:
+            return torch.zeros(len(stems), dtype=torch.float32), 0.0
         base = torch.tensor(
             [stem.base_relative_level_db for stem in stems],
             dtype=torch.float32,

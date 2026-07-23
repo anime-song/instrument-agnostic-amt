@@ -10,7 +10,7 @@ import torch.nn.functional as F
 class VelocityLossConfig:
     velocity_ce_weight: float = 1.0
     velocity_expected_weight: float = 0.25
-    stem_gain_weight: float = 0.1
+    stem_gain_weight: float = 0.0
     label_smoothing: float = 0.02
     gain_huber_delta_db: float = 1.0
 
@@ -38,12 +38,13 @@ def compute_velocity_losses(
     *,
     config: VelocityLossConfig | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Joint loss with relative (common-gain-invariant) stem supervision."""
+    """Velocity loss with optional legacy relative-stem-gain supervision."""
 
     if config is None:
         config = VelocityLossConfig()
     note_mask = batch["note_mask"].bool()
     gain_mask = batch["stem_gain_mask"].bool()
+    gain_enabled = config.stem_gain_weight > 0.0
     logits = outputs["velocity_logits"]
     target_velocity = batch["target_velocity"].long()
     zero = _zero_from(outputs)
@@ -75,7 +76,11 @@ def compute_velocity_losses(
         within_5 = zero.detach()
         within_10 = zero.detach()
 
-    if gain_mask.any():
+    if gain_enabled and "stem_gain_db" not in outputs:
+        raise ValueError(
+            "stem_gain_weight is positive but the model has no stem-gain head"
+        )
+    if gain_enabled and gain_mask.any():
         predicted_gain = _center_stem_gains(outputs["stem_gain_db"], gain_mask)
         target_gain = _center_stem_gains(batch["stem_gain_db"].float(), gain_mask)
         gain_errors = F.smooth_l1_loss(
@@ -107,6 +112,10 @@ def compute_velocity_losses(
         "stem_gain_loss": stem_gain_loss.detach(),
         "stem_gain_mae_db": stem_gain_mae_db.detach(),
         "note_count": note_mask.sum().detach(),
-        "stem_gain_count": gain_mask.sum().detach(),
+        "stem_gain_count": (
+            gain_mask.sum().detach()
+            if gain_enabled
+            else torch.zeros((), dtype=torch.long, device=gain_mask.device)
+        ),
     }
     return loss, metrics

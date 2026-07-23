@@ -144,6 +144,8 @@ def sample_stem_gains(
     names = sorted(base_relative_levels_db)
     if not names:
         return {}
+    if not config.use_gain_augmentation:
+        return {name: 0.0 for name in names}
     base = np.asarray(
         [
             0.0

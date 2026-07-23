@@ -27,6 +27,7 @@ class SyntheticDataConfig:
     render_synth_gain: float = 0.5
     mixture_sample_rate: int = 22_050
     mix_peak_limit_dbfs: float = -1.0
+    use_gain_augmentation: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= self.canonical_velocity <= 127:

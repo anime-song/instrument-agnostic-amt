@@ -15,7 +15,10 @@ from instrument_agnostic_amt.velocity.synthesis.mix import (
     write_dataset_manifest,
 )
 from instrument_agnostic_amt.velocity.synthesis.plan import prepare_synthetic_plan
-from instrument_agnostic_amt.velocity.synthesis.sampling import sample_note_velocities
+from instrument_agnostic_amt.velocity.synthesis.sampling import (
+    sample_note_velocities,
+    sample_stem_gains,
+)
 
 
 def _write_midi(path: Path, *, program: int, pitch_offset: int = 0) -> None:
@@ -90,6 +93,16 @@ def test_note_velocity_sampling_is_bounded_and_rank_conditioned() -> None:
 
     assert sample.target_velocity.tolist() == [50, 80, 80, 110]
     assert sample.rank_source.tolist() == [2, 1, 1, 2]
+
+
+def test_stem_gain_sampling_is_zero_by_default() -> None:
+    gains = sample_stem_gains(
+        {"bass": -8.0, "piano": 5.0},
+        rng=np.random.default_rng(123),
+        config=SyntheticDataConfig(),
+    )
+
+    assert gains == {"bass": 0.0, "piano": 0.0}
 
 
 def test_target_midi_uses_label_order_and_fixed_render_controllers(

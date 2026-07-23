@@ -10,7 +10,10 @@ from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityPredictionModel,
 )
 from instrument_agnostic_amt.velocity.training.forward import forward_velocity_batch
-from instrument_agnostic_amt.velocity.training.losses import compute_velocity_losses
+from instrument_agnostic_amt.velocity.training.losses import (
+    VelocityLossConfig,
+    compute_velocity_losses,
+)
 
 
 class _FakePitchBackbone(nn.Module):
@@ -68,13 +71,55 @@ def test_velocity_model_forward_loss_and_backward() -> None:
     assert torch.allclose(outputs["stem_gain_db"].sum(dim=1), torch.zeros(2), atol=1e-6)
     assert outputs["local_attention"][0, 2].sum() == 0
 
-    loss, metrics = compute_velocity_losses(outputs, batch)
+    loss, metrics = compute_velocity_losses(
+        outputs,
+        batch,
+        config=VelocityLossConfig(stem_gain_weight=0.1),
+    )
     assert torch.isfinite(loss)
     assert int(metrics["note_count"]) == 5
     assert int(metrics["stem_gain_count"]) == 4
     loss.backward()
     assert model.velocity_head.weight.grad is not None
     assert model.stem_gain_head[-1].weight.grad is not None
+
+
+def test_velocity_only_model_retains_absolute_audio_level() -> None:
+    config = VelocityModelConfig(
+        use_absolute_velocity_energy=True,
+        predict_stem_gain=False,
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        dropout=0.0,
+        use_gradient_checkpoint=False,
+    )
+    model = VelocityPredictionModel(config, backbone=_FakePitchBackbone())
+    batch = _batch()
+    outputs = forward_velocity_batch(model, batch)
+
+    assert "stem_gain_db" not in outputs
+    assert model.stem_gain_head is None
+
+    frame_mask = torch.ones(1, 2, 10, dtype=torch.bool)
+    loud = torch.ones(1, 2, 100)
+    quiet = loud * 0.1
+    audio = torch.stack((loud, quiet), dim=1)
+    energy = model._relative_energy(
+        audio,
+        num_frames=10,
+        frame_valid_mask=frame_mask,
+    )
+    assert energy[:, 0].mean() > energy[:, 1].mean()
+
+    loss, metrics = compute_velocity_losses(outputs, batch)
+    assert int(metrics["stem_gain_count"]) == 0
+    loss.backward()
+    assert model.velocity_head.weight.grad is not None
 
 
 def test_velocity_loss_handles_empty_note_targets() -> None:
