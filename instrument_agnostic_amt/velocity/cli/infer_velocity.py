@@ -149,7 +149,7 @@ def predict_velocity_for_stem_midis(
     output_midi_path: Path | str | None = None,
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
-    window_seconds: float = 16.0,
+    window_seconds: float = 8.0,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
 ) -> Path | dict[str, Path]:
@@ -367,7 +367,7 @@ def predict_velocity_for_midi(
     output_midi_path: Path | str | None = None,
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
-    window_seconds: float = 16.0,
+    window_seconds: float = 8.0,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
 ) -> Path:
@@ -448,7 +448,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--window-seconds",
         type=float,
-        default=16.0,
+        default=8.0,
         help="Window size in seconds for long audio inference",
     )
     gain_group = parser.add_mutually_exclusive_group()
