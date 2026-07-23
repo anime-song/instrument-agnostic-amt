@@ -142,6 +142,79 @@ def _resolve_stem_files(
     return resolved_stems
 
 
+def _set_fixed_loudness_controls(
+    instruments: list[pretty_midi.Instrument],
+) -> None:
+    for instrument in instruments:
+        instrument.control_changes = [
+            control
+            for control in instrument.control_changes
+            if int(control.number) not in (7, 11)
+        ]
+        instrument.control_changes.extend(
+            [
+                pretty_midi.ControlChange(number=7, value=127, time=0.0),
+                pretty_midi.ControlChange(number=11, value=127, time=0.0),
+            ]
+        )
+
+
+def _merge_and_limit_instruments(
+    midi_objects: Mapping[str, pretty_midi.PrettyMIDI],
+    *,
+    max_melodic_instruments: int,
+) -> list[pretty_midi.Instrument]:
+    """Merge duplicate instruments and reserve the last melodic slot for overflow."""
+
+    grouped: dict[tuple[int, bool, str], pretty_midi.Instrument] = {}
+    for midi in midi_objects.values():
+        for source in midi.instruments:
+            key = (int(source.program), bool(source.is_drum), str(source.name))
+            target = grouped.get(key)
+            if target is None:
+                target = pretty_midi.Instrument(
+                    program=key[0],
+                    is_drum=key[1],
+                    name=key[2],
+                )
+                grouped[key] = target
+            target.notes.extend(source.notes)
+            target.control_changes.extend(source.control_changes)
+            target.pitch_bends.extend(source.pitch_bends)
+
+    melodic = [instrument for instrument in grouped.values() if not instrument.is_drum]
+    drums = [instrument for instrument in grouped.values() if instrument.is_drum]
+    sort_key = lambda instrument: (
+        -len(instrument.notes),
+        int(instrument.program),
+        str(instrument.name),
+    )
+    melodic.sort(key=sort_key)
+    drums.sort(key=sort_key)
+
+    limit = int(max_melodic_instruments)
+    if limit > 0 and len(melodic) > limit:
+        kept = melodic[: max(0, limit - 1)]
+        overflow = melodic[max(0, limit - 1) :]
+        merged_other = pretty_midi.Instrument(
+            program=int(overflow[0].program),
+            is_drum=False,
+            name="Other / Merged",
+        )
+        for instrument in overflow:
+            merged_other.notes.extend(instrument.notes)
+            merged_other.control_changes.extend(instrument.control_changes)
+            merged_other.pitch_bends.extend(instrument.pitch_bends)
+        melodic = [*kept, merged_other]
+
+    final_instruments = [*melodic, *drums]
+    for instrument in final_instruments:
+        instrument.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
+        instrument.control_changes.sort(key=lambda control: control.time)
+        instrument.pitch_bends.sort(key=lambda bend: bend.time)
+    return final_instruments
+
+
 def predict_velocity_for_stem_midis(
     stem_midis: Mapping[str, Path | str],
     stem_audios: Mapping[str, Path | str] | Path | str,
@@ -150,6 +223,7 @@ def predict_velocity_for_stem_midis(
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
     window_seconds: float = 8.0,
+    max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
 ) -> Path | dict[str, Path]:
@@ -162,6 +236,8 @@ def predict_velocity_for_stem_midis(
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         target_device = torch.device(device)
+    if max_melodic_instruments < 0:
+        raise ValueError("max_melodic_instruments must be nonnegative")
 
     model, config = load_velocity_model(checkpoint_path, device=target_device)
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
@@ -317,26 +393,7 @@ def predict_velocity_for_stem_midis(
 
     if not apply_stem_gain_to_cc7:
         for pm_obj in loaded_midi_objs.values():
-            for inst in pm_obj.instruments:
-                inst.control_changes = [
-                    control
-                    for control in inst.control_changes
-                    if int(control.number) not in (7, 11)
-                ]
-                inst.control_changes.extend(
-                    [
-                        pretty_midi.ControlChange(
-                            number=7,
-                            value=127,
-                            time=0.0,
-                        ),
-                        pretty_midi.ControlChange(
-                            number=11,
-                            value=127,
-                            time=0.0,
-                        ),
-                    ]
-                )
+            _set_fixed_loudness_controls(pm_obj.instruments)
 
     # 旧joint checkpointを明示的に指定した場合だけ予測gainをCC#7へ反映する。
     stem_gain_by_name: dict[str, float] = {}
@@ -367,11 +424,12 @@ def predict_velocity_for_stem_midis(
         # 最初のステムMIDIファイルをベースにしてテンポマップ・解像度を保持する
         first_midi_path = next(iter(resolved_midis.values()))
         merged_midi = pretty_midi.PrettyMIDI(str(first_midi_path))
-        merged_midi.instruments = []
-
-        for stem_name, pm_obj in loaded_midi_objs.items():
-            for inst in pm_obj.instruments:
-                merged_midi.instruments.append(inst)
+        merged_midi.instruments = _merge_and_limit_instruments(
+            loaded_midi_objs,
+            max_melodic_instruments=max_melodic_instruments,
+        )
+        if not apply_stem_gain_to_cc7:
+            _set_fixed_loudness_controls(merged_midi.instruments)
 
         destination_path = Path(output_midi_path)
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +453,7 @@ def predict_velocity_for_midi(
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
     window_seconds: float = 8.0,
+    max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
 ) -> Path:
@@ -430,6 +489,7 @@ def predict_velocity_for_midi(
         checkpoint_path=checkpoint_path,
         device=device,
         window_seconds=window_seconds,
+        max_melodic_instruments=max_melodic_instruments,
         apply_stem_gain_to_cc7=apply_stem_gain_to_cc7,
         disable_tqdm=disable_tqdm,
     )
@@ -478,6 +538,12 @@ def parse_args() -> argparse.Namespace:
         default=8.0,
         help="Window size in seconds for long audio inference",
     )
+    parser.add_argument(
+        "--max-midi-melodic-instruments",
+        type=int,
+        default=15,
+        help="Maximum melodic tracks; overflow is merged into Other / Merged",
+    )
     gain_group = parser.add_mutually_exclusive_group()
     gain_group.add_argument(
         "--apply-cc7-gain",
@@ -508,6 +574,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         device=args.device,
         window_seconds=args.window_seconds,
+        max_melodic_instruments=args.max_midi_melodic_instruments,
         apply_stem_gain_to_cc7=args.apply_cc7_gain,
     )
     print(f"Successfully generated velocity-predicted MIDI: {output_path}")

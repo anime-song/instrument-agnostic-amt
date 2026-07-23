@@ -206,3 +206,48 @@ def test_velocity_only_inference_fixes_loudness_controls_at_maximum(
     assert controls.count((11, 127, 0.0)) == instrument_count
     assert all(number not in (7, 11) or value == 127 for number, value, _ in controls)
     assert any(number == 64 for number, _, _ in controls)
+
+
+def test_velocity_output_limits_melodic_tracks_and_merges_overflow(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    guitar_midi = pretty_midi.PrettyMIDI()
+    for index in range(17):
+        instrument = pretty_midi.Instrument(
+            program=index,
+            name=f"guitar_class_{index:02d}",
+        )
+        instrument.notes.append(
+            pretty_midi.Note(
+                velocity=80,
+                pitch=48 + index,
+                start=0.1 + 0.01 * index,
+                end=0.8 + 0.01 * index,
+            )
+        )
+        guitar_midi.instruments.append(instrument)
+    guitar_midi.write(str(mock_stem_midis["guitar"]))
+
+    output_path = tmp_path / "limited_velocity.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        max_melodic_instruments=15,
+        disable_tqdm=True,
+    )
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    melodic = [instrument for instrument in output.instruments if not instrument.is_drum]
+    drums = [instrument for instrument in output.instruments if instrument.is_drum]
+    assert len(melodic) == 15
+    assert len(drums) == 1
+    assert len(output.instruments) == 16
+    assert sum(len(instrument.notes) for instrument in output.instruments) == 19
+    assert sum(instrument.name == "Other / Merged" for instrument in melodic) == 1
