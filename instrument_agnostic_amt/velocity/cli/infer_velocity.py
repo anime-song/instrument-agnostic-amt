@@ -261,14 +261,14 @@ def predict_velocity_for_stem_midis(
             sample_end = min(sample_start + window_samples, max_samples)
             sub_audio = audio_tensor[:, :, :, sample_start:sample_end]
 
-            win_starts = starts[indices_in_win] - win_start
-            win_ends = ends[indices_in_win] - win_start
+            win_starts = (starts[indices_in_win] - win_start).astype(np.float32)
+            win_ends = (ends[indices_in_win] - win_start).astype(np.float32)
 
             note_start_tensor = (
-                torch.from_numpy(win_starts).unsqueeze(0).to(device=target_device)
+                torch.from_numpy(win_starts).unsqueeze(0).to(device=target_device, dtype=torch.float32)
             )
             note_end_tensor = (
-                torch.from_numpy(win_ends).unsqueeze(0).to(device=target_device)
+                torch.from_numpy(win_ends).unsqueeze(0).to(device=target_device, dtype=torch.float32)
             )
             note_pitch_tensor = (
                 torch.from_numpy(pitches[indices_in_win]).unsqueeze(0).to(device=target_device)
