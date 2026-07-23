@@ -99,7 +99,7 @@ def test_predict_velocity_for_stem_midis(
     mock_velocity_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """predict_velocity_for_stem_midis が各ステムMIDIの1:1対応を維持して正確に推論を行うかテスト。"""
+    """predict_velocity_for_stem_midis が各ステムMIDIの1:1対応を維持し、CC#7 Volumeを更新するかテスト。"""
     output_midi_path = tmp_path / "merged_velocity.mid"
 
     result_path = predict_velocity_for_stem_midis(
@@ -109,6 +109,7 @@ def test_predict_velocity_for_stem_midis(
         checkpoint_path=mock_velocity_checkpoint,
         device="cpu",
         window_seconds=4.0,
+        apply_stem_gain_to_cc7=True,
         disable_tqdm=True,
     )
 
@@ -122,6 +123,11 @@ def test_predict_velocity_for_stem_midis(
     for inst in output_midi.instruments:
         for note in inst.notes:
             assert 1 <= note.velocity <= 127
+
+        cc7_events = [cc for cc in inst.control_changes if cc.number == 7]
+        assert len(cc7_events) >= 1
+        for cc in cc7_events:
+            assert 1 <= cc.value <= 127
 
 
 def test_predict_velocity_for_single_midi(
@@ -148,6 +154,7 @@ def test_predict_velocity_for_single_midi(
         checkpoint_path=mock_velocity_checkpoint,
         device="cpu",
         window_seconds=4.0,
+        apply_stem_gain_to_cc7=True,
         disable_tqdm=True,
     )
 

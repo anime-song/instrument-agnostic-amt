@@ -150,9 +150,10 @@ def predict_velocity_for_stem_midis(
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
     window_seconds: float = 16.0,
+    apply_stem_gain_to_cc7: bool = True,
     disable_tqdm: bool = False,
 ) -> Path | dict[str, Path]:
-    """各ステムの音声と、そのステムから採譜された個別のMIDIを直接対応づけてVelocityを予測する。"""
+    """各ステムの音声とMIDIを直接対応づけてVelocityおよび相対ステムゲイン（CC#7 Volume）を予測して反映する。"""
     if device is None:
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -243,11 +244,12 @@ def predict_velocity_for_stem_midis(
         window_starts_seconds = list(np.arange(0.0, total_duration_seconds, window_seconds))
 
     predicted_velocities = np.full(len(flat_notes), 80, dtype=np.int32)
+    predicted_stem_gains_db_list: list[np.ndarray] = []
 
     with torch.no_grad():
         for win_start in tqdm(
             window_starts_seconds,
-            desc="Predicting velocity",
+            desc="Predicting velocity and stem gain",
             disable=disable_tqdm,
         ):
             win_end = win_start + window_seconds
@@ -298,8 +300,37 @@ def predict_velocity_for_stem_midis(
             velocity_clamped = np.clip(np.round(velocity_expected), 1, 127).astype(np.int32)
             predicted_velocities[indices_in_win] = velocity_clamped
 
+            if "stem_gain_db" in outputs:
+                stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
+                predicted_stem_gains_db_list.append(stem_gain_np)
+
     for idx, (note, _, _, _, _, _) in enumerate(flat_notes):
         note.velocity = int(predicted_velocities[idx])
+
+    # 相対ステムゲインの計算と CC#7 Volume への反映
+    stem_gain_by_name: dict[str, float] = {}
+    if predicted_stem_gains_db_list:
+        mean_stem_gains = np.mean(np.stack(predicted_stem_gains_db_list, axis=0), axis=0)
+        for i, s_name in enumerate(active_stem_names):
+            stem_gain_by_name[s_name] = float(mean_stem_gains[i])
+
+    if apply_stem_gain_to_cc7 and stem_gain_by_name:
+        for s_name, pm_obj in loaded_midi_objs.items():
+            gain_db = stem_gain_by_name.get(s_name, 0.0)
+            linear_scale = float(10.0 ** (gain_db / 20.0))
+
+            for inst in pm_obj.instruments:
+                cc7_events = [cc for cc in inst.control_changes if cc.number == 7]
+                if cc7_events:
+                    for cc in cc7_events:
+                        updated_val = int(np.clip(round(cc.value * linear_scale), 1, 127))
+                        cc.value = updated_val
+                else:
+                    base_val = 100
+                    updated_val = int(np.clip(round(base_val * linear_scale), 1, 127))
+                    inst.control_changes.append(
+                        pretty_midi.ControlChange(number=7, value=updated_val, time=0.0)
+                    )
 
     if output_midi_path is not None:
         merged_midi = pretty_midi.PrettyMIDI()
@@ -329,6 +360,7 @@ def predict_velocity_for_midi(
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
     window_seconds: float = 16.0,
+    apply_stem_gain_to_cc7: bool = True,
     disable_tqdm: bool = False,
 ) -> Path:
     """単一のMIDIファイルを受け取った場合の互換用エントリポイント。"""
@@ -363,6 +395,7 @@ def predict_velocity_for_midi(
         checkpoint_path=checkpoint_path,
         device=device,
         window_seconds=window_seconds,
+        apply_stem_gain_to_cc7=apply_stem_gain_to_cc7,
         disable_tqdm=disable_tqdm,
     )
 
@@ -375,7 +408,7 @@ def predict_velocity_for_midi(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Predict MIDI note velocity from separated stem audio files."
+        description="Predict MIDI note velocity and relative stem gains (CC#7) from separated stem audio files."
     )
     parser.add_argument("--midi", type=Path, required=True, help="Input MIDI file path")
     parser.add_argument(
@@ -391,7 +424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-midi",
         type=Path,
-        help="Output MIDI file path with updated velocity",
+        help="Output MIDI file path with updated velocity and stem gain",
     )
     parser.add_argument(
         "--checkpoint",
@@ -410,6 +443,11 @@ def parse_args() -> argparse.Namespace:
         default=16.0,
         help="Window size in seconds for long audio inference",
     )
+    parser.add_argument(
+        "--no-cc7-gain",
+        action="store_true",
+        help="Disable applying predicted stem gain to Control Change #7 Volume",
+    )
     return parser.parse_args()
 
 
@@ -426,8 +464,9 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         device=args.device,
         window_seconds=args.window_seconds,
+        apply_stem_gain_to_cc7=not args.no_cc7_gain,
     )
-    print(f"Successfully generated velocity-predicted MIDI: {output_path}")
+    print(f"Successfully generated velocity & volume predicted MIDI: {output_path}")
 
 
 if __name__ == "__main__":
