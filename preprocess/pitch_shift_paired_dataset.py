@@ -22,7 +22,6 @@ import soundfile as sf
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_MIDI_TICK = 1_000_000
 DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac")
 DEFAULT_MIDI_EXTENSIONS = (".mid", ".midi")
 DEFAULT_EXCLUDE_FILENAME_MARKERS = ("_pitch_",)
@@ -47,7 +46,6 @@ class RuntimePitchShiftConfig:
     semitones: tuple[int, ...]
     workers: int
     overwrite: bool
-    max_midi_tick: int
 
     @classmethod
     def from_arguments(cls, arguments: argparse.Namespace) -> RuntimePitchShiftConfig:
@@ -98,7 +96,6 @@ class RuntimePitchShiftConfig:
             semitones=cls.build_semitones(arguments.min_pitch, arguments.max_pitch),
             workers=arguments.workers,
             overwrite=arguments.overwrite,
-            max_midi_tick=arguments.max_midi_tick,
         )
         runtime_config.validate()
         return runtime_config
@@ -137,8 +134,6 @@ class RuntimePitchShiftConfig:
         """実行前に最低限の前提を検証する。"""
         if self.workers < 1:
             raise ValueError("--workers は 1 以上にしてください。")
-        if self.max_midi_tick < 1:
-            raise ValueError("--max_midi_tick は 1 以上にしてください。")
         if self.generate_audio and not self.audio_dir.exists():
             raise FileNotFoundError(
                 f"入力音声ディレクトリが見つかりません: {self.audio_dir}"
@@ -165,7 +160,6 @@ class MidiTask:
     input_path: Path
     output_dir: Path
     semitones: tuple[int, ...]
-    max_midi_tick: int
 
 
 @dataclass
@@ -174,7 +168,6 @@ class TaskResult:
 
     success_count: int = 0
     skipped_count: int = 0
-    normalized_original_count: int = 0
     error_messages: list[str] = field(default_factory=list)
 
 
@@ -250,12 +243,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite", action="store_true", help="既存の生成ファイルを上書きする"
     )
-    parser.add_argument(
-        "--max_midi_tick",
-        type=int,
-        default=DEFAULT_MAX_MIDI_TICK,
-        help="生成するMIDIの最大tick目安。大きすぎるMIDIはこの値以下になるよう解像度を下げる",
-    )
     parser.add_argument("--audio-only", action="store_true", help="音声だけを生成する")
     parser.add_argument("--midi-only", action="store_true", help="MIDIだけを生成する")
     arguments = parser.parse_args()
@@ -323,60 +310,30 @@ def get_temporary_output_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
 
 
-def compute_largest_tick(midi_file: mido.MidiFile) -> int:
-    """MIDI全体で最も大きい絶対tick位置を返す。"""
-    largest_tick = 0
-    for track in midi_file.tracks:
-        absolute_tick = 0
-        for message in track:
-            absolute_tick += int(message.time)
-        largest_tick = max(largest_tick, absolute_tick)
-    return largest_tick
-
-
-def compute_tick_divisor(largest_tick: int, max_midi_tick: int) -> int:
-    """最大tickが目標以下になるように解像度の縮小率を決める。"""
-    if largest_tick <= max_midi_tick:
-        return 1
-    return (largest_tick + max_midi_tick - 1) // max_midi_tick
-
-
-def scale_tick_value(tick_value: int, divisor: int) -> int:
-    """delta tickを縮小後の整数tickへ丸める。"""
-    if divisor <= 1 or tick_value <= 0:
-        return int(tick_value)
-    return max(1, int(round(tick_value / divisor)))
-
-
 def build_shifted_midi(
     midi_file: mido.MidiFile,
     semitone: int,
     source_name: str,
-    max_midi_tick: int,
 ) -> mido.MidiFile:
     """
-    MIDIを指定半音数だけ移調し、必要ならtick解像度も下げた新しいMIDIを返す。
+    MIDIを指定半音数だけ移調し、時刻情報を完全に保持した新しいMIDIを返す。
 
     注釈: GMの慣例に従い、channel 10 (index 9) の打楽器ノートは移調せずそのまま保持する。
     """
-    largest_tick = compute_largest_tick(midi_file)
-    divisor = compute_tick_divisor(largest_tick, max_midi_tick)
-    new_ticks_per_beat = max(1, int(round(midi_file.ticks_per_beat / divisor)))
-
     shifted_midi = mido.MidiFile(
         type=midi_file.type,
-        ticks_per_beat=new_ticks_per_beat,
+        ticks_per_beat=midi_file.ticks_per_beat,
+        charset=midi_file.charset,
+        clip=midi_file.clip,
     )
     out_of_range_notes: list[str] = []
 
     for track_index, track in enumerate(midi_file.tracks):
         new_track = mido.MidiTrack()
         for message_index, message in enumerate(track):
-            new_time = scale_tick_value(int(message.time), divisor)
-
             if message.type in ("note_on", "note_off") and not message.is_meta:
                 if getattr(message, "channel", None) == 9:
-                    new_track.append(message.copy(time=new_time))
+                    new_track.append(message.copy())
                     continue
 
                 shifted_note = int(message.note) + semitone
@@ -384,12 +341,12 @@ def build_shifted_midi(
                     out_of_range_notes.append(
                         f"track={track_index}, message={message_index}, note={message.note}"
                     )
-                    new_track.append(message.copy(time=new_time))
+                    new_track.append(message.copy())
                     continue
-                new_track.append(message.copy(note=shifted_note, time=new_time))
+                new_track.append(message.copy(note=shifted_note))
                 continue
 
-            new_track.append(message.copy(time=new_time))
+            new_track.append(message.copy())
         shifted_midi.tracks.append(new_track)
 
     if out_of_range_notes:
@@ -440,24 +397,6 @@ def write_shifted_midi(output_path: Path, midi_data: mido.MidiFile) -> None:
         if temp_output_path.exists():
             temp_output_path.unlink()
         raise
-
-
-def normalize_original_midi_if_needed(task: MidiTask, midi_data: mido.MidiFile) -> int:
-    """
-    元MIDIの解像度が高すぎる場合、元ファイル自体を低解像度化して上書きする。
-    `pitch_0` は生成せず、オリジナルを正規化済みの基準ファイルとして扱う。
-    """
-    if compute_largest_tick(midi_data) <= task.max_midi_tick:
-        return 0
-
-    normalized_midi = build_shifted_midi(
-        midi_file=midi_data,
-        semitone=0,
-        source_name=task.input_path.name,
-        max_midi_tick=task.max_midi_tick,
-    )
-    write_shifted_midi(task.input_path, normalized_midi)
-    return 1
 
 
 def process_audio_task(task: AudioTask, overwrite: bool) -> TaskResult:
@@ -514,25 +453,13 @@ def process_midi_task(task: MidiTask, overwrite: bool) -> TaskResult:
         task.semitones,
         overwrite=overwrite,
     )
+    if not pending_semitones:
+        return result
 
     try:
         midi_data = mido.MidiFile(str(task.input_path))
     except (OSError, RuntimeError, ValueError) as exception:
         result.error_messages.append(f"{task.input_path.name} load: {exception}")
-        return result
-
-    try:
-        result.normalized_original_count = normalize_original_midi_if_needed(
-            task,
-            midi_data,
-        )
-    except (OSError, RuntimeError, ValueError) as exception:
-        result.error_messages.append(
-            f"{task.input_path.name} normalize_original: {exception}"
-        )
-        return result
-
-    if not pending_semitones:
         return result
 
     task.output_dir.mkdir(parents=True, exist_ok=True)
@@ -543,7 +470,6 @@ def process_midi_task(task: MidiTask, overwrite: bool) -> TaskResult:
                 midi_file=midi_data,
                 semitone=semitone,
                 source_name=task.input_path.name,
-                max_midi_tick=task.max_midi_tick,
             )
             write_shifted_midi(output_path, shifted_midi)
             result.success_count += 1
@@ -686,22 +612,15 @@ class PitchShiftDatasetRunner:
                     path,
                 ),
                 semitones=self.runtime_config.semitones,
-                max_midi_tick=self.runtime_config.max_midi_tick,
             )
             for path in midi_files
         ]
         logger.info("MIDI処理対象: %d ファイル", len(midi_tasks))
-        (
-            midi_success,
-            midi_skipped,
-            midi_normalized_original,
-            midi_errors,
-        ) = self.execute_midi_tasks(midi_tasks)
+        midi_success, midi_skipped, midi_errors = self.execute_midi_tasks(midi_tasks)
         logger.info(
-            "MIDI完了: 成功 %d, スキップ %d, 元MIDI正規化 %d, エラー %d",
+            "MIDI完了: 成功 %d, スキップ %d, エラー %d",
             midi_success,
             midi_skipped,
-            midi_normalized_original,
             len(midi_errors),
         )
         self.log_error_messages(midi_errors)
@@ -742,13 +661,10 @@ class PitchShiftDatasetRunner:
 
         return total_success, total_skipped, all_errors
 
-    def execute_midi_tasks(
-        self, tasks: list[MidiTask]
-    ) -> tuple[int, int, int, list[str]]:
+    def execute_midi_tasks(self, tasks: list[MidiTask]) -> tuple[int, int, list[str]]:
         """MIDIタスク群を並列実行して結果を集計する。"""
         total_success = 0
         total_skipped = 0
-        total_normalized_original = 0
         all_errors: list[str] = []
 
         with ProcessPoolExecutor(max_workers=self.runtime_config.workers) as executor:
@@ -764,10 +680,9 @@ class PitchShiftDatasetRunner:
                 result = future.result()
                 total_success += result.success_count
                 total_skipped += result.skipped_count
-                total_normalized_original += result.normalized_original_count
                 all_errors.extend(result.error_messages)
 
-        return total_success, total_skipped, total_normalized_original, all_errors
+        return total_success, total_skipped, all_errors
 
     def log_pairing_summary(
         self, audio_files: list[Path], midi_files: list[Path]

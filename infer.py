@@ -32,6 +32,7 @@ MODEL_CHECKPOINT_FILENAMES = {
     "bass_v2": "best_model_bass_v2.pth",
     "vocal": "best_model_vocal.pth",
     "guitar": "best_model_guitar.pth",
+    "guitar_v1_5": "best_model_guitar_v1_5.pth",
     "vocal_harmony": "best_model_vocal_harmony.pth",
     "drums": "best_model_drums.pth",
     "other": "best_model_other.pth",
@@ -144,19 +145,19 @@ DEFAULT_INSTRUMENT_VOLUMES: dict[str, int] = {
     "distorted_guitar": 78,
     "electric_guitar_muted": 68,
     "guitar_harmonics": 72,
-    "acoustic_bass": 92,
-    "electric_bass": 90,
-    "synth_bass": 86,
+    "acoustic_bass": 100,
+    "electric_bass": 100,
+    "synth_bass": 100,
     "drums": 100,
     "strings": 82,
-    "brass": 84,
-    "sax": 86,
+    "brass": 100,
+    "sax": 100,
     "flute_pipe": 84,
     "choir": 80,
     "organ": 88,
     "synth_pad": 76,
-    "synth_lead": 84,
-    "melody": 110,
+    "synth_lead": 76,
+    "melody": 120,
     "vocal_harmony": 60,
 }
 
@@ -225,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         "--type",
         choices=list(MODEL_CHECKPOINT_FILENAMES.keys()),
         default="default",
-        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' or 'bass_v2' for bass-focused models, 'vocal' for vocal-focused model, 'guitar' for guitar-focused model, 'vocal_harmony' for vocal harmony model, 'drums' for drum-focused model, 'other' for other-instrument-focused model.",
+        help="Type of the model to download from Hugging Face if checkpoint is not provided. 'default' for multi-instrument, 'bass' or 'bass_v2' for bass-focused models, 'vocal' for vocal-focused model, 'guitar' or 'guitar_v1_5' for guitar-focused models, 'vocal_harmony' for vocal harmony model, 'drums' for drum-focused model, 'other' for other-instrument-focused model.",
     )
 
     # 単一ファイルモード
