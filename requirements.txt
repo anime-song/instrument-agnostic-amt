@@ -22,6 +22,7 @@ miditoolkit
 # For separate inference, we need the following additional dependencies:
 stem-splitter
 git+https://github.com/xavriley/ADTOF-pytorch.git # For the ADTOF model, which is used for drum transcription.
+transkun # For the TransKun model, which is used for piano transcription.
 
 
 # The following line is commented out because yt-dlp may not be necessary for all users and can be installed separately if needed. Uncomment it if you want to include it in the requirements.
