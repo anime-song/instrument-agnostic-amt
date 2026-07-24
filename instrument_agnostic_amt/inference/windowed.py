@@ -369,13 +369,19 @@ class WindowNoteStitcher:
             if track_notes:
                 track_notes[-1].has_offset = True
 
-        stitched_notes = sorted(
+        # V1 decoding appends overlapping-window segments directly.  A sustained
+        # note therefore commonly has several intermediate segments whose offset
+        # flag is false.  Merge those continuations before filtering on offset;
+        # filtering first discards the true onset and keeps only the last window.
+        merged_notes = self._merge_nearby_notes(
             [
                 note
                 for track_notes in self.notes_by_pair.values()
                 for note in track_notes
-                if note.has_offset
-            ],
+            ]
+        )
+        return sorted(
+            [note for note in merged_notes if note.has_offset],
             key=lambda note: (
                 int(note.start_sample),
                 int(note.instrument_id),
@@ -384,7 +390,6 @@ class WindowNoteStitcher:
                 int(note.end_sample),
             ),
         )
-        return self._merge_nearby_notes(stitched_notes)
 
     @staticmethod
     def _resolve_interval_boundary_flags(
