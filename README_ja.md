@@ -25,7 +25,7 @@
 
 > **動画について**: 上の画像はクリックできるサムネイルです。クリックすると YouTube で動画を見られます。
 
-> **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、最後に MIDI をマージする** オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。
+> **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、MIDI をマージした後、分離音声から各ノートの velocity を予測する**オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。このワークフローでは velocity 予測がデフォルトで有効です。
 
 ---
 
@@ -47,6 +47,7 @@
 
 | 日付 | 内容 |
 |---|---|
+| 2026-07-24 | 分離ステム音声からノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
 | 2026-07-22 | ギター専用モデル v1.5（`--type guitar_v1_5`）を追加。Colab のステム分離ワークフローでは、ギターステムの既定モデルとして使用します。 |
 | 2026-07-16 | 🐛 データ拡張処理の不具合によりノートのタイミングにずれが生じていた問題を修正し、修正後にベースモデル v2（`--type bass_v2`）を再学習しました。再学習した `bass_v2` ではノート検出精度が向上し、1つのノートが複数の短いノートに過剰分割される問題も修正されています。これらの改善は `bass_v2` のみに適用されます。 |
 | 2026-07-15 | 🎸 ベースモデル v2（`--type bass_v2`）を追加。楽器分類におけるスラップベースの分類精度が向上しました。 |
@@ -69,6 +70,7 @@
 - 🎹 **楽器を問わない採譜** — ピアノ、ギター、ベース、ボーカル、ストリングス、管楽器など
 - 🧠 **Neural Semi-CRF + Pitch Slot** — ピッチごとに最適なノート区間を Viterbi で一括デコード。Pitch Slot により同じ音程の重複ノートも同時に予測可能
 - 🎼 **HCQT 特徴量** — 5つの倍音 × ステレオ 2ch の Harmonic CQT で音高情報をしっかり捉える
+- 🎚️ **ノート単位の velocity 予測** — 専用の後処理モデルが分離ステム音声から MIDI ノートの強弱を推定
 - 🔧 **豊富なデータ拡張** — ステムの混ぜ合わせ、IR リバーブ、EQ、ノイズ、ドラム追加など
 - 🧪 **[実験的] 楽器識別 & マルチトラック出力** — 33+ 楽器クラスの分類ヘッド付き（精度は改善中）
 
@@ -378,11 +380,27 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 1. 入力した曲をステム分離する
 2. 各ステムを個別に採譜する
-3. ステムごとの MIDI を最後に 1 本へマージする
+3. ステムごとの MIDI を 1 本へマージする
+4. 対応する分離ステム音声から MIDI ノートごとの velocity を予測する
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
+
+velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）。必要な velocity チェックポイント `best_velocity_model.pth` は Hugging Face から自動取得され、最終結果は `_velocity.mid` という接尾辞付きで保存されます。この処理を省略する場合は、ノートブック内で `PREDICT_VELOCITY = False` に設定してください。
+
+### velocity 予測の単体実行
+
+velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。
+
+```bash
+python infer_velocity.py \
+  --midi output.mid \
+  --stems-dir separated_stems \
+  --output-midi output_velocity.mid
+```
+
+`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離音声を配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
 
 ### その他のオプション
 
@@ -404,7 +422,7 @@ python infer.py \
 | 引数 | デフォルト | 説明 |
 |---|---|---|
 | `--checkpoint` | (自動) | 学習済みモデルのパス。指定しない場合は HF から自動取得 |
-| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: ギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
+| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: 従来のギター専用モデル、`guitar_v1_5`: 新しいギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
 | `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
 | `--amp` | `false` | 混合精度推論を有効化 |
