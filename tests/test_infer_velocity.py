@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import mido
 import numpy as np
 import pretty_midi
 import pytest
 import soundfile as sf
 import torch
 
+import instrument_agnostic_amt.velocity.cli.infer_velocity as velocity_infer
 from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     predict_velocity_for_midi,
     predict_velocity_for_stem_midis,
@@ -16,6 +18,51 @@ from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
 )
+
+
+def _midi_note_structure(path: Path) -> list[tuple[int, str, int, str, int, int]]:
+    midi = mido.MidiFile(str(path))
+    structure: list[tuple[int, str, int, str, int, int]] = []
+    for track_index, track in enumerate(midi.tracks):
+        track_name = next(
+            (
+                message.name
+                for message in track
+                if message.type == 'track_name'
+            ),
+            '',
+        )
+        absolute_tick = 0
+        for message in track:
+            absolute_tick += int(message.time)
+            if message.type not in {'note_on', 'note_off'}:
+                continue
+            event_kind = (
+                'on'
+                if message.type == 'note_on' and int(message.velocity) > 0
+                else 'off'
+            )
+            structure.append(
+                (
+                    track_index,
+                    track_name,
+                    absolute_tick,
+                    event_kind,
+                    int(message.channel),
+                    int(message.note),
+                )
+            )
+    return structure
+
+
+def _midi_note_on_velocities(path: Path) -> list[int]:
+    midi = mido.MidiFile(str(path))
+    return [
+        int(message.velocity)
+        for track in midi.tracks
+        for message in track
+        if message.type == 'note_on' and int(message.velocity) > 0
+    ]
 
 
 @pytest.fixture
@@ -130,6 +177,63 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
+def test_template_midi_preserves_note_structure_and_uses_stem_velocities(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class StemIndexedVelocityModel:
+        def __call__(self, _audio: torch.Tensor, **kwargs: torch.Tensor):
+            stem_indices = kwargs['note_stem_index']
+            return {
+                'velocity_expected': stem_indices.to(torch.float32) * 10.0 + 30.0
+            }
+
+    config = VelocityModelConfig(sample_rate=22050, predict_stem_gain=False)
+    monkeypatch.setattr(
+        velocity_infer,
+        'load_velocity_model',
+        lambda *_args, **_kwargs: (StemIndexedVelocityModel(), config),
+    )
+
+    template_midi = pretty_midi.PrettyMIDI()
+    for midi_path in mock_stem_midis.values():
+        stem_midi = pretty_midi.PrettyMIDI(str(midi_path))
+        template_midi.instruments.extend(stem_midi.instruments)
+
+    # 予測元のbass noteより長いV1 noteを作り、終了位置が維持されることも確認する。
+    template_midi.instruments[0].notes[0].end = 1.8
+    template_path = tmp_path / 'template_v1.mid'
+    template_midi.write(str(template_path))
+    original_structure = _midi_note_structure(template_path)
+
+    output_path = tmp_path / 'template_velocity.mid'
+    result_path = predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        template_midi_path=template_path,
+        device='cpu',
+        window_seconds=4.0,
+        disable_tqdm=True,
+    )
+
+    assert result_path == output_path
+    assert _midi_note_structure(output_path) == original_structure
+    assert _midi_note_on_velocities(output_path) == [30, 50, 40]
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    assert output.instruments[0].notes[0].end == pytest.approx(1.8, abs=0.01)
+    for instrument in output.instruments:
+        fixed_controls = [
+            (control.number, control.value, control.time)
+            for control in instrument.control_changes
+            if control.number in (7, 11)
+        ]
+        assert fixed_controls == [(7, 127, 0.0), (11, 127, 0.0)]
+
+
 def test_predict_velocity_for_single_midi(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
@@ -144,6 +248,7 @@ def test_predict_velocity_for_single_midi(
 
     single_midi_path = tmp_path / "single_merged.mid"
     merged_pm.write(str(single_midi_path))
+    original_structure = _midi_note_structure(single_midi_path)
 
     output_midi_path = tmp_path / "single_output_velocity.mid"
 
@@ -154,11 +259,11 @@ def test_predict_velocity_for_single_midi(
         checkpoint_path=mock_velocity_checkpoint,
         device="cpu",
         window_seconds=4.0,
-        apply_stem_gain_to_cc7=True,
         disable_tqdm=True,
     )
 
     assert result_path.exists()
+    assert _midi_note_structure(result_path) == original_structure
     output_midi = pretty_midi.PrettyMIDI(str(result_path))
     assert len(output_midi.instruments) >= 1
     for inst in output_midi.instruments:

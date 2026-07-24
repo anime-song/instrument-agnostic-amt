@@ -391,7 +391,7 @@ velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）�
 
 ### velocity 予測の単体実行
 
-velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。
+velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。
 
 ```bash
 python infer_velocity.py \

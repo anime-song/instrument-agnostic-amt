@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import mido
 import numpy as np
 import pretty_midi
 import soundfile as sf
@@ -21,6 +24,217 @@ HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
 )
 DEFAULT_VELOCITY_CHECKPOINT_FILENAME = "best_velocity_model.pth"
+
+
+@dataclass
+class _VelocityNoteRecord:
+    note: pretty_midi.Note
+    program: int
+    is_drum: bool
+    stem_index: int
+    stem_name: str
+    instrument_name: str
+
+
+def _normalized_instrument_name(name: str) -> str:
+    return str(name).strip().casefold()
+
+
+def _pop_unused_assignment(
+    queue: deque[int] | None,
+    *,
+    used: set[int],
+) -> int | None:
+    if queue is None:
+        return None
+    while queue and queue[0] in used:
+        queue.popleft()
+    if not queue:
+        return None
+    assignment_index = queue.popleft()
+    used.add(assignment_index)
+    return assignment_index
+
+
+def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
+    '''CC7/CC11を各演奏チャンネルのtick 0へ1件ずつ設定する。'''
+
+    for track in midi.tracks:
+        channels = sorted(
+            {
+                int(message.channel)
+                for message in track
+                if hasattr(message, 'channel')
+                and message.type in {'program_change', 'note_on', 'note_off'}
+            }
+        )
+        if not channels:
+            continue
+
+        rebuilt_track = mido.MidiTrack()
+        carried_delta = 0
+        for message in track:
+            if (
+                message.type == 'control_change'
+                and int(message.control) in (7, 11)
+            ):
+                carried_delta += int(message.time)
+                continue
+            rebuilt_track.append(
+                message.copy(time=int(message.time) + carried_delta)
+            )
+            carried_delta = 0
+
+        insert_at = 0
+        while insert_at < len(rebuilt_track) and rebuilt_track[insert_at].time == 0:
+            insert_at += 1
+        fixed_controls = [
+            mido.Message(
+                'control_change',
+                channel=channel,
+                control=control,
+                value=127,
+                time=0,
+            )
+            for channel in channels
+            for control in (7, 11)
+        ]
+        rebuilt_track[insert_at:insert_at] = fixed_controls
+        track[:] = rebuilt_track
+
+
+def _write_velocity_template_midi(
+    template_midi_path: Path | str,
+    output_midi_path: Path | str,
+    note_records: list[_VelocityNoteRecord],
+    *,
+    set_fixed_loudness_controls: bool,
+) -> Path:
+    '''テンプレートのNote On velocityだけを更新し、ノート構造を維持する。'''
+
+    template_path = Path(template_midi_path)
+    if not template_path.exists():
+        raise FileNotFoundError(f'Template MIDI file not found: {template_path}')
+
+    template_pm = pretty_midi.PrettyMIDI(str(template_path))
+    template_midi = mido.MidiFile(str(template_path))
+    exact_assignments: dict[
+        tuple[str, int, bool, int, int], deque[int]
+    ] = defaultdict(deque)
+    program_assignments: dict[
+        tuple[int, bool, int, int], deque[int]
+    ] = defaultdict(deque)
+    global_assignments: dict[tuple[int, int], deque[int]] = defaultdict(deque)
+
+    for assignment_index, record in enumerate(note_records):
+        start_tick = int(template_pm.time_to_tick(float(record.note.start)))
+        instrument_name = _normalized_instrument_name(record.instrument_name)
+        exact_assignments[
+            (
+                instrument_name,
+                int(record.program),
+                bool(record.is_drum),
+                int(record.note.pitch),
+                start_tick,
+            )
+        ].append(assignment_index)
+        program_assignments[
+            (
+                int(record.program),
+                bool(record.is_drum),
+                int(record.note.pitch),
+                start_tick,
+            )
+        ].append(assignment_index)
+        global_assignments[(int(record.note.pitch), start_tick)].append(
+            assignment_index
+        )
+
+    used_assignments: set[int] = set()
+    unmatched_note_ons: list[tuple[int, str, int, int]] = []
+
+    for track_index, track in enumerate(template_midi.tracks):
+        track_name = next(
+            (
+                message.name
+                for message in track
+                if message.type == 'track_name'
+            ),
+            '',
+        )
+        normalized_track_name = _normalized_instrument_name(track_name)
+        program_by_channel: dict[int, int] = {}
+        absolute_tick = 0
+
+        for message in track:
+            absolute_tick += int(message.time)
+            if message.type == 'program_change':
+                program_by_channel[int(message.channel)] = int(message.program)
+                continue
+            if message.type != 'note_on' or int(message.velocity) <= 0:
+                continue
+
+            channel = int(message.channel)
+            program = int(program_by_channel.get(channel, 0))
+            is_drum = channel == 9
+            pitch = int(message.note)
+            assignment_index: int | None = None
+
+            for tick_offset in (0, -1, 1, -2, 2):
+                candidate_tick = absolute_tick + tick_offset
+                assignment_index = _pop_unused_assignment(
+                    exact_assignments.get(
+                        (
+                            normalized_track_name,
+                            program,
+                            is_drum,
+                            pitch,
+                            candidate_tick,
+                        )
+                    ),
+                    used=used_assignments,
+                )
+                if assignment_index is not None:
+                    break
+                assignment_index = _pop_unused_assignment(
+                    program_assignments.get(
+                        (program, is_drum, pitch, candidate_tick)
+                    ),
+                    used=used_assignments,
+                )
+                if assignment_index is not None:
+                    break
+                assignment_index = _pop_unused_assignment(
+                    global_assignments.get((pitch, candidate_tick)),
+                    used=used_assignments,
+                )
+                if assignment_index is not None:
+                    break
+
+            if assignment_index is None:
+                unmatched_note_ons.append(
+                    (track_index, track_name, pitch, absolute_tick)
+                )
+                continue
+            message.velocity = int(note_records[assignment_index].note.velocity)
+
+    if unmatched_note_ons:
+        preview = ', '.join(
+            f'track={track_index} name={track_name!r} pitch={pitch} tick={tick}'
+            for track_index, track_name, pitch, tick in unmatched_note_ons[:5]
+        )
+        raise ValueError(
+            'Velocity predictions could not be matched to '
+            f'{len(unmatched_note_ons)} template Note On events. {preview}'
+        )
+
+    if set_fixed_loudness_controls:
+        _replace_fixed_loudness_controls_in_mido(template_midi)
+
+    destination_path = Path(output_midi_path)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    template_midi.save(str(destination_path))
+    return destination_path
 
 
 def ensure_velocity_checkpoint(checkpoint_path: Path | str | None = None) -> Path:
@@ -220,6 +434,7 @@ def predict_velocity_for_stem_midis(
     stem_audios: Mapping[str, Path | str] | Path | str,
     *,
     output_midi_path: Path | str | None = None,
+    template_midi_path: Path | str | None = None,
     checkpoint_path: Path | str | None = None,
     device: torch.device | str | None = None,
     window_seconds: float = 8.0,
@@ -230,7 +445,8 @@ def predict_velocity_for_stem_midis(
     """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
 
     Velocity-only推論ではCC7 VolumeとCC11 Expressionを127へ固定し、学習renderと
-    同じ基準でノートVelocityを唯一の可変音量表現にする。
+    同じ基準でノートVelocityを唯一の可変音量表現にする。template_midi_pathを
+    指定した場合は、そのMIDIのNote Onイベントへ予測値だけを書き戻す。
     """
     if device is None:
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,6 +454,13 @@ def predict_velocity_for_stem_midis(
         target_device = torch.device(device)
     if max_melodic_instruments < 0:
         raise ValueError("max_melodic_instruments must be nonnegative")
+
+    if template_midi_path is not None and output_midi_path is None:
+        raise ValueError('template_midi_path requires output_midi_path')
+    if template_midi_path is not None and apply_stem_gain_to_cc7:
+        raise ValueError(
+            'template_midi_path is not compatible with legacy stem-gain CC7 output'
+        )
 
     model, config = load_velocity_model(checkpoint_path, device=target_device)
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
@@ -292,7 +515,7 @@ def predict_velocity_for_stem_midis(
         .to(device=target_device)
     )
 
-    flat_notes: list[tuple[pretty_midi.Note, int, int, bool, int, pretty_midi.PrettyMIDI]] = []
+    flat_notes: list[_VelocityNoteRecord] = []
     loaded_midi_objs: dict[str, pretty_midi.PrettyMIDI] = {}
 
     for stem_name, midi_path in resolved_midis.items():
@@ -306,18 +529,27 @@ def predict_velocity_for_stem_midis(
 
         for inst in pm_obj.instruments:
             for note in inst.notes:
-                flat_notes.append((note, inst.program, int(inst.is_drum), False, stem_index, pm_obj))
+                flat_notes.append(
+                    _VelocityNoteRecord(
+                        note=note,
+                        program=int(inst.program),
+                        is_drum=bool(inst.is_drum),
+                        stem_index=stem_index,
+                        stem_name=stem_name,
+                        instrument_name=str(inst.name),
+                    )
+                )
 
     if not flat_notes:
         print("Warning: No notes found across stem MIDI files.")
         return list(resolved_midis.values())[0]
 
-    starts = np.array([item[0].start for item in flat_notes], dtype=np.float32)
-    ends = np.array([item[0].end for item in flat_notes], dtype=np.float32)
-    pitches = np.array([item[0].pitch for item in flat_notes], dtype=np.int64)
-    programs = np.array([item[1] for item in flat_notes], dtype=np.int64)
-    is_drums = np.array([item[2] for item in flat_notes], dtype=np.int64)
-    stem_indices = np.array([item[4] for item in flat_notes], dtype=np.int64)
+    starts = np.array([item.note.start for item in flat_notes], dtype=np.float32)
+    ends = np.array([item.note.end for item in flat_notes], dtype=np.float32)
+    pitches = np.array([item.note.pitch for item in flat_notes], dtype=np.int64)
+    programs = np.array([item.program for item in flat_notes], dtype=np.int64)
+    is_drums = np.array([item.is_drum for item in flat_notes], dtype=np.int64)
+    stem_indices = np.array([item.stem_index for item in flat_notes], dtype=np.int64)
 
     total_duration_seconds = float(max_samples) / float(config.sample_rate)
     window_samples = int(window_seconds * config.sample_rate)
@@ -388,8 +620,8 @@ def predict_velocity_for_stem_midis(
                 stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
                 predicted_stem_gains_db_list.append(stem_gain_np)
 
-    for idx, (note, _, _, _, _, _) in enumerate(flat_notes):
-        note.velocity = int(predicted_velocities[idx])
+    for idx, record in enumerate(flat_notes):
+        record.note.velocity = int(predicted_velocities[idx])
 
     if not apply_stem_gain_to_cc7:
         for pm_obj in loaded_midi_objs.values():
@@ -419,6 +651,14 @@ def predict_velocity_for_stem_midis(
                     inst.control_changes.append(
                         pretty_midi.ControlChange(number=7, value=updated_val, time=0.0)
                     )
+
+    if output_midi_path is not None and template_midi_path is not None:
+        return _write_velocity_template_midi(
+            template_midi_path=template_midi_path,
+            output_midi_path=output_midi_path,
+            note_records=flat_notes,
+            set_fixed_loudness_controls=not apply_stem_gain_to_cc7,
+        )
 
     if output_midi_path is not None:
         # 最初のステムMIDIファイルをベースにしてテンポマップ・解像度を保持する
@@ -486,6 +726,9 @@ def predict_velocity_for_midi(
         stem_midis=stem_midis,
         stem_audios=resolved_audios,
         output_midi_path=output_midi_path or (midi_file_path.parent / f"{midi_file_path.stem}_velocity.mid"),
+        template_midi_path=(
+            midi_file_path if not apply_stem_gain_to_cc7 else None
+        ),
         checkpoint_path=checkpoint_path,
         device=device,
         window_seconds=window_seconds,

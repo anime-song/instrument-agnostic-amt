@@ -390,7 +390,7 @@ Velocity prediction is enabled by default (`PREDICT_VELOCITY = True`). The veloc
 
 ### Standalone velocity prediction
 
-The velocity model is a separate post-processing model from the AMT note-detection model. Given an existing MIDI file and its separated stem audio, it replaces fixed note velocities with dynamics predicted for each note.
+The velocity model is a separate post-processing model from the AMT note-detection model. Given an existing MIDI file and its separated stem audio, it replaces fixed note velocities with dynamics predicted for each note. The original tracks, pitches, and Note On/Off timing are preserved.
 
 ```bash
 python infer_velocity.py \
