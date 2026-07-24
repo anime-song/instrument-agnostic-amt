@@ -205,7 +205,7 @@ def resolve_stem_model_type(stem_name):
     if "vocal" in stem_name:
         return "vocal_harmony"
     if "guitar" in stem_name:
-        return "guitar"
+        return "guitar_v1_5"
     if "other" in stem_name:
         return "other"
     return "default"
