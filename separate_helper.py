@@ -153,9 +153,6 @@ def merge_midis_logic(midi_paths, output_file, max_melodic=15):
         )
         inst.notes = all_notes[key]
         inst.control_changes = all_ccs[key]
-        inst.control_changes.append(
-            pretty_midi.ControlChange(number=7, value=70, time=0.0)
-        )
         inst.pitch_bends = all_pbends[key]
         final_instruments.append(inst)
 

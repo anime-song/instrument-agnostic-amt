@@ -57,49 +57,17 @@ def _pop_unused_assignment(
 
 
 def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
-    '''CC7/CC11を各演奏チャンネルのtick 0へ1件ずつ設定する。'''
+    '''CC7/CC11のイベントをすべて削除する。'''
 
     for track in midi.tracks:
-        channels = sorted(
-            {
-                int(message.channel)
-                for message in track
-                if hasattr(message, 'channel')
-                and message.type in {'program_change', 'note_on', 'note_off'}
-            }
-        )
-        if not channels:
-            continue
-
         rebuilt_track = mido.MidiTrack()
-        carried_delta = 0
         for message in track:
             if (
                 message.type == 'control_change'
                 and int(message.control) in (7, 11)
             ):
-                carried_delta += int(message.time)
                 continue
-            rebuilt_track.append(
-                message.copy(time=int(message.time) + carried_delta)
-            )
-            carried_delta = 0
-
-        insert_at = 0
-        while insert_at < len(rebuilt_track) and rebuilt_track[insert_at].time == 0:
-            insert_at += 1
-        fixed_controls = [
-            mido.Message(
-                'control_change',
-                channel=channel,
-                control=control,
-                value=127,
-                time=0,
-            )
-            for channel in channels
-            for control in (7, 11)
-        ]
-        rebuilt_track[insert_at:insert_at] = fixed_controls
+            rebuilt_track.append(message.copy())
         track[:] = rebuilt_track
 
 
@@ -365,12 +333,6 @@ def _set_fixed_loudness_controls(
             for control in instrument.control_changes
             if int(control.number) not in (7, 11)
         ]
-        instrument.control_changes.extend(
-            [
-                pretty_midi.ControlChange(number=7, value=127, time=0.0),
-                pretty_midi.ControlChange(number=11, value=127, time=0.0),
-            ]
-        )
 
 
 def _merge_and_limit_instruments(
