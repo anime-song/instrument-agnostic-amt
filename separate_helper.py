@@ -7,7 +7,7 @@ import pretty_midi
 import torch
 
 import infer
-from instrument_classes import INSTRUMENT_CLASSES
+from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 from adtof_pytorch import transcribe_to_midi
@@ -16,7 +16,6 @@ import librosa
 import soundfile as sf
 import numpy as np
 
-from velocity_estimator import estimate_velocities_for_notes, apply_velocities_to_notes
 
 
 
@@ -211,7 +210,7 @@ def resolve_stem_model_type(stem_name):
     if "other" in stem_name:
         return "other"
     if "piano" in stem_name:
-        return "piano"
+        return "default"
     return "default"
 
 
@@ -304,7 +303,9 @@ def run_stem_separated_transcription(
     max_midi_melodic_instruments=15,
     transcribe_drum_stems=True,
     cleanup_separated_stems=False,
-    use_adtof_transcriber=False,
+    predict_velocity=True,
+    velocity_checkpoint_path=None,
+    use_adtof_transcriber=True,
     use_stft_vocalizer=False,
     use_transkun=False,
     merge_onset_ms=50.0,
@@ -440,6 +441,7 @@ def run_stem_separated_transcription(
         )
 
         # Estimate MIDI velocities from audio amplitude
+        '''
         if notes and not "drum" in stem_name.lower():
             waveform_np = waveform.cpu().numpy()
             estimated_velocities = estimate_velocities_for_notes(
@@ -449,8 +451,10 @@ def run_stem_separated_transcription(
                 fallback_velocity=100,
             )
             apply_velocities_to_notes(notes, estimated_velocities)
+        '''
 
-        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=MELODY_GAIN)
+        instrument_volumes = None if predict_velocity else dict(infer.DEFAULT_INSTRUMENT_VOLUMES)
+        midi = infer._build_midi(notes, sample_rate=current_amt_config.sample_rate, instrument_volumes=instrument_volumes)
         midi.write(str(output_midi))
         song_midi_paths.append(output_midi)
 
@@ -465,7 +469,36 @@ def run_stem_separated_transcription(
         max_melodic=max_midi_melodic_instruments,
     )
 
-    # 6. 必要なら中間の分離 wav を消して容量を節約する。
+    # 6. Velocity予測を実行し、MIDIノートの強弱を補正する。
+    if predict_velocity:
+        try:
+            print("Predicting note velocities from separated stems...")
+            from infer_velocity import predict_velocity_for_stem_midis
+
+            stem_midis_map = {
+                stem_name: stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
+                for stem_name in stems.keys()
+                if (stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid").exists()
+            }
+            velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
+            predict_velocity_for_stem_midis(
+                stem_midis=stem_midis_map,
+                stem_audios=stems,
+                output_midi_path=velocity_midi_path,
+                template_midi_path=merged_midi_path,
+                checkpoint_path=velocity_checkpoint_path,
+                device=device,
+                window_seconds=8.0,
+                max_melodic_instruments=max_midi_melodic_instruments,
+                disable_tqdm=True,
+            )
+            merged_midi_path = velocity_midi_path
+            print("Updated merged MIDI with predicted velocities:", merged_midi_path)
+        except Exception as err:
+            print(f"Warning: Velocity prediction skipped due to error: {err}")
+
+
+    # 7. 必要なら中間の分離 wav を消して容量を節約する。
     if cleanup_separated_stems:
         shutil.rmtree(stem_dir, ignore_errors=True)
 

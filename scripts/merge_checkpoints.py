@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from instrument_agnostic_amt.modeling.model import remap_legacy_v1_state_dict
+
 
 STATE_DICT_KEYS = ("ema_state_dict", "model_state_dict")
 OVERLAP_MERGE_KEYS = {
-    "instrument_classifier.weight",
-    "instrument_classifier.bias",
+    "head.instrument_classifier.weight",
+    "head.instrument_classifier.bias",
+    "head.interval_instrument_predictor.net.4.weight",
+    "head.interval_instrument_predictor.net.4.bias",
 }
 
 
@@ -29,12 +35,12 @@ def _select_inference_state_dict(
     for key in STATE_DICT_KEYS:
         state_dict = checkpoint.get(key)
         if isinstance(state_dict, Mapping):
-            return state_dict, key
+            return remap_legacy_v1_state_dict(state_dict), key
 
     if checkpoint and all(
         isinstance(value, torch.Tensor) for value in checkpoint.values()
     ):
-        return checkpoint, "raw_state_dict"
+        return remap_legacy_v1_state_dict(checkpoint), "raw_state_dict"
 
     raise ValueError("Checkpoint does not contain a model state dict")
 

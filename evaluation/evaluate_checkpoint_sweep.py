@@ -224,6 +224,10 @@ def main() -> None:
             tone_summary.update(summarize([row for row in rows if row["tone"] == tone]))
             tone_rows.append(tone_summary)
 
+    if args.baseline_epoch not in rows_by_epoch:
+        raise ValueError(
+            f"--baseline-epoch {args.baseline_epoch} is not included in --epochs"
+        )
     bootstrap_rows = bootstrap_vs_baseline(
         rows_by_epoch, args.baseline_epoch, args.bootstrap_samples, args.seed
     )
@@ -250,8 +254,12 @@ def main() -> None:
     )
     print("epoch train_loss COnPOff_micro COnPOff_macro COnP_micro COn_micro")
     for row in summary_rows:
+        train_loss = row["train_loss"]
+        train_loss_text = (
+            "n/a" if train_loss is None else f"{float(train_loss):.6f}"
+        )
         print(
-            f"{row['epoch']:>5} {row['train_loss']:.6f} "
+            f"{row['epoch']:>5} {train_loss_text:>10} "
             f"{row['conpoff_micro_f1']:.6f} {row['conpoff_macro_f1']:.6f} "
             f"{row['conp_micro_f1']:.6f} {row['con_micro_f1']:.6f}"
         )

@@ -25,7 +25,7 @@
 
 > **Video note**: The images above are clickable thumbnails. Click either one to watch the videos on YouTube.
 
-> **Colab tip**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) also includes an optional **stem-separated transcription** workflow: separate the song into stems, transcribe each stem, then merge the MIDI files. This often gives better results than transcribing the full mix directly, especially for dense arrangements with overlapping instruments.
+> **Colab tip**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) also includes an optional **stem-separated transcription** workflow: separate the song into stems, transcribe each stem, merge the MIDI files, then predict the velocity of each note from the separated audio. This often gives better results than transcribing the full mix directly, especially for dense arrangements with overlapping instruments. Velocity prediction is enabled by default in this workflow.
 
 ---
 
@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
 | 2026-07-22 | Added guitar model v1.5 (`--type guitar_v1_5`). The Colab stem-separated workflow now uses it by default for guitar stems. |
 | 2026-07-16 | 🐛 Fixed a bug in the data augmentation pipeline that caused note timing misalignment, then retrained the bass v2 model (`--type bass_v2`) after the fix. The retrained `bass_v2` improves note detection accuracy and fixes the issue where notes were over-segmented into multiple short notes. These improvements apply only to `bass_v2`. |
 | 2026-07-15 | 🎸 Added the updated bass model (`--type bass_v2`), with improved slap bass classification in the instrument classification output. |
@@ -68,6 +69,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 - 🎹 **Works with any instrument** — Piano, guitar, bass, vocals, strings, wind instruments, and more
 - 🧠 **Neural Semi-CRF + Pitch Slot** — Viterbi decoding finds globally optimal note intervals for each pitch, while Pitch Slots allow predicting overlapping notes of the same pitch.
 - 🎼 **HCQT features** — 5 harmonics × stereo 2ch Harmonic CQT captures rich pitch information
+- 🎚️ **Per-note velocity prediction** — A dedicated post-processing model estimates MIDI note dynamics from separated stem audio
 - 🔧 **Extensive data augmentation** — Stem mixing, IR reverb, EQ, noise injection, drum addition, and more
 - 🧪 **[Experimental] Instrument classification & multi-track output** — 33+ instrument class head for per-instrument MIDI tracks (accuracy still improving)
 
@@ -337,6 +339,28 @@ datasets:
     use_for_cross_aug: false  # Don't use for cross-stem mixing
 ```
 
+Use the optional `group` key when separate manifests contain stems rendered
+from the same songs:
+
+```yaml
+datasets:
+  - name: rendered_piano
+    group: single_stems
+    manifest: piano_stem_manifest.csv
+    allow_multi_stem_same_song: true
+
+  - name: rendered_strings
+    group: single_stems
+    manifest: strings_stem_manifest.csv
+    allow_multi_stem_same_song: true
+```
+
+Entries with the same `group` and CSV `song_name` share one virtual song.
+Consequently, `allow_multi_stem_same_song: true` can select stems across those
+manifests. Dataset weights, augmentation settings, and cross-augmentation
+eligibility remain per entry. Omitting `group` preserves the previous isolated
+behavior by using `name` as the group.
+
 ---
 
 ## Inference
@@ -355,11 +379,27 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 1. separates the uploaded song into stems,
 2. transcribes the separated stems individually,
-3. merges the per-stem MIDI files into one final MIDI.
+3. merges the per-stem MIDI files,
+4. predicts the velocity of each MIDI note from the corresponding separated stem audio.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
+
+Velocity prediction is enabled by default (`PREDICT_VELOCITY = True`). The velocity checkpoint, `best_velocity_model.pth`, is downloaded automatically from Hugging Face when needed, and the final file is written with a `_velocity.mid` suffix. Set `PREDICT_VELOCITY = False` in the notebook to skip this step.
+
+### Standalone velocity prediction
+
+The velocity model is a separate post-processing model from the AMT note-detection model. Given an existing MIDI file and its separated stem audio, it replaces fixed note velocities with dynamics predicted for each note. The original tracks, pitches, and Note On/Off timing are preserved.
+
+```bash
+python infer_velocity.py \
+  --midi output.mid \
+  --stems-dir separated_stems \
+  --output-midi output_velocity.mid
+```
+
+If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
 
 ### Additional options
 
@@ -381,7 +421,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: fine-tuned for guitar. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--amp` | `false` | Enable mixed precision inference |

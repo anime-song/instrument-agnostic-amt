@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+from bisect import bisect_right
+from concurrent.futures import ProcessPoolExecutor
 import logging
 import os
 import sys
@@ -16,7 +18,10 @@ import soundfile as sf
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent))
-from instrument_classes import get_instrument_class_id, get_instrument_class_id_by_name
+from instrument_agnostic_amt.taxonomy.instrument_classes import (
+    get_instrument_class_id,
+    get_instrument_class_id_by_name,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,6 +33,7 @@ TIMPANI_CLASS_ID = get_instrument_class_id_by_name("timpani")
 WIND_CHIMES_CLASS_ID = get_instrument_class_id_by_name("wind_chimes")
 LABEL_MODE_MELODIC = "melodic"
 LABEL_MODE_DRUM = "drum"
+LABEL_MODE_ALL = "all"
 MELODY_TRACK_KEYWORDS = ("vocal", "melody")
 VOCAL_HARMONY_TRACK_KEYWORDS = ("vocal_harmony", "harmony")
 DRUM_TRACK_KEYWORDS = ("drum",)
@@ -170,13 +176,13 @@ def load_pretty_midi_safely(mid_path: Path) -> pretty_midi.PrettyMIDI:
 
 
 def is_vocal_harmony_track(instrument: pretty_midi.Instrument) -> bool:
-    """MIDIトラック名に vocal_harmony または harmony が含まれるかを判定する。"""
+    """Return True when the MIDI track name looks like vocal harmony."""
     name = (instrument.name or "").lower()
     return any(keyword in name for keyword in VOCAL_HARMONY_TRACK_KEYWORDS)
 
 
 def is_melody_track(instrument: pretty_midi.Instrument) -> bool:
-    """MIDIトラック名に vocal / melody が含まれるかを判定する。ただし vocal_harmony は除外。"""
+    """Return True for vocal/melody tracks, excluding vocal_harmony tracks."""
     if is_vocal_harmony_track(instrument):
         return False
     name = (instrument.name or "").lower()
@@ -184,7 +190,7 @@ def is_melody_track(instrument: pretty_midi.Instrument) -> bool:
 
 
 def is_named_drum_track(instrument: pretty_midi.Instrument) -> bool:
-    """MIDIトラック名からドラム/打楽器トラックを判定する。"""
+    """Return True when a non-drum MIDI track is named like a drum/percussion track."""
     name = (instrument.name or "").strip().lower()
     return name in DRUM_TRACK_NAMES or any(
         keyword in name for keyword in DRUM_TRACK_KEYWORDS
@@ -204,7 +210,7 @@ def is_wind_chimes_track(instrument: pretty_midi.Instrument) -> bool:
 
 
 def get_drum_mode_class_id(instrument: pretty_midi.Instrument) -> int | None:
-    if instrument.is_drum:
+    if instrument.is_drum or is_named_drum_track(instrument):
         return DRUM_CLASS_ID
     if is_timpani_track(instrument):
         return TIMPANI_CLASS_ID
@@ -215,12 +221,12 @@ def get_drum_mode_class_id(instrument: pretty_midi.Instrument) -> int | None:
 
 def is_excluded_instrument(instrument: pretty_midi.Instrument) -> bool:
     """
-    ドラム、または音高ラベルとして扱いにくいGM音色を除外する。
+    Exclude drum-like tracks and GM programs that should not be used as melodic labels.
 
-    除外対象:
-      - is_drum == True (通常MIDI Channel 10)
-      - トラック名が percussion
-      - トラック名に drum を含む
+    Excluded:
+      - is_drum == True (usually MIDI channel 10)
+      - track name is exactly percussion
+      - track name contains drum
       - Timpani (47)
       - Synth Effects Family (96-103)
       - Percussive Family (112-119)
@@ -251,11 +257,11 @@ def process_stem(
     drum_note_duration_ms: int = 80,
 ) -> dict[str, Any] | None:
     """
-    1つの音声ステムを処理し、MIDI由来のノート配列をnpzに保存する。
+    Process one audio stem and save MIDI-derived note arrays to an NPZ file.
 
-    MIDIがない場合、または有効なノートがない場合も、空のラベルnpzを出力する。
-    トラック名に vocal / melody が含まれるトラックは、GM programに関係なく
-    追加クラス melody として保存する。
+    If MIDI is missing, or no usable notes are found, an empty label NPZ is still
+    written. Tracks whose names contain vocal/melody are assigned to the special
+    melody class regardless of their GM program.
     """
     midi_data = None
     if mid_path is not None and mid_path.exists():
@@ -272,23 +278,27 @@ def process_stem(
 
     if midi_data is not None:
         for instrument in midi_data.instruments:
-            if label_mode == LABEL_MODE_DRUM:
+            if label_mode in (LABEL_MODE_DRUM, LABEL_MODE_ALL):
                 inst_id = get_drum_mode_class_id(instrument)
-                if inst_id is None:
+                if inst_id is not None:
+                    use_fixed_duration = instrument.is_drum or is_named_drum_track(
+                        instrument
+                    )
+                    for note in sorted(instrument.notes, key=lambda x: x.start):
+                        start_ms = int(round(note.start * 1000.0))
+                        if use_fixed_duration:
+                            end_ms = start_ms + int(drum_note_duration_ms)
+                        else:
+                            end_ms = int(round(note.end * 1000.0))
+                        all_start_ms.append(start_ms)
+                        all_end_ms.append(max(end_ms, start_ms + 1))
+                        all_pitch.append(note.pitch)
+                        all_velocity.append(note.velocity)
+                        all_instrument_id.append(inst_id)
                     continue
 
-                for note in sorted(instrument.notes, key=lambda x: x.start):
-                    start_ms = int(round(note.start * 1000.0))
-                    if instrument.is_drum:
-                        end_ms = start_ms + int(drum_note_duration_ms)
-                    else:
-                        end_ms = int(round(note.end * 1000.0))
-                    all_start_ms.append(start_ms)
-                    all_end_ms.append(max(end_ms, start_ms + 1))
-                    all_pitch.append(note.pitch)
-                    all_velocity.append(note.velocity)
-                    all_instrument_id.append(inst_id)
-                continue
+                if label_mode == LABEL_MODE_DRUM:
+                    continue
 
             is_harmony = is_vocal_harmony_track(instrument)
             is_named_melody = is_melody_track(instrument)
@@ -299,8 +309,8 @@ def process_stem(
             ):
                 continue
 
-            # vocal/melody/vocal_harmony と明示されたトラックは、元のGM音色よりトラック名を優先する。
-            # これにより、Voice/Flute/Synthなどに分散していたメロディを1クラスに集約できる。
+            # Track-name hints take precedence over GM programs for
+            # vocal/melody/vocal_harmony labels.
             if is_harmony:
                 inst_id = VOCAL_HARMONY_CLASS_ID
             elif is_named_melody:
@@ -310,7 +320,7 @@ def process_stem(
                     instrument.program, instrument.is_drum
                 )
 
-            # CC64 sustain pedal をノート終端へ反映する。
+            # Extend note ends through CC64 sustain pedal intervals.
             pedal_events = [cc for cc in instrument.control_changes if cc.number == 64]
             pedal_intervals = []
             current_pedal_on = None
@@ -327,20 +337,24 @@ def process_stem(
             notes = sorted(instrument.notes, key=lambda x: x.start)
             max_original_end = max((n.end for n in notes), default=0.0)
 
+            pedal_starts = [start for start, _ in pedal_intervals]
             extended_ends = []
             for note in notes:
                 new_end = note.end
-                for p_start, p_end in pedal_intervals:
+                pedal_index = bisect_right(pedal_starts, note.end) - 1
+                if pedal_index >= 0:
+                    p_start, p_end = pedal_intervals[pedal_index]
                     if p_start <= note.end < p_end:
                         new_end = p_end
-                        break
                 extended_ends.append(new_end)
 
-            # 同じ pitch の重複ノートは、次の onset 直前で前ノートを切る。
-            for pitch in range(128):
-                pitch_indices = [
-                    i for i, note in enumerate(notes) if note.pitch == pitch
-                ]
+            # For repeated notes of the same pitch, trim each note at the next onset.
+            pitch_indices_by_pitch: dict[int, list[int]] = {}
+            for note_index, note in enumerate(notes):
+                pitch_indices_by_pitch.setdefault(int(note.pitch), []).append(
+                    note_index
+                )
+            for pitch_indices in pitch_indices_by_pitch.values():
                 for i in range(len(pitch_indices) - 1):
                     idx = pitch_indices[i]
                     next_idx = pitch_indices[i + 1]
@@ -367,7 +381,7 @@ def process_stem(
         note_count = 0
         end_note_ms = 0
     else:
-        # Numpy array に変換し、開始時刻でソートする。
+        # Convert to numpy arrays and sort by onset time.
         start_ms = np.array(all_start_ms, dtype=np.int64)
         end_ms = np.array(all_end_ms, dtype=np.int64)
         pitch = np.array(all_pitch, dtype=np.int16)
@@ -384,7 +398,7 @@ def process_stem(
         note_count = len(start_ms)
         end_note_ms = int(np.max(end_ms))
 
-    # NPZに保存する。
+    # Save note labels to NPZ.
     npz_path = npz_dir / f"{wav_path.stem}.npz"
     np.savez_compressed(
         npz_path,
@@ -395,7 +409,7 @@ def process_stem(
         note_instrument=instrument_ids,
     )
 
-    # 音声の長さを取得する。
+    # Read audio duration.
     try:
         info = sf.info(str(wav_path))
         sample_rate = int(info.samplerate)
@@ -404,9 +418,9 @@ def process_stem(
         logger.warning(f"Failed to read audio info for {wav_path}: {e}")
         return None
 
-    # song_name は "__" より前の部分を使う。
-    # ピッチシフト / タイムストレッチ / swing のサフィックスがある場合は、
-    # 元データとは別曲扱いになるよう song_name にも付加する。
+    # Use the part before "__" as song_name.
+    # Keep pitch/stretch/swing suffixes in song_name so augmented variants are
+    # sampled independently from their original stems.
     import re
 
     stem_name = wav_path.stem
@@ -427,6 +441,20 @@ def process_stem(
         "note_count": note_count,
         "sample_rate": sample_rate,
     }
+
+
+def process_stem_task(
+    task: tuple[Path | None, Path, Path, Path, str, int],
+) -> dict[str, Any] | None:
+    mid_path, wav_path, npz_dir, manifest_dir, label_mode, drum_note_duration_ms = task
+    return process_stem(
+        mid_path,
+        wav_path,
+        npz_dir,
+        manifest_dir,
+        label_mode=label_mode,
+        drum_note_duration_ms=drum_note_duration_ms,
+    )
 
 
 def main():
@@ -458,23 +486,34 @@ def main():
     parser.add_argument(
         "--require-midi",
         action="store_true",
-        help="MIDIファイルが存在するステムのみをマニフェストに含める",
+        help="Only include stems that have a matching MIDI file.",
     )
     parser.add_argument(
         "--label-mode",
-        choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM),
+        choices=(LABEL_MODE_MELODIC, LABEL_MODE_DRUM, LABEL_MODE_ALL),
         default=LABEL_MODE_MELODIC,
-        help="Label extraction mode. Use 'drum' to keep drum tracks plus supported percussion classes.",
+        help=(
+            "Label extraction mode. Use 'all' for melodic plus drums/percussion; "
+            "use 'drum' for drums/percussion only."
+        ),
     )
     parser.add_argument(
         "--drum-note-duration-ms",
         type=int,
         default=80,
-        help="Fixed label duration for drum notes in --label-mode drum.",
+        help="Fixed label duration for drum notes in --label-mode drum/all.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes for MIDI/audio metadata extraction.",
     )
     args = parser.parse_args()
     if args.drum_note_duration_ms <= 0:
         raise ValueError("--drum-note-duration-ms must be positive")
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
 
     midis_dir = args.midis_dir.resolve()
     stems_dir = args.stems_dir.resolve()
@@ -492,29 +531,47 @@ def main():
     wav_files = list(stems_dir.glob("*.wav")) + list(stems_dir.glob("*.flac"))
     logger.info(f"Found {len(wav_files)} audio files.")
 
-    rows = []
+    tasks: list[tuple[Path | None, Path, Path, Path, str, int]] = []
     skipped_no_midi = 0
-    for wav_path in tqdm(wav_files, desc="Processing stems"):
+    for wav_path in wav_files:
         mid_path = midis_dir / f"{wav_path.stem}.mid"
         if not mid_path.exists():
             mid_path = midis_dir / f"{wav_path.stem}.midi"
         target_mid_path = mid_path if mid_path.exists() else None
 
-        # --require-midi: MIDIがないステムはスキップする
+        # --require-midi skips stems without MIDI.
         if args.require_midi and target_mid_path is None:
             skipped_no_midi += 1
             continue
 
-        row = process_stem(
-            target_mid_path,
-            wav_path,
-            npz_dir,
-            manifest_path.parent,
-            label_mode=args.label_mode,
-            drum_note_duration_ms=args.drum_note_duration_ms,
+        tasks.append(
+            (
+                target_mid_path,
+                wav_path,
+                npz_dir,
+                manifest_path.parent,
+                args.label_mode,
+                args.drum_note_duration_ms,
+            )
         )
-        if row:
-            rows.append(row)
+
+    rows = []
+    if args.workers == 1 or len(tasks) <= 1:
+        row_iter = (process_stem_task(task) for task in tasks)
+        for row in tqdm(row_iter, total=len(tasks), desc="Processing stems"):
+            if row:
+                rows.append(row)
+    else:
+        worker_count = min(args.workers, len(tasks))
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            row_iter = executor.map(process_stem_task, tasks, chunksize=8)
+            for row in tqdm(
+                row_iter,
+                total=len(tasks),
+                desc=f"Processing stems ({worker_count} workers)",
+            ):
+                if row:
+                    rows.append(row)
 
     if skipped_no_midi > 0:
         logger.info(f"Skipped {skipped_no_midi} stems without MIDI (--require-midi)")
@@ -523,7 +580,7 @@ def main():
         logger.warning("No valid stems were processed.")
         return
 
-    # マニフェストCSVを書き出す。
+    # Write manifest CSV.
     fieldnames = [
         "song_name",
         "stem_name",

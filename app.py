@@ -52,16 +52,13 @@ class TranskunTranscriber(BaseTranscriber):
             window_batch_size=WINDOW_BATCH_SIZE,
             max_midi_melodic_instruments=MAX_MIDI_MELODIC_INSTRUMENTS,
             cleanup_separated_stems=CLEANUP_SEPARATED_STEMS,
-            merge_onset_ms=MERGE_ONSET_MS,
-            use_adtof_transcriber=True,
-            use_stft_vocalizer=False,
-            use_transkun=True
+            merge_onset_ms=MERGE_ONSET_MS
         )
         merged_midi_path = Path(stem_pipeline_result["merged_midi_path"])
 
         # Move the merged MIDI file to the audio file's directory
         audio_dir = Path(input_path).parent
-        new_midi_path = Path(output_folder) / merged_midi_path.name
+        new_midi_path = Path(output_folder) / str(merged_midi_path.name).replace("_velocity", "")
         shutil.move(merged_midi_path, new_midi_path)
 
     async def transcribe(self, input_path: str, output_folder: str):
