@@ -307,7 +307,7 @@ def run_stem_separated_transcription(
     use_adtof_transcriber=False,
     use_stft_vocalizer=False,
     use_transkun=False,
-    merge_onset_ms=20.0,
+    merge_onset_ms=50.0,
 ):
     """ステム分離 -> 各ステム採譜 -> MIDI マージを 1 回で実行する。"""
     audio_file = Path(audio_path)
