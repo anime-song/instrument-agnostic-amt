@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import json
+from typing import Optional
 
 OUTPUT_ROOT = "U:"  # @param {type:"string"}
 WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
@@ -40,7 +41,7 @@ class BaseTranscriber:
         raise NotImplementedError("transcribe() must be implemented")
 
 # ---- 具体实现：TranskunTranscriber ----
-from separate_helper import run_stem_separated_transcription
+from infer_stem import run_stem_separated_transcription
 
 class TranskunTranscriber(BaseTranscriber):
 
@@ -52,13 +53,14 @@ class TranskunTranscriber(BaseTranscriber):
             window_batch_size=WINDOW_BATCH_SIZE,
             max_midi_melodic_instruments=MAX_MIDI_MELODIC_INSTRUMENTS,
             cleanup_separated_stems=CLEANUP_SEPARATED_STEMS,
-            merge_onset_ms=MERGE_ONSET_MS
+            merge_onset_ms=MERGE_ONSET_MS,
+            predict_beat_chord=True
         )
         merged_midi_path = Path(stem_pipeline_result["merged_midi_path"])
 
         # Move the merged MIDI file to the audio file's directory
         audio_dir = Path(input_path).parent
-        new_midi_path = Path(output_folder) / str(merged_midi_path.name).replace("_velocity", "")
+        new_midi_path = Path(output_folder) / merged_midi_path.name
         shutil.move(merged_midi_path, new_midi_path)
 
     async def transcribe(self, input_path: str, output_folder: str):

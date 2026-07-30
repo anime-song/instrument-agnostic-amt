@@ -15,6 +15,7 @@ import torch
 import infer
 from infer_beat_chord import predict_beat_chord_for_midi
 from infer_velocity import predict_velocity_for_stem_midis
+from whisper_lyrics import add_whisper_lyrics_to_vocals_midi
 from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
@@ -109,6 +110,18 @@ def merge_midis_logic(
         instrument.notes.sort(key=lambda note: note.start)
         instrument.control_changes.sort(key=lambda change: change.time)
         instrument.pitch_bends.sort(key=lambda pitch_bend: pitch_bend.time)
+
+    # 收集 lyrics（来自 vocals stem 的歌词）
+    merged_lyrics: list[tuple[str, float]] = []
+    for path in midi_paths:
+        lmidi = pretty_midi.PrettyMIDI(str(path))
+        for l in lmidi.lyrics:
+            merged_lyrics.append((l.text, l.time))
+    if merged_lyrics:
+        merged_lyrics.sort(key=lambda x: x[1])
+        from pretty_midi import Lyric
+        master_midi.lyrics = [Lyric(text=t, time=s) for t, s in merged_lyrics]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     master_midi.write(str(output_path))
 
@@ -267,6 +280,8 @@ def run_stem_separated_transcription(
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     merge_onset_ms: float = 20.0,
+    transcribe_lyrics: bool = False,
+    whisper_lyrics_language: str | None = None,
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
     audio_file = Path(audio_path)
@@ -384,6 +399,19 @@ def run_stem_separated_transcription(
         )
         midi.write(str(output_midi))
         song_midi_paths.append(output_midi)
+
+        # ── Whisper word-level lyrics for vocals stem ──
+        if "vocal" in stem_name.lower() and transcribe_lyrics:
+            try:
+                print(f"[WhisperLyrics] Running whisper on {stem_name} ...")
+                add_whisper_lyrics_to_vocals_midi(
+                    vocals_wav_path=stem_path,
+                    stem_midi_path=output_midi,
+                    language=whisper_lyrics_language,
+                    target_track_name="vocals",
+                )
+            except Exception as e:
+                print(f"[WhisperLyrics] WARNING: lyrics insertion failed: {e}")
 
     if not song_midi_paths:
         raise RuntimeError("No stem MIDI files were generated")
