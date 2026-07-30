@@ -287,11 +287,11 @@ def test_optional_chord_romanizer_respects_the_predicted_key(monkeypatch) -> Non
     assert status == "applied"
     assert FakeRomanizer.options == [("Bb", True)]
     assert fixed[0]["chord"] == "Eb:M7/F"
-    assert fixed[0]["combined_label"] == "Eb:M7/F [IVM7|PD]"
+    assert fixed[0]["combined_label"] == "Eb:M7/F"
     assert fixed[0]["root_chord"] == "Eb:M7"
     assert fixed[0]["bass"] == "F"
     assert fixed[1]["chord"] == "F:7"
-    assert fixed[1]["combined_label"] == "F:7 [V7|D]"
+    assert fixed[1]["combined_label"] == "F:7"
 
 
 def test_missing_chord_romanizer_keeps_original_symbols(monkeypatch) -> None:

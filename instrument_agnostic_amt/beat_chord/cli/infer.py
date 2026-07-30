@@ -1,3 +1,4 @@
+import dataclasses
 import argparse
 import json
 import math
@@ -33,6 +34,508 @@ from ..decoding.legacy_grid import (
 )
 from ..midi_roll import MidiFrameLoader, MidiFrameLoaderConfig
 from ..tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
+
+
+HF_CHECKPOINT_BASE_URL = (
+    "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
+)
+DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME = "best_beat_chord_key.pth"
+
+
+def ensure_beat_chord_checkpoint(
+    checkpoint_path: Path | str | None = None,
+) -> Path:
+    """指定された checkpoint パスを確保し、存在しない場合は Hugging Face からダウンロードする。"""
+    if checkpoint_path is not None:
+        target_path = Path(checkpoint_path).resolve()
+    else:
+        candidates = [
+            Path("beat_chord_checkpoints") / DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME,
+            Path("checkpoints") / DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME,
+            Path("beat_chord_checkpoints") / "midi_frame" / DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME,
+        ]
+        target_path = candidates[0]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+
+    if not target_path.exists():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{HF_CHECKPOINT_BASE_URL}/{DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME}?download=true"
+        print(f"Beat/chord checkpoint not found at {target_path}. Downloading from Hugging Face...")
+        torch.hub.download_url_to_file(url, str(target_path))
+
+    return target_path.resolve()
+
+
+def load_beat_chord_model(
+    checkpoint_path: Path | str,
+    device: torch.device | str = "cpu",
+    meter_classes_json: Path | str | None = None,
+) -> tuple[MidiFrameBeatChordModel, MidiFrameModelConfig, dict[str, object]]:
+    """チェックポイントから beat_chord モデルと設定、関連メタデータをロードする。"""
+    device_obj = torch.device(device)
+    checkpoint_file = Path(checkpoint_path).resolve()
+    if not checkpoint_file.exists():
+        raise FileNotFoundError(f"Beat/chord checkpoint not found: {checkpoint_file}")
+
+    checkpoint = torch.load(checkpoint_file, map_location=device_obj, weights_only=False)
+    model_config_dict = checkpoint["model_config"]
+    model_config = MidiFrameModelConfig(**model_config_dict)
+
+    meter_json_path = Path(meter_classes_json).resolve() if meter_classes_json else None
+    meter_classes = load_meter_classes(
+        checkpoint=checkpoint,
+        model_config=model_config,
+        meter_classes_json=meter_json_path,
+    )
+
+    quality_map = load_chord_quality_map(
+        checkpoint=checkpoint,
+        model_config=model_config,
+        quality_json=None,
+    )
+
+    model = MidiFrameBeatChordModel(model_config).to(device_obj)
+    state_dict = checkpoint.get("ema_state_dict", checkpoint.get("model_state_dict"))
+    if state_dict is None:
+        state_dict = checkpoint
+    has_major_grouping_head = state_dict_has_major_grouping_head(state_dict)
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+
+    legacy_config = checkpoint.get("config", {})
+    legacy_args = (
+        legacy_config.get("args", {}) if isinstance(legacy_config, Mapping) else {}
+    )
+    checkpoint_args = dict(legacy_args) if isinstance(legacy_args, Mapping) else {}
+    inference_config = checkpoint.get("inference_config", {})
+    if isinstance(inference_config, Mapping):
+        checkpoint_args.update(inference_config)
+
+    metadata = {
+        "checkpoint": checkpoint,
+        "meter_classes": meter_classes,
+        "quality_map": quality_map,
+        "has_major_grouping_head": has_major_grouping_head,
+        "checkpoint_args": checkpoint_args,
+    }
+    return model, model_config, metadata
+
+
+
+@dataclasses.dataclass
+class BeatChordInferenceConfig:
+    device: torch.device
+    window_ms_override: int | None = None
+    stride_ms_override: int | None = None
+    beat_decode_mode: str = "grid"
+    beat_threshold: float = 0.5
+    downbeat_threshold: float = 0.5
+    grid_tolerance_frames: int = 2
+    meter_score_weight: float = 1.0
+    beat_grid_score_weight: float = 1.0
+    grid_downbeat_candidate_threshold: float = 0.15
+    grid_beat_candidate_threshold: float = 0.35
+    grid_max_bar_count: int = 4
+    grid_beam_size: int = 24
+    grid_jit: bool = False
+    group_boundary_score_weight: float = 0.5
+    grid_false_group_boundary_weight: float = 0.25
+    grid_downbeat_score_weight: float = 1.5
+    grid_false_downbeat_weight: float = 0.75
+    grid_segment_penalty: float = 0.25
+    grid_additive_meter_penalty: float = 0.35
+    grid_tempo_transition_weight: float = 2.0
+    grid_meter_change_penalty: float = 12.0
+    grid_short_meter_run_penalty: float = 8.5
+    grid_minimum_meter_run_quarter_notes: float = 4.0
+    grid_octave_jump_penalty: float = 2.0
+    grid_min_bpm: float = 30.0
+    grid_max_bpm: float = 300.0
+    chord_boundary_threshold: float = 0.5
+    chord_boundary_min_distance_frames: int = 5
+    key_boundary_threshold: float = 0.5
+    key_boundary_min_distance_frames: int = 5
+    key_boundary_js_weight: float = 0.0
+    key_boundary_js_context_seconds: float = 3.0
+    key_boundary_js_gap_seconds: float = 0.25
+    disable_tqdm: bool = False
+    meter_classes_json: Path | None = None
+    quality_json: Path | None = None
+    beat_decoder_cache_path: Path | None = None
+    beat_mapped_ticks_per_beat: int = 480
+
+@dataclasses.dataclass
+class BeatChordInferenceResult:
+    beat_times: list[float]
+    downbeat_times: list[float]
+    mapped_downbeat_times: list[float]
+    meter_segments: list[MeterGridSegment] | list[MeterSegmentSpec]
+    chord_segments: list[dict[str, object]]
+    key_segments: list[dict[str, object]]
+    chord_romanizer_status: str
+    duration_seconds: float
+    decoder_diagnostics: dict[str, object]
+    beat_probabilities: np.ndarray | None = None
+    downbeat_probabilities: np.ndarray | None = None
+    group_boundary_probabilities: np.ndarray | None = None
+    meter_logits: np.ndarray | None = None
+    hop_length: int = 0
+    sample_rate: int = 0
+    meter_classes: list[tuple[int, int]] | None = None
+
+
+def run_beat_chord_inference(
+    midi_path: Path | str,
+    checkpoint: dict,
+    model: torch.nn.Module,
+    model_config: MidiFrameModelConfig,
+    metadata: dict,
+    config: BeatChordInferenceConfig,
+) -> BeatChordInferenceResult:
+    midi_file = Path(midi_path).resolve()
+    device = config.device
+    
+    meter_classes = metadata["meter_classes"]
+    quality_map = metadata["quality_map"]
+    has_major_grouping_head = metadata["has_major_grouping_head"]
+    checkpoint_args = metadata["checkpoint_args"]
+    
+    beat_decode_mode = config.beat_decode_mode
+    if beat_decode_mode in {"grid", "grid_legacy"} and meter_classes is None:
+        beat_decode_mode = "peaks"
+
+    window_ms, stride_ms = resolve_inference_window_settings(
+        window_ms_override=config.window_ms_override,
+        stride_ms_override=config.stride_ms_override,
+        checkpoint_args=checkpoint_args,
+    )
+
+    sample_rate = model_config.sample_rate
+    hop_length = model_config.hop_length
+    window_frames = int(round(window_ms * sample_rate / 1000.0))
+    model_frames = math.ceil(window_frames / hop_length)
+
+    midi_data = pretty_midi.PrettyMIDI(str(midi_file))
+    duration_seconds = midi_data.get_end_time()
+
+    loader_config = MidiFrameLoaderConfig(
+        midi_dir=midi_file.parent,
+        sample_rate=sample_rate,
+        hop_length=hop_length,
+        pitch_min=model_config.pitch_min,
+        pitch_max=model_config.pitch_max,
+        num_channels=model_config.num_input_channels,
+    )
+    loader = SingleMidiFrameLoader(loader_config, midi_file)
+
+    total_frames = math.ceil(duration_seconds * sample_rate / hop_length)
+    buffer_size = max(total_frames, model_frames) + model_frames
+
+    beat_probabilities_accum = torch.zeros(buffer_size)
+    downbeat_probabilities_accum = torch.zeros(buffer_size)
+    group_boundary_probabilities_accum = torch.zeros(buffer_size)
+    meter_logits_accum = torch.zeros(buffer_size, model_config.num_meter_classes)
+    chord_logits_accum = torch.zeros(buffer_size, model_config.num_root_chord_classes)
+    chord_boundary_probabilities_accum = torch.zeros(buffer_size)
+    bass_logits_accum = torch.zeros(buffer_size, 13)
+    key_boundary_probabilities_accum = torch.zeros(buffer_size)
+    key_logits_accum = torch.zeros(buffer_size, 13)
+    weight_accum = torch.zeros(buffer_size)
+
+    start_seconds = 0.0
+    stride_seconds = stride_ms / 1000.0
+
+    while start_seconds < duration_seconds:
+        start_frame = int(round(start_seconds * sample_rate / hop_length))
+        try:
+            roll = loader.load_window(
+                song_name="", window_start_sec=start_seconds, num_frames=model_frames
+            )
+        except Exception:
+            start_seconds += stride_seconds
+            continue
+
+        roll = roll.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            outputs = model(roll, include_beat=True, include_chord=True)
+
+            beat_prob = torch.sigmoid(outputs["beat_logits"]).squeeze(0).cpu()
+            downbeat_prob = torch.sigmoid(outputs["downbeat_logits"]).squeeze(0).cpu()
+            group_boundary_prob = (
+                torch.sigmoid(outputs["group_boundary_logits"]).squeeze(0).cpu()
+            )
+            meter_logits = outputs["meter_logits"].squeeze(0).cpu()
+            chord_logits = outputs["root_chord_logits"].squeeze(0).cpu()
+            chord_boundary_prob = (
+                torch.sigmoid(outputs["chord_boundary_logits"]).squeeze(0).cpu()
+            )
+            bass_logits = outputs["bass_logits"].squeeze(0).cpu()
+            key_boundary_prob = (
+                torch.sigmoid(outputs["key_boundary_logits"]).squeeze(0).cpu()
+            )
+            key_logits = outputs["key_logits"].squeeze(0).cpu()
+
+        chord_boundary_probabilities_accum[
+            start_frame : start_frame + model_frames
+        ] += chord_boundary_prob
+        bass_logits_accum[start_frame : start_frame + model_frames] += bass_logits
+        key_boundary_probabilities_accum[start_frame : start_frame + model_frames] += key_boundary_prob
+        key_logits_accum[start_frame : start_frame + model_frames] += key_logits
+        beat_probabilities_accum[start_frame : start_frame + model_frames] += beat_prob
+        downbeat_probabilities_accum[start_frame : start_frame + model_frames] += downbeat_prob
+        group_boundary_probabilities_accum[
+            start_frame : start_frame + model_frames
+        ] += group_boundary_prob
+        meter_logits_accum[start_frame : start_frame + model_frames] += meter_logits
+        chord_logits_accum[start_frame : start_frame + model_frames] += chord_logits
+        weight_accum[start_frame : start_frame + model_frames] += 1.0
+
+        start_seconds += stride_seconds
+
+    active_mask = weight_accum > 0
+    beat_probabilities_accum[active_mask] /= weight_accum[active_mask]
+    downbeat_probabilities_accum[active_mask] /= weight_accum[active_mask]
+    group_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
+    meter_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
+    chord_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
+    chord_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
+    bass_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
+    key_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
+    key_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
+
+    beat_probabilities_accum = beat_probabilities_accum[:total_frames]
+    downbeat_probabilities_accum = downbeat_probabilities_accum[:total_frames]
+    group_boundary_probabilities_accum = group_boundary_probabilities_accum[:total_frames]
+    meter_logits_accum = meter_logits_accum[:total_frames]
+    chord_logits_accum = chord_logits_accum[:total_frames]
+    chord_boundary_probabilities_accum = chord_boundary_probabilities_accum[:total_frames]
+    bass_logits_accum = bass_logits_accum[:total_frames]
+    key_boundary_probabilities_accum = key_boundary_probabilities_accum[:total_frames]
+    key_logits_accum = key_logits_accum[:total_frames]
+
+    beat_probabilities_numpy = beat_probabilities_accum.numpy()
+    downbeat_probabilities_numpy = downbeat_probabilities_accum.numpy()
+    group_boundary_probabilities_numpy = (
+        group_boundary_probabilities_accum.numpy() if has_major_grouping_head else None
+    )
+    meter_logits_numpy = meter_logits_accum.numpy()
+
+    raw_downbeat_frame_indices = detect_peaks(downbeat_probabilities_numpy, threshold=config.downbeat_threshold)
+    downbeat_frame_indices = list(raw_downbeat_frame_indices)
+
+    meter_segments = []
+    decoder_diagnostics = {}
+    
+    if beat_decode_mode == "grid" and meter_classes is not None:
+        dp_config = BeatGridDPConfig(
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+            tolerance_frames=config.grid_tolerance_frames,
+            downbeat_candidate_threshold=config.grid_downbeat_candidate_threshold,
+            beat_candidate_threshold=config.grid_beat_candidate_threshold,
+            max_bar_count=config.grid_max_bar_count,
+            beam_size=config.grid_beam_size,
+            use_jit_grid=config.grid_jit,
+            min_quarter_bpm=config.grid_min_bpm,
+            max_quarter_bpm=config.grid_max_bpm,
+            beat_score_weight=config.beat_grid_score_weight,
+            downbeat_score_weight=config.grid_downbeat_score_weight,
+            false_downbeat_weight=config.grid_false_downbeat_weight,
+            meter_score_weight=config.meter_score_weight,
+            group_boundary_score_weight=config.group_boundary_score_weight,
+            false_group_boundary_weight=config.grid_false_group_boundary_weight,
+            additive_meter_penalty=config.grid_additive_meter_penalty,
+            segment_penalty=config.grid_segment_penalty,
+            tempo_transition_weight=config.grid_tempo_transition_weight,
+            meter_change_penalty=config.grid_meter_change_penalty,
+            short_meter_run_penalty=config.grid_short_meter_run_penalty,
+            minimum_meter_run_quarter_notes=config.grid_minimum_meter_run_quarter_notes,
+            octave_jump_penalty=config.grid_octave_jump_penalty,
+        )
+        beat_grid_result = decode_beats_with_meter_grid_dp(
+            beat_probabilities=beat_probabilities_numpy,
+            downbeat_probabilities=downbeat_probabilities_numpy,
+            group_boundary_probabilities=group_boundary_probabilities_numpy,
+            meter_logits=meter_logits_numpy,
+            meter_classes=meter_classes,
+            config=dp_config,
+        )
+        decoder_diagnostics = result_to_diagnostics(beat_grid_result)
+        if beat_grid_result.beat_frames:
+            beat_frame_indices = list(beat_grid_result.beat_frames)
+            downbeat_frame_indices = list(beat_grid_result.downbeat_frames)
+            meter_segments = list(beat_grid_result.meter_segments)
+        else:
+            beat_decode_mode = "grid_legacy"
+            
+    if beat_decode_mode == "grid_legacy" and meter_classes is not None:
+        beat_frame_indices, meter_segments = decode_beats_with_meter_grid(
+            beat_probabilities=beat_probabilities_numpy,
+            downbeat_frames=downbeat_frame_indices,
+            meter_logits=meter_logits_numpy,
+            meter_classes=meter_classes,
+            tolerance_frames=config.grid_tolerance_frames,
+            meter_score_weight=config.meter_score_weight,
+            beat_grid_score_weight=config.beat_grid_score_weight,
+        )
+        if not beat_frame_indices:
+            beat_decode_mode = "peaks"
+            
+    if beat_decode_mode == "peaks":
+        beat_frame_indices = detect_peaks(beat_probabilities_numpy, threshold=config.beat_threshold)
+        meter_segments = []
+
+    beat_times = [float(f * hop_length / sample_rate) for f in beat_frame_indices]
+    downbeat_times = [float(f * hop_length / sample_rate) for f in downbeat_frame_indices]
+    
+    mapped_downbeat_frame_indices = sorted(
+        {
+            frame
+            for segment in meter_segments
+            for frame in segment.mapped_downbeat_frames
+        }
+    )
+    if meter_segments:
+        mapped_downbeat_frame_indices.append(int(meter_segments[-1].end_frame))
+        mapped_downbeat_frame_indices = sorted(set(mapped_downbeat_frame_indices))
+    elif downbeat_frame_indices:
+        mapped_downbeat_frame_indices = list(downbeat_frame_indices)
+    mapped_downbeat_times = [
+        float(frame * hop_length / sample_rate)
+        for frame in mapped_downbeat_frame_indices
+    ]
+
+    seconds_per_frame = hop_length / sample_rate
+    chord_segments = decode_chord_segments(
+        chord_logits=chord_logits_accum.numpy(),
+        bass_logits=bass_logits_accum.numpy(),
+        boundary_probabilities=chord_boundary_probabilities_accum.numpy(),
+        quality_map=quality_map,
+        seconds_per_frame=seconds_per_frame,
+        duration_seconds=duration_seconds,
+        boundary_threshold=config.chord_boundary_threshold,
+        minimum_boundary_distance_frames=config.chord_boundary_min_distance_frames,
+    )
+    key_segments = decode_key_segments(
+        key_logits=key_logits_accum.numpy(),
+        boundary_probabilities=key_boundary_probabilities_accum.numpy(),
+        seconds_per_frame=seconds_per_frame,
+        duration_seconds=duration_seconds,
+        boundary_threshold=config.key_boundary_threshold,
+        minimum_boundary_distance_frames=config.key_boundary_min_distance_frames,
+        js_weight=config.key_boundary_js_weight,
+        js_context_seconds=config.key_boundary_js_context_seconds,
+        js_gap_seconds=config.key_boundary_js_gap_seconds,
+    )
+    
+    chord_segments, chord_romanizer_status = respell_chord_segments_with_romanizer(
+        chord_segments,
+        key_segments,
+    )
+
+    return BeatChordInferenceResult(
+        beat_times=beat_times,
+        downbeat_times=downbeat_times,
+        mapped_downbeat_times=mapped_downbeat_times,
+        meter_segments=meter_segments,
+        chord_segments=chord_segments,
+        key_segments=key_segments,
+        chord_romanizer_status=chord_romanizer_status,
+        duration_seconds=duration_seconds,
+        decoder_diagnostics=decoder_diagnostics,
+        beat_probabilities=beat_probabilities_numpy,
+        downbeat_probabilities=downbeat_probabilities_numpy,
+        group_boundary_probabilities=group_boundary_probabilities_numpy,
+        meter_logits=meter_logits_numpy,
+        hop_length=hop_length,
+        sample_rate=sample_rate,
+        meter_classes=meter_classes,
+    )
+
+
+def predict_beat_chord_for_midi(
+    input_midi_path: Path | str,
+    output_midi_path: Path | str | None = None,
+    *,
+    checkpoint_path: Path | str | None = None,
+    device: torch.device | str | None = None,
+    beat_decode_mode: str = "grid",
+    window_ms_override: int | None = None,
+    stride_ms_override: int | None = None,
+    beat_mapped_ticks_per_beat: int = 480,
+    disable_tqdm: bool = False,
+) -> Path:
+    """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。"""
+    input_midi_file = Path(input_midi_path).resolve()
+    if not input_midi_file.exists():
+        raise FileNotFoundError(f"Input MIDI file not found: {input_midi_file}")
+
+    if output_midi_path is None:
+        output_midi_file = input_midi_file.parent / f"{input_midi_file.stem}.beat_mapped.mid"
+    else:
+        output_midi_file = Path(output_midi_path).resolve()
+
+    if device is None:
+        device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device_obj = torch.device(device)
+
+    resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
+    model, model_config, metadata = load_beat_chord_model(
+        resolved_checkpoint_path,
+        device=device_obj,
+    )
+    
+    # Defaults in original function
+    config = BeatChordInferenceConfig(
+        device=device_obj,
+        beat_decode_mode=beat_decode_mode,
+        window_ms_override=window_ms_override,
+        stride_ms_override=stride_ms_override,
+        beat_mapped_ticks_per_beat=beat_mapped_ticks_per_beat,
+        disable_tqdm=disable_tqdm,
+        beat_threshold=0.3,
+        downbeat_threshold=0.3,
+        chord_boundary_threshold=0.5,
+        chord_boundary_min_distance_frames=5,
+        key_boundary_threshold=0.5,
+        key_boundary_min_distance_frames=5,
+    )
+
+    result = run_beat_chord_inference(
+        midi_path=input_midi_file,
+        checkpoint=metadata["checkpoint"],
+        model=model,
+        model_config=model_config,
+        metadata=metadata,
+        config=config,
+    )
+
+    output_midi_file.parent.mkdir(parents=True, exist_ok=True)
+    export_tempo_mapped_midi(
+        source_midi_path=input_midi_file,
+        output_midi_path=output_midi_file,
+        beat_times=result.beat_times,
+        meter_segments=[
+            MeterSegmentSpec(
+                start_seconds=segment.start_frame * result.hop_length / result.sample_rate,
+                end_seconds=segment.end_frame * result.hop_length / result.sample_rate,
+                numerator=segment.meter_num,
+                denominator=segment.meter_den,
+                bar_count=segment.bar_count,
+                score=segment.score,
+            )
+            for segment in result.meter_segments
+        ],
+        chord_segments=result.chord_segments,
+        key_segments=result.key_segments,
+        duration_seconds=result.duration_seconds,
+        ticks_per_beat=config.beat_mapped_ticks_per_beat,
+    )
+    return output_midi_file
 
 
 class SingleMidiFrameLoader(MidiFrameLoader):
@@ -657,143 +1160,33 @@ def respell_chord_segments_with_romanizer(
     return updated, api_status if processed else "skipped"
 
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="MIDIファイルからビートとコードを予測します。"
-    )
-    parser.add_argument(
-        "--checkpoint", type=Path, required=True, help="学習済み重みのパス (.pth)"
-    )
-    parser.add_argument(
-        "--midi_path", type=Path, required=True, help="推論対象のMIDIファイルのパス"
-    )
-    parser.add_argument(
-        "--output_path",
-        type=Path,
-        default=None,
-        help="予測結果を出力するJSONファイルのパス（未指定の場合は predictions/ の下に自動生成）",
-    )
-    parser.add_argument(
-        "--quality_json",
-        type=Path,
-        default=None,
-        help=(
-            "quality.json override. By default the vocabulary embedded in the "
-            "checkpoint is used."
-        ),
-    )
-    parser.add_argument(
-        "--beat_decoder_cache_path",
-        type=Path,
-        default=None,
-        help="Optional NPZ cache for beat/downbeat probabilities and meter logits.",
-    )
-    parser.add_argument(
-        "--window_ms",
-        type=int,
-        default=None,
-        help="推論時の窓幅 (ms)。未指定の場合はチェックポイントの設定を使用",
-    )
-    parser.add_argument(
-        "--beat_mapped_midi_path",
-        type=Path,
-        default=None,
-        help="Output MIDI containing the predicted tempo, meter, and chord map.",
-    )
-    parser.add_argument(
-        "--disable_beat_mapped_midi",
-        action="store_true",
-        help="Disable automatic tempo-mapped MIDI export.",
-    )
-    parser.add_argument(
-        "--beat_mapped_ticks_per_beat",
-        type=int,
-        default=960,
-        help="Ticks per quarter note used by the tempo-mapped MIDI.",
-    )
-    parser.add_argument(
-        "--stride_ms",
-        type=int,
-        default=None,
-        help="スライディングウィンドウのストライド (ms)。未指定時は窓幅の半分",
-    )
-    parser.add_argument(
-        "--beat_threshold", type=float, default=0.5, help="ビート検出の閾値"
-    )
-    parser.add_argument(
-        "--downbeat_threshold", type=float, default=0.5, help="ダウンビート検出の閾値"
-    )
-    parser.add_argument(
-        "--beat_decode_mode",
-        choices=("grid", "grid_legacy", "peaks"),
-        default="grid",
-        help="ビートのデコード方式。grid は downbeat 間で meter grid を1つ選ぶ。",
-    )
-    parser.add_argument(
-        "--meter_classes_json",
-        type=Path,
-        default=None,
-        help="古い checkpoint 用の meter class JSON。例: [[4, 4], [12, 8]]",
-    )
-    parser.add_argument(
-        "--grid_tolerance_frames",
-        type=int,
-        default=2,
-        help="grid score と snap に使う許容フレーム幅。",
-    )
-    parser.add_argument(
-        "--meter_score_weight",
-        type=float,
-        default=1.0,
-        help="grid decoder で meter logits をどれだけ重視するか。",
-    )
-    parser.add_argument(
-        "--beat_grid_score_weight",
-        type=float,
-        default=1.0,
-        help="grid decoder で beat の on/off grid score をどれだけ重視するか。",
-    )
-    parser.add_argument(
-        "--grid_downbeat_candidate_threshold",
-        type=float,
-        default=0.15,
-        help="Low threshold used to propose downbeat candidates for the DP lattice.",
-    )
-    parser.add_argument(
-        "--grid_beat_candidate_threshold",
-        type=float,
-        default=0.35,
-        help="Threshold used to propose beat-aligned bar boundaries.",
-    )
-    parser.add_argument(
-        "--grid_max_bar_count",
-        type=int,
-        default=4,
-        help="Maximum number of bars represented by one lattice edge.",
-    )
-    parser.add_argument(
-        "--grid_beam_size",
-        type=int,
-        default=24,
-        help="Number of tempo/meter path states retained per boundary.",
-    )
-    parser.add_argument(
-        "--grid_jit",
-        action="store_true",
-        help=("Use the optional cached CPU Numba kernel for beat-grid snapping."),
-    )
-    parser.add_argument(
-        "--group_boundary_score_weight",
-        type=float,
-        default=0.5,
-        help="Weight for learned major beat-group boundaries in grid decoding.",
-    )
-    parser.add_argument(
-        "--grid_false_group_boundary_weight",
-        type=float,
-        default=0.25,
-        help="Penalty for unsupported positive major-boundary evidence.",
-    )
+    parser = argparse.ArgumentParser(description="MIDIファイルからビートとコードを予測します。")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="学習済み重みのパス (.pth)")
+    parser.add_argument("--midi_path", type=Path, required=True, help="推論対象のMIDIファイルのパス")
+    parser.add_argument("--output_path", type=Path, default=None, help="予測結果を出力するJSONファイルのパス")
+    parser.add_argument("--quality_json", type=Path, default=None, help="quality.json override.")
+    parser.add_argument("--beat_decoder_cache_path", type=Path, default=None, help="Optional NPZ cache.")
+    parser.add_argument("--window_ms", type=int, default=None, help="推論時の窓幅 (ms)。")
+    parser.add_argument("--beat_mapped_midi_path", type=Path, default=None, help="Output MIDI")
+    parser.add_argument("--disable_beat_mapped_midi", action="store_true", help="Disable automatic export.")
+    parser.add_argument("--beat_mapped_ticks_per_beat", type=int, default=960, help="Ticks per quarter note.")
+    parser.add_argument("--stride_ms", type=int, default=None, help="ストライド (ms)。")
+    parser.add_argument("--beat_threshold", type=float, default=0.5, help="ビート検出の閾値")
+    parser.add_argument("--downbeat_threshold", type=float, default=0.5, help="ダウンビート検出の閾値")
+    parser.add_argument("--beat_decode_mode", choices=("grid", "grid_legacy", "peaks"), default="grid", help="ビートのデコード方式。")
+    parser.add_argument("--meter_classes_json", type=Path, default=None, help="古い checkpoint 用の meter class JSON。")
+    parser.add_argument("--grid_tolerance_frames", type=int, default=2, help="grid score 許容フレーム幅。")
+    parser.add_argument("--meter_score_weight", type=float, default=1.0)
+    parser.add_argument("--beat_grid_score_weight", type=float, default=1.0)
+    parser.add_argument("--grid_downbeat_candidate_threshold", type=float, default=0.15)
+    parser.add_argument("--grid_beat_candidate_threshold", type=float, default=0.35)
+    parser.add_argument("--grid_max_bar_count", type=int, default=4)
+    parser.add_argument("--grid_beam_size", type=int, default=24)
+    parser.add_argument("--grid_jit", action="store_true")
+    parser.add_argument("--group_boundary_score_weight", type=float, default=0.5)
+    parser.add_argument("--grid_false_group_boundary_weight", type=float, default=0.25)
     parser.add_argument("--grid_downbeat_score_weight", type=float, default=1.5)
     parser.add_argument("--grid_false_downbeat_weight", type=float, default=0.75)
     parser.add_argument("--grid_segment_penalty", type=float, default=0.25)
@@ -801,490 +1194,157 @@ def main() -> None:
     parser.add_argument("--grid_tempo_transition_weight", type=float, default=2.0)
     parser.add_argument("--grid_meter_change_penalty", type=float, default=12.0)
     parser.add_argument("--grid_short_meter_run_penalty", type=float, default=8.5)
-    parser.add_argument(
-        "--grid_minimum_meter_run_quarter_notes", type=float, default=4.0
-    )
+    parser.add_argument("--grid_minimum_meter_run_quarter_notes", type=float, default=4.0)
     parser.add_argument("--grid_octave_jump_penalty", type=float, default=2.0)
     parser.add_argument("--grid_min_bpm", type=float, default=30.0)
     parser.add_argument("--grid_max_bpm", type=float, default=300.0)
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    parser.add_argument(
-        "--chord_boundary_threshold",
-        type=float,
-        default=0.5,
-        help="Minimum chord-boundary probability used to start a new chord region.",
-    )
-    parser.add_argument(
-        "--chord_boundary_min_distance_frames",
-        type=int,
-        default=5,
-        help="Minimum distance between decoded chord boundaries, in model frames.",
-    )
-    parser.add_argument(
-        "--key_boundary_threshold",
-        type=float,
-        default=0.5,
-        help="Minimum key-boundary probability used to start a new key region.",
-    )
-    parser.add_argument(
-        "--key_boundary_min_distance_frames",
-        type=int,
-        default=5,
-        help="Minimum distance between decoded key boundaries, in model frames.",
-    )
-    parser.add_argument(
-        "--key_boundary_js_weight",
-        type=float,
-        default=0.0,
-        help="Weight used to reinforce key boundaries with JS divergence.",
-    )
-    parser.add_argument(
-        "--key_boundary_js_context_seconds",
-        type=float,
-        default=3.0,
-        help="Seconds of key evidence averaged on each side of a boundary.",
-    )
-    parser.add_argument(
-        "--key_boundary_js_gap_seconds",
-        type=float,
-        default=0.25,
-        help="Evidence gap excluded on each side of a candidate boundary.",
-    )
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--chord_boundary_threshold", type=float, default=0.5)
+    parser.add_argument("--chord_boundary_min_distance_frames", type=int, default=5)
+    parser.add_argument("--key_boundary_threshold", type=float, default=0.5)
+    parser.add_argument("--key_boundary_min_distance_frames", type=int, default=5)
+    parser.add_argument("--key_boundary_js_weight", type=float, default=0.0)
+    parser.add_argument("--key_boundary_js_context_seconds", type=float, default=3.0)
+    parser.add_argument("--key_boundary_js_gap_seconds", type=float, default=0.25)
     args = parser.parse_args()
-    if not 0.0 <= args.chord_boundary_threshold <= 1.0:
-        raise ValueError("chord boundary threshold must be between zero and one")
-    if not 0.0 <= args.key_boundary_threshold <= 1.0:
-        raise ValueError("key boundary threshold must be between zero and one")
-    if args.chord_boundary_min_distance_frames < 1:
-        raise ValueError("chord boundary minimum distance must be positive")
-    if args.key_boundary_min_distance_frames < 1:
-        raise ValueError("key boundary minimum distance must be positive")
-    if not 0.0 <= args.key_boundary_js_weight <= 1.0:
-        raise ValueError("--key_boundary_js_weight must be between zero and one")
-    if args.key_boundary_js_context_seconds <= 0.0:
-        raise ValueError("--key_boundary_js_context_seconds must be positive")
-    if args.key_boundary_js_gap_seconds < 0.0:
-        raise ValueError("--key_boundary_js_gap_seconds must be non-negative")
-    if args.grid_tolerance_frames < 0:
-        raise ValueError("--grid_tolerance_frames must be non-negative")
-    for threshold_name in (
-        "grid_downbeat_candidate_threshold",
-        "grid_beat_candidate_threshold",
-    ):
-        threshold = float(getattr(args, threshold_name))
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError(f"--{threshold_name} must be between zero and one")
-    if args.grid_max_bar_count <= 0:
-        raise ValueError("--grid_max_bar_count must be positive")
-    if args.grid_beam_size <= 0:
-        raise ValueError("--grid_beam_size must be positive")
-    if args.group_boundary_score_weight < 0.0:
-        raise ValueError("--group_boundary_score_weight must be non-negative")
-    if args.grid_false_group_boundary_weight < 0.0:
-        raise ValueError("--grid_false_group_boundary_weight must be non-negative")
-    if args.grid_minimum_meter_run_quarter_notes <= 0.0:
-        raise ValueError("--grid_minimum_meter_run_quarter_notes must be positive")
-    if args.grid_min_bpm <= 0.0 or args.grid_max_bpm <= args.grid_min_bpm:
-        raise ValueError("grid BPM range must be positive and increasing")
-    if args.beat_mapped_ticks_per_beat <= 0:
-        raise ValueError("--beat_mapped_ticks_per_beat must be positive")
 
-    # デバイス設定
+    if not 0.0 <= args.chord_boundary_threshold <= 1.0: raise ValueError("chord boundary threshold must be between zero and one")
+    if not 0.0 <= args.key_boundary_threshold <= 1.0: raise ValueError("key boundary threshold must be between zero and one")
+    if args.chord_boundary_min_distance_frames < 1: raise ValueError("chord boundary minimum distance must be positive")
+    if args.key_boundary_min_distance_frames < 1: raise ValueError("key boundary minimum distance must be positive")
+    if not 0.0 <= args.key_boundary_js_weight <= 1.0: raise ValueError("--key_boundary_js_weight must be between zero and one")
+    if args.key_boundary_js_context_seconds <= 0.0: raise ValueError("--key_boundary_js_context_seconds must be positive")
+    if args.key_boundary_js_gap_seconds < 0.0: raise ValueError("--key_boundary_js_gap_seconds must be non-negative")
+    if args.grid_tolerance_frames < 0: raise ValueError("--grid_tolerance_frames must be non-negative")
+    for threshold_name in ("grid_downbeat_candidate_threshold", "grid_beat_candidate_threshold"):
+        threshold = float(getattr(args, threshold_name))
+        if not 0.0 <= threshold <= 1.0: raise ValueError(f"--{threshold_name} must be between zero and one")
+    if args.grid_max_bar_count <= 0: raise ValueError("--grid_max_bar_count must be positive")
+    if args.grid_beam_size <= 0: raise ValueError("--grid_beam_size must be positive")
+    if args.group_boundary_score_weight < 0.0: raise ValueError("--group_boundary_score_weight must be non-negative")
+    if args.grid_false_group_boundary_weight < 0.0: raise ValueError("--grid_false_group_boundary_weight must be non-negative")
+    if args.grid_minimum_meter_run_quarter_notes <= 0.0: raise ValueError("--grid_minimum_meter_run_quarter_notes must be positive")
+    if args.grid_min_bpm <= 0.0 or args.grid_max_bpm <= args.grid_min_bpm: raise ValueError("grid BPM range must be positive and increasing")
+    if args.beat_mapped_ticks_per_beat <= 0: raise ValueError("--beat_mapped_ticks_per_beat must be positive")
+
     device = torch.device(args.device)
     print(f"使用デバイス: {device}")
 
-    # チェックポイントロード
     print(f"チェックポイントをロード中: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    resolved_checkpoint_path = ensure_beat_chord_checkpoint(args.checkpoint)
+    model, model_config, metadata = load_beat_chord_model(resolved_checkpoint_path, device=device)
 
-    # モデル設定の復元
-    model_config_dict = checkpoint["model_config"]
-    model_config = MidiFrameModelConfig(**model_config_dict)
-    meter_classes = load_meter_classes(
-        checkpoint=checkpoint,
-        model_config=model_config,
-        meter_classes_json=args.meter_classes_json,
-    )
-    if args.beat_decode_mode in {"grid", "grid_legacy"} and meter_classes is None:
-        print(
-            "警告: meter class 表が checkpoint にないため、beat_decode_mode=peaks に戻します。"
-            " 新しい checkpoint を使うか --meter_classes_json を指定してください。"
+    # Note: main originally overrides meter classes with meter_classes_json if passed.
+    if args.meter_classes_json:
+        metadata["meter_classes"] = load_meter_classes(
+            checkpoint=metadata["checkpoint"],
+            model_config=model_config,
+            meter_classes_json=args.meter_classes_json,
         )
-        beat_decode_mode = "peaks"
-    else:
-        beat_decode_mode = args.beat_decode_mode
 
-    # モデル構築と重み適用
-    model = MidiFrameBeatChordModel(model_config).to(device)
-    state_dict = checkpoint.get("ema_state_dict", checkpoint.get("model_state_dict"))
-    if state_dict is None:
-        state_dict = checkpoint
-    has_major_grouping_head = state_dict_has_major_grouping_head(state_dict)
-    model.load_state_dict(state_dict, strict=True)
-    model.eval()
-    print("モデルのロードが完了しました。")
+    if args.quality_json:
+        metadata["quality_map"] = load_chord_quality_map(
+            checkpoint=metadata["checkpoint"],
+            model_config=model_config,
+            quality_json=args.quality_json,
+        )
 
-    # 推論窓サイズの設定
-    legacy_config = checkpoint.get("config", {})
-    legacy_args = (
-        legacy_config.get("args", {}) if isinstance(legacy_config, Mapping) else {}
-    )
-    checkpoint_args = dict(legacy_args) if isinstance(legacy_args, Mapping) else {}
-    inference_config = checkpoint.get("inference_config", {})
-    if isinstance(inference_config, Mapping):
-        checkpoint_args.update(inference_config)
-    window_ms, stride_ms = resolve_inference_window_settings(
+    config = BeatChordInferenceConfig(
+        device=device,
         window_ms_override=args.window_ms,
         stride_ms_override=args.stride_ms,
-        checkpoint_args=checkpoint_args,
+        beat_decode_mode=args.beat_decode_mode,
+        beat_threshold=args.beat_threshold,
+        downbeat_threshold=args.downbeat_threshold,
+        grid_tolerance_frames=args.grid_tolerance_frames,
+        meter_score_weight=args.meter_score_weight,
+        beat_grid_score_weight=args.beat_grid_score_weight,
+        grid_downbeat_candidate_threshold=args.grid_downbeat_candidate_threshold,
+        grid_beat_candidate_threshold=args.grid_beat_candidate_threshold,
+        grid_max_bar_count=args.grid_max_bar_count,
+        grid_beam_size=args.grid_beam_size,
+        grid_jit=args.grid_jit,
+        group_boundary_score_weight=args.group_boundary_score_weight,
+        grid_false_group_boundary_weight=args.grid_false_group_boundary_weight,
+        grid_downbeat_score_weight=args.grid_downbeat_score_weight,
+        grid_false_downbeat_weight=args.grid_false_downbeat_weight,
+        grid_segment_penalty=args.grid_segment_penalty,
+        grid_additive_meter_penalty=args.grid_additive_meter_penalty,
+        grid_tempo_transition_weight=args.grid_tempo_transition_weight,
+        grid_meter_change_penalty=args.grid_meter_change_penalty,
+        grid_short_meter_run_penalty=args.grid_short_meter_run_penalty,
+        grid_minimum_meter_run_quarter_notes=args.grid_minimum_meter_run_quarter_notes,
+        grid_octave_jump_penalty=args.grid_octave_jump_penalty,
+        grid_min_bpm=args.grid_min_bpm,
+        grid_max_bpm=args.grid_max_bpm,
+        chord_boundary_threshold=args.chord_boundary_threshold,
+        chord_boundary_min_distance_frames=args.chord_boundary_min_distance_frames,
+        key_boundary_threshold=args.key_boundary_threshold,
+        key_boundary_min_distance_frames=args.key_boundary_min_distance_frames,
+        key_boundary_js_weight=args.key_boundary_js_weight,
+        key_boundary_js_context_seconds=args.key_boundary_js_context_seconds,
+        key_boundary_js_gap_seconds=args.key_boundary_js_gap_seconds,
+        disable_tqdm=False,
+        meter_classes_json=args.meter_classes_json,
+        quality_json=args.quality_json,
+        beat_decoder_cache_path=args.beat_decoder_cache_path,
+        beat_mapped_ticks_per_beat=args.beat_mapped_ticks_per_beat,
     )
-
-    sample_rate = model_config.sample_rate
-    hop_length = model_config.hop_length
-
-    window_frames = int(round(window_ms * sample_rate / 1000.0))
-    model_frames = math.ceil(window_frames / hop_length)
-
-    print(
-        f"推論設定 - 窓幅: {window_ms}ms ({model_frames}フレーム), ストライド: {stride_ms}ms"
-    )
-
-    # MIDIファイルのロード
-    if not args.midi_path.exists():
-        print(
-            f"エラー: MIDIファイルが見つかりません: {args.midi_path}", file=sys.stderr
-        )
-        sys.exit(1)
-
-    print(f"MIDIファイルを解析中: {args.midi_path}")
-    try:
-        midi_data = pretty_midi.PrettyMIDI(str(args.midi_path))
-        duration_seconds = midi_data.get_end_time()
-    except Exception as e:
-        print(f"エラー: MIDIファイルの読み込みに失敗しました: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"MIDIの長さ: {duration_seconds:.2f}秒")
-
-    # SingleMidiFrameLoaderの設定
-    loader_config = MidiFrameLoaderConfig(
-        midi_dir=args.midi_path.parent,  # ダミー。resolve_pathで上書きされるため不使用
-        sample_rate=sample_rate,
-        hop_length=hop_length,
-        pitch_min=model_config.pitch_min,
-        pitch_max=model_config.pitch_max,
-        num_channels=model_config.num_input_channels,
-    )
-    loader = SingleMidiFrameLoader(loader_config, args.midi_path)
-
-    # 累積用バッファの初期化
-    total_frames = math.ceil(duration_seconds * sample_rate / hop_length)
-    # 推論時に余白が出る可能性を考慮してバッファサイズを大きめに確保
-    buffer_size = max(total_frames, model_frames) + model_frames
-
-    beat_probabilities_accum = torch.zeros(buffer_size)
-    downbeat_probabilities_accum = torch.zeros(buffer_size)
-    group_boundary_probabilities_accum = torch.zeros(buffer_size)
-    meter_logits_accum = torch.zeros(buffer_size, model_config.num_meter_classes)
-    chord_logits_accum = torch.zeros(buffer_size, model_config.num_root_chord_classes)
-    chord_boundary_probabilities_accum = torch.zeros(buffer_size)
-    bass_logits_accum = torch.zeros(buffer_size, 13)
-    key_boundary_probabilities_accum = torch.zeros(buffer_size)
-    key_logits_accum = torch.zeros(buffer_size, 13)
-    weight_accum = torch.zeros(buffer_size)
-
-    # スライディングウィンドウによる推論ループ
-    start_seconds = 0.0
-    stride_seconds = stride_ms / 1000.0
 
     print("推論を実行中...")
-    while start_seconds < duration_seconds:
-        start_frame = int(round(start_seconds * sample_rate / hop_length))
-
-        # 窓のデータを取得
-        try:
-            roll = loader.load_window(
-                song_name="", window_start_sec=start_seconds, num_frames=model_frames
-            )
-        except Exception as e:
-            print(f"警告: 窓のロードに失敗しました (開始時間: {start_seconds}s): {e}")
-            start_seconds += stride_seconds
-            continue
-
-        roll = roll.unsqueeze(0).to(device)  # バッチ次元の追加
-
-        with torch.no_grad():
-            outputs = model(roll, include_beat=True, include_chord=True)
-
-            beat_prob = torch.sigmoid(outputs["beat_logits"]).squeeze(0).cpu()
-            downbeat_prob = torch.sigmoid(outputs["downbeat_logits"]).squeeze(0).cpu()
-            group_boundary_prob = (
-                torch.sigmoid(outputs["group_boundary_logits"]).squeeze(0).cpu()
-            )
-            meter_logits = outputs["meter_logits"].squeeze(0).cpu()
-            chord_logits = outputs["root_chord_logits"].squeeze(0).cpu()
-            chord_boundary_prob = (
-                torch.sigmoid(outputs["chord_boundary_logits"]).squeeze(0).cpu()
-            )
-            bass_logits = outputs["bass_logits"].squeeze(0).cpu()
-            key_boundary_prob = (
-                torch.sigmoid(outputs["key_boundary_logits"]).squeeze(0).cpu()
-            )
-            key_logits = outputs["key_logits"].squeeze(0).cpu()
-
-        # バッファへの累積
-        chord_boundary_probabilities_accum[
-            start_frame : start_frame + model_frames
-        ] += chord_boundary_prob
-        bass_logits_accum[start_frame : start_frame + model_frames] += bass_logits
-        key_boundary_probabilities_accum[start_frame : start_frame + model_frames] += (
-            key_boundary_prob
-        )
-        key_logits_accum[start_frame : start_frame + model_frames] += key_logits
-        beat_probabilities_accum[start_frame : start_frame + model_frames] += beat_prob
-        downbeat_probabilities_accum[start_frame : start_frame + model_frames] += (
-            downbeat_prob
-        )
-        group_boundary_probabilities_accum[
-            start_frame : start_frame + model_frames
-        ] += group_boundary_prob
-        meter_logits_accum[start_frame : start_frame + model_frames] += meter_logits
-        chord_logits_accum[start_frame : start_frame + model_frames] += chord_logits
-        weight_accum[start_frame : start_frame + model_frames] += 1.0
-
-        start_seconds += stride_seconds
-
-    # 平均化
-    active_mask = weight_accum > 0
-    beat_probabilities_accum[active_mask] /= weight_accum[active_mask]
-    downbeat_probabilities_accum[active_mask] /= weight_accum[active_mask]
-    group_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
-    meter_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
-    chord_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
-    chord_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
-    bass_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
-    key_boundary_probabilities_accum[active_mask] /= weight_accum[active_mask]
-    key_logits_accum[active_mask] /= weight_accum[active_mask].unsqueeze(-1)
-
-    # 実際の長さにトリミング
-    beat_probabilities_accum = beat_probabilities_accum[:total_frames]
-    downbeat_probabilities_accum = downbeat_probabilities_accum[:total_frames]
-    group_boundary_probabilities_accum = group_boundary_probabilities_accum[
-        :total_frames
-    ]
-    meter_logits_accum = meter_logits_accum[:total_frames]
-    chord_logits_accum = chord_logits_accum[:total_frames]
-    chord_boundary_probabilities_accum = chord_boundary_probabilities_accum[
-        :total_frames
-    ]
-    bass_logits_accum = bass_logits_accum[:total_frames]
-    key_boundary_probabilities_accum = key_boundary_probabilities_accum[:total_frames]
-    key_logits_accum = key_logits_accum[:total_frames]
-
-    # 1. downbeat は小節境界としてピーク検出する。
-    beat_probabilities_numpy = beat_probabilities_accum.numpy()
-    downbeat_probabilities_numpy = downbeat_probabilities_accum.numpy()
-    group_boundary_probabilities_numpy = (
-        group_boundary_probabilities_accum.numpy() if has_major_grouping_head else None
+    result = run_beat_chord_inference(
+        midi_path=args.midi_path,
+        checkpoint=metadata["checkpoint"],
+        model=model,
+        model_config=model_config,
+        metadata=metadata,
+        config=config,
     )
-    meter_logits_numpy = meter_logits_accum.numpy()
-    raw_downbeat_frame_indices = detect_peaks(
-        downbeat_probabilities_numpy, threshold=args.downbeat_threshold
-    )
-    downbeat_frame_indices = list(raw_downbeat_frame_indices)
+
     if args.beat_decoder_cache_path is not None:
         args.beat_decoder_cache_path.parent.mkdir(parents=True, exist_ok=True)
         decoder_cache = {
-            "beat_probabilities": beat_probabilities_numpy,
-            "downbeat_probabilities": downbeat_probabilities_numpy,
-            "meter_logits": meter_logits_numpy,
-            "meter_classes": np.asarray(meter_classes or [], dtype=np.int64),
-            "sample_rate": np.asarray(sample_rate, dtype=np.int64),
-            "hop_length": np.asarray(hop_length, dtype=np.int64),
+            "beat_probabilities": result.beat_probabilities,
+            "downbeat_probabilities": result.downbeat_probabilities,
+            "meter_logits": result.meter_logits,
+            "meter_classes": np.asarray(result.meter_classes or [], dtype=np.int64),
+            "sample_rate": np.asarray(result.sample_rate, dtype=np.int64),
+            "hop_length": np.asarray(result.hop_length, dtype=np.int64),
         }
-        if group_boundary_probabilities_numpy is not None:
-            decoder_cache["group_boundary_probabilities"] = (
-                group_boundary_probabilities_numpy
-            )
+        if result.group_boundary_probabilities is not None:
+            decoder_cache["group_boundary_probabilities"] = result.group_boundary_probabilities
         np.savez_compressed(args.beat_decoder_cache_path, **decoder_cache)
 
-    # 2. beat は従来のピーク検出か、meter grid による構造化 decode で決める。
-    meter_segments: list[MeterGridSegment] = []
-    meter_segments: list[MeterGridSegment] = []
-    decoder_diagnostics: dict[str, object] = {}
-    if beat_decode_mode == "grid" and meter_classes is not None:
-        grid_result = decode_beats_with_meter_grid_dp(
-            beat_probabilities=beat_probabilities_numpy,
-            downbeat_probabilities=downbeat_probabilities_numpy,
-            group_boundary_probabilities=group_boundary_probabilities_numpy,
-            meter_logits=meter_logits_numpy,
-            meter_classes=meter_classes,
-            config=BeatGridDPConfig(
-                sample_rate=sample_rate,
-                hop_length=hop_length,
-                tolerance_frames=args.grid_tolerance_frames,
-                downbeat_candidate_threshold=(args.grid_downbeat_candidate_threshold),
-                beat_candidate_threshold=args.grid_beat_candidate_threshold,
-                max_bar_count=args.grid_max_bar_count,
-                beam_size=args.grid_beam_size,
-                use_jit_grid=args.grid_jit,
-                min_quarter_bpm=args.grid_min_bpm,
-                max_quarter_bpm=args.grid_max_bpm,
-                beat_score_weight=args.beat_grid_score_weight,
-                downbeat_score_weight=args.grid_downbeat_score_weight,
-                false_downbeat_weight=args.grid_false_downbeat_weight,
-                meter_score_weight=args.meter_score_weight,
-                group_boundary_score_weight=args.group_boundary_score_weight,
-                false_group_boundary_weight=(args.grid_false_group_boundary_weight),
-                additive_meter_penalty=args.grid_additive_meter_penalty,
-                segment_penalty=args.grid_segment_penalty,
-                tempo_transition_weight=args.grid_tempo_transition_weight,
-                meter_change_penalty=args.grid_meter_change_penalty,
-                short_meter_run_penalty=args.grid_short_meter_run_penalty,
-                minimum_meter_run_quarter_notes=(
-                    args.grid_minimum_meter_run_quarter_notes
-                ),
-                octave_jump_penalty=args.grid_octave_jump_penalty,
-            ),
-        )
-        decoder_diagnostics = result_to_diagnostics(grid_result)
-        if grid_result.beat_frames:
-            beat_frame_indices = list(grid_result.beat_frames)
-            downbeat_frame_indices = list(grid_result.downbeat_frames)
-            meter_segments = list(grid_result.meter_segments)
-        else:
-            print(
-                "Warning: DP grid decoder produced no path; "
-                "falling back to the legacy grid decoder."
-            )
-            beat_decode_mode = "grid_legacy"
-
-    if beat_decode_mode == "grid_legacy" and meter_classes is not None:
-        beat_frame_indices, meter_segments = decode_beats_with_meter_grid(
-            beat_probabilities=beat_probabilities_numpy,
-            downbeat_frames=downbeat_frame_indices,
-            meter_logits=meter_logits_numpy,
-            meter_classes=meter_classes,
-            tolerance_frames=args.grid_tolerance_frames,
-            meter_score_weight=args.meter_score_weight,
-            beat_grid_score_weight=args.beat_grid_score_weight,
-        )
-        if not beat_frame_indices:
-            print(
-                "警告: grid decoder が beat を生成できなかったため、ピーク検出に戻します。"
-            )
-            beat_decode_mode = "peaks"
-    if beat_decode_mode == "peaks":
-        beat_frame_indices = detect_peaks(
-            beat_probabilities_numpy,
-            threshold=args.beat_threshold,
-        )
-
-    beat_times = [float(f * hop_length / sample_rate) for f in beat_frame_indices]
-    downbeat_times = [
-        float(f * hop_length / sample_rate) for f in downbeat_frame_indices
-    ]
-    mapped_downbeat_frame_indices = sorted(
-        {
-            frame
-            for segment in meter_segments
-            for frame in segment.mapped_downbeat_frames
-        }
-    )
-    if meter_segments:
-        mapped_downbeat_frame_indices.append(int(meter_segments[-1].end_frame))
-        mapped_downbeat_frame_indices = sorted(set(mapped_downbeat_frame_indices))
-    elif downbeat_frame_indices:
-        mapped_downbeat_frame_indices = list(downbeat_frame_indices)
-    mapped_downbeat_times = [
-        float(frame * hop_length / sample_rate)
-        for frame in mapped_downbeat_frame_indices
-    ]
-
-    # コード予測のデコード
-    quality_map = load_chord_quality_map(
-        checkpoint=checkpoint,
-        model_config=model_config,
-        quality_json=args.quality_json,
-    )
-
-    # Boundary heads decide region starts; class heads are pooled within each region.
-    seconds_per_frame = hop_length / sample_rate
-    chord_segments = decode_chord_segments(
-        chord_logits=chord_logits_accum.numpy(),
-        bass_logits=bass_logits_accum.numpy(),
-        boundary_probabilities=chord_boundary_probabilities_accum.numpy(),
-        quality_map=quality_map,
-        seconds_per_frame=seconds_per_frame,
-        duration_seconds=duration_seconds,
-        boundary_threshold=args.chord_boundary_threshold,
-        minimum_boundary_distance_frames=args.chord_boundary_min_distance_frames,
-    )
-    key_segments = decode_key_segments(
-        key_logits=key_logits_accum.numpy(),
-        boundary_probabilities=key_boundary_probabilities_accum.numpy(),
-        seconds_per_frame=seconds_per_frame,
-        duration_seconds=duration_seconds,
-        boundary_threshold=args.key_boundary_threshold,
-        minimum_boundary_distance_frames=args.key_boundary_min_distance_frames,
-        js_weight=args.key_boundary_js_weight,
-        js_context_seconds=args.key_boundary_js_context_seconds,
-        js_gap_seconds=args.key_boundary_js_gap_seconds,
-    )
-    chord_segments, chord_romanizer_status = respell_chord_segments_with_romanizer(
-        chord_segments,
-        key_segments,
-    )
-    if chord_romanizer_status == "unavailable":
+    if result.chord_romanizer_status == "unavailable":
         print("chord-romanizer is not installed; keeping the decoded spellings.")
-    elif chord_romanizer_status in {"error", "partial"}:
-        print(
-            "Warning: chord-romanizer could not respell every chord; "
-            "keeping the original spelling where needed."
-        )
-    elif chord_romanizer_status in {
-        "applied_symbol_only",
-        "applied_legacy_api",
-    }:
-        print(
-            "Warning: this chord-romanizer version does not provide "
-            "display_progression(); functional labels are unavailable."
-        )
-    # 結果表示
+    elif result.chord_romanizer_status in {"error", "partial"}:
+        print("Warning: chord-romanizer could not respell every chord; keeping the original spelling where needed.")
+    elif result.chord_romanizer_status in {"applied_symbol_only", "applied_legacy_api"}:
+        print("Warning: this chord-romanizer version does not provide display_progression(); functional labels are unavailable.")
+
     print("\n--- 予測結果サマリー ---")
-    print(f"ビートデコード方式: {beat_decode_mode}")
-    print(f"検出ビート数: {len(beat_times)}")
-    print(f"検出ダウンビート数: {len(downbeat_times)}")
-    if meter_segments:
+    print(f"ビートデコード方式: {config.beat_decode_mode}")
+    print(f"検出ビート数: {len(result.beat_times)}")
+    print(f"検出ダウンビート数: {len(result.downbeat_times)}")
+    if result.meter_segments:
         meter_counter: dict[str, int] = {}
-        for segment in meter_segments:
+        for segment in result.meter_segments:
             meter_name = f"{segment.meter_num}/{segment.meter_den}"
             meter_counter[meter_name] = meter_counter.get(meter_name, 0) + 1
-        meter_summary = ", ".join(
-            f"{meter_name}: {count}"
-            for meter_name, count in sorted(meter_counter.items())
-        )
+        meter_summary = ", ".join(f"{name}: {count}" for name, count in sorted(meter_counter.items()))
         print(f"選択meter: {meter_summary}")
-    print(f"コード区間数: {len(chord_segments)}")
-    print(f"キー区間数: {len(key_segments)}")
+    print(f"コード区間数: {len(result.chord_segments)}")
+    print(f"キー区間数: {len(result.key_segments)}")
 
-    # 最初の10個のコード進行を表示
     print("\n予測コード（最初の10区間）:")
-    for segment in chord_segments[:10]:
-        print(
-            f"  {segment['start']:6.2f}s - {segment['end']:6.2f}s : "
-            f"{segment.get('combined_label', segment['chord'])}"
-        )
-    if len(chord_segments) > 10:
+    for segment in result.chord_segments[:10]:
+        print(f"  {segment['start']:6.2f}s - {segment['end']:6.2f}s : {segment.get('combined_label', segment['chord'])}")
+    if len(result.chord_segments) > 10:
         print("  ...")
 
-    # 結果の保存
     if args.output_path is None:
         output_dir = Path("beat_chord_predictions")
         output_dir.mkdir(exist_ok=True)
-        # 入力MIDI名に基づき、拡張子を変更して保存
         args.output_path = output_dir / f"{args.midi_path.stem}.prediction.json"
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1293,103 +1353,67 @@ def main() -> None:
     if not args.disable_beat_mapped_midi:
         beat_mapped_midi_path = args.beat_mapped_midi_path
         if beat_mapped_midi_path is None:
-            beat_mapped_midi_path = (
-                args.output_path.parent / f"{args.midi_path.stem}.beat_mapped.mid"
-            )
+            beat_mapped_midi_path = args.output_path.parent / f"{args.midi_path.stem}.beat_mapped.mid"
         tempo_mapped_result = export_tempo_mapped_midi(
             source_midi_path=args.midi_path,
             output_midi_path=beat_mapped_midi_path,
-            beat_times=beat_times,
+            beat_times=result.beat_times,
             meter_segments=[
                 MeterSegmentSpec(
-                    start_seconds=segment.start_frame * hop_length / sample_rate,
-                    end_seconds=segment.end_frame * hop_length / sample_rate,
+                    start_seconds=segment.start_frame * result.hop_length / result.sample_rate,
+                    end_seconds=segment.end_frame * result.hop_length / result.sample_rate,
                     numerator=segment.meter_num,
                     denominator=segment.meter_den,
                     bar_count=segment.bar_count,
                     score=segment.score,
                 )
-                for segment in meter_segments
+                for segment in result.meter_segments
             ],
-            chord_segments=chord_segments,
-            key_segments=key_segments,
-            duration_seconds=duration_seconds,
+            chord_segments=result.chord_segments,
+            key_segments=result.key_segments,
+            duration_seconds=result.duration_seconds,
             ticks_per_beat=args.beat_mapped_ticks_per_beat,
         )
         print(f"Saved tempo-mapped MIDI: {beat_mapped_midi_path}")
-        print(
-            "Maximum absolute note timing drift: "
-            f"{tempo_mapped_result.max_note_drift_seconds * 1000.0:.3f}ms"
-        )
+        print(f"Maximum absolute note timing drift: {tempo_mapped_result.max_note_drift_seconds * 1000.0:.3f}ms")
         if not tempo_mapped_result.used_predicted_tempo:
-            print(
-                "Warning: no valid meter interval was decoded; "
-                "the original tempo map was retained and chords/keys were added."
-            )
+            print("Warning: no valid meter interval was decoded; the original tempo map was retained and chords/keys were added.")
 
     output_data = {
         "song_name": args.midi_path.stem,
-        "beat_decode_mode": beat_decode_mode,
+        "beat_decode_mode": config.beat_decode_mode,
         "decoder_diagnostics": {
-            **decoder_diagnostics,
-            "seconds_per_frame": float(hop_length / sample_rate),
+            **result.decoder_diagnostics,
+            "seconds_per_frame": float(result.hop_length / result.sample_rate),
         },
-        "beats": beat_times,
-        "downbeats": downbeat_times,
-        "mapped_downbeats": mapped_downbeat_times,
+        "beats": result.beat_times,
+        "downbeats": result.downbeat_times,
+        "mapped_downbeats": result.mapped_downbeat_times,
         "meters": [
             {
-                "start": round(segment.start_frame * hop_length / sample_rate, 3),
-                "end": round(segment.end_frame * hop_length / sample_rate, 3),
+                "start": round(segment.start_frame * result.hop_length / result.sample_rate, 3),
+                "end": round(segment.end_frame * result.hop_length / result.sample_rate, 3),
                 "meter_index": int(segment.meter_index),
                 "meter": f"{segment.meter_num}/{segment.meter_den}",
                 "bar_count": int(segment.bar_count),
                 "source": "interpolated" if segment.bar_count > 1 else "detected",
                 "score": float(segment.score),
-                "tempo_bpm": (
-                    None
-                    if getattr(segment, "quarter_note_bpm", None) is None
-                    else float(segment.quarter_note_bpm)
-                ),
+                "tempo_bpm": (None if getattr(segment, "quarter_note_bpm", None) is None else float(segment.quarter_note_bpm)),
                 "score_components": getattr(segment, "score_components", None),
                 "confidence_margin": getattr(segment, "confidence_margin", None),
-                "meter_evidence_source": getattr(
-                    segment, "meter_evidence_source", "direct"
-                ),
-                "major_grouping": (
-                    None
-                    if getattr(segment, "major_grouping", None) is None
-                    else list(segment.major_grouping)
-                ),
+                "meter_evidence_source": getattr(segment, "meter_evidence_source", "direct"),
+                "major_grouping": (None if getattr(segment, "major_grouping", None) is None else list(segment.major_grouping)),
             }
-            for segment in meter_segments
+            for segment in result.meter_segments
         ],
-        "chords": chord_segments,
-        "chord_romanizer": chord_romanizer_status,
-        "keys": key_segments,
-        "key_representation": "relative_major",
-        "tempo_mapped_midi": (
-            None if tempo_mapped_result is None else tempo_mapped_result.to_json()
-        ),
+        "chords": result.chord_segments,
+        "chord_romanizer": result.chord_romanizer_status,
+        "keys": result.key_segments,
     }
 
     with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
+    print(f"Saved predictions to: {args.output_path}")
 
-    print(f"\n予測結果を保存しました: {args.output_path}")
-
-    # Audacity用ラベル形式の保存
-    audacity_dir = args.output_path.parent / "audacity"
-    audacity_dir.mkdir(exist_ok=True)
-    audacity_path = audacity_dir / f"{args.midi_path.stem}.txt"
-    with open(audacity_path, "w", encoding="utf-8") as f:
-        for segment in chord_segments:
-            f.write(
-                f"{segment['start']:.6f}\t{segment['end']:.6f}\t"
-                f"{segment.get('combined_label', segment['chord'])}\n"
-            )
-    print(f"Audacity用ラベルを保存しました: {audacity_path}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
