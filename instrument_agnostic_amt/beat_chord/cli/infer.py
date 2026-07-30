@@ -94,8 +94,7 @@ def state_dict_has_major_grouping_head(
     """Return whether a checkpoint contains a trained final grouping head."""
 
     return any(
-        str(key).endswith("beat_head.group_boundary_proj.weight")
-        for key in state_dict
+        str(key).endswith("beat_head.group_boundary_proj.weight") for key in state_dict
     )
 
 
@@ -513,10 +512,7 @@ def _romanize_chord_symbols(
                         or getattr(result, "symbol_fixed", None)
                         or original
                     )
-                    combined_label = str(
-                        getattr(result, "combined_label", None) or fixed_symbol
-                    )
-                    labels.append((fixed_symbol, combined_label))
+                    labels.append((fixed_symbol, fixed_symbol))
                 api_status = "applied"
             else:
                 romanize_progression = getattr(romanizer, "romanize_progression", None)
@@ -887,9 +883,7 @@ def main() -> None:
     if args.group_boundary_score_weight < 0.0:
         raise ValueError("--group_boundary_score_weight must be non-negative")
     if args.grid_false_group_boundary_weight < 0.0:
-        raise ValueError(
-            "--grid_false_group_boundary_weight must be non-negative"
-        )
+        raise ValueError("--grid_false_group_boundary_weight must be non-negative")
     if args.grid_minimum_meter_run_quarter_notes <= 0.0:
         raise ValueError("--grid_minimum_meter_run_quarter_notes must be positive")
     if args.grid_min_bpm <= 0.0 or args.grid_max_bpm <= args.grid_min_bpm:
@@ -1093,9 +1087,7 @@ def main() -> None:
     beat_probabilities_numpy = beat_probabilities_accum.numpy()
     downbeat_probabilities_numpy = downbeat_probabilities_accum.numpy()
     group_boundary_probabilities_numpy = (
-        group_boundary_probabilities_accum.numpy()
-        if has_major_grouping_head
-        else None
+        group_boundary_probabilities_accum.numpy() if has_major_grouping_head else None
     )
     meter_logits_numpy = meter_logits_accum.numpy()
     raw_downbeat_frame_indices = detect_peaks(
@@ -1145,9 +1137,7 @@ def main() -> None:
                 false_downbeat_weight=args.grid_false_downbeat_weight,
                 meter_score_weight=args.meter_score_weight,
                 group_boundary_score_weight=args.group_boundary_score_weight,
-                false_group_boundary_weight=(
-                    args.grid_false_group_boundary_weight
-                ),
+                false_group_boundary_weight=(args.grid_false_group_boundary_weight),
                 additive_meter_penalty=args.grid_additive_meter_penalty,
                 segment_penalty=args.grid_segment_penalty,
                 tempo_transition_weight=args.grid_tempo_transition_weight,
