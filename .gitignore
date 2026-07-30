@@ -236,6 +236,10 @@ dataset_config.yaml
 .codex
 *.bat
 beat_chord_dataset/
+beat_chord_checkpoints/
+beat_chord_predictions/
+midi_dataset/
+beat_dataset_midi/
 batch_process_unlabeled.py
 
 # Output MIDI files
@@ -244,3 +248,4 @@ outputs/
 uploads/
 
 configs/
+scripts/prepare_guitar_pro_beat_midis.py

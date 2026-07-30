@@ -403,6 +403,8 @@ def predict_velocity_for_stem_midis(
     max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
     disable_tqdm: bool = False,
+    preloaded_model: VelocityPredictionModel | None = None,
+    preloaded_config: VelocityModelConfig | None = None,
 ) -> Path | dict[str, Path]:
     """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
 
@@ -424,7 +426,17 @@ def predict_velocity_for_stem_midis(
             'template_midi_path is not compatible with legacy stem-gain CC7 output'
         )
 
-    model, config = load_velocity_model(checkpoint_path, device=target_device)
+    if (preloaded_model is None) != (preloaded_config is None):
+        raise ValueError(
+            "preloaded_model and preloaded_config must be provided together"
+        )
+    if preloaded_model is None or preloaded_config is None:
+        model, config = load_velocity_model(checkpoint_path, device=target_device)
+    else:
+        model = preloaded_model
+        config = preloaded_config
+        model.to(target_device)
+        model.eval()
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
         raise ValueError(
             "This velocity checkpoint does not contain a stem-gain prediction head"
