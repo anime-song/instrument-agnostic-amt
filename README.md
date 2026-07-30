@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-07-30 | Integrated the MIDI-frame beat/chord pipeline under `instrument_agnostic_amt/beat_chord`, including MIDI beat pretraining, joint beat/chord training, and MIDI inference. |
 | 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
 | 2026-07-22 | Added guitar model v1.5 (`--type guitar_v1_5`). The Colab stem-separated workflow now uses it by default for guitar stems. |
 | 2026-07-16 | 🐛 Fixed a bug in the data augmentation pipeline that caused note timing misalignment, then retrained the bass v2 model (`--type bass_v2`) after the fix. The retrained `bass_v2` improves note detection accuracy and fixes the issue where notes were over-segmented into multiple short notes. These improvements apply only to `bass_v2`. |
@@ -360,6 +361,85 @@ Consequently, `allow_multi_stem_same_song: true` can select stems across those
 manifests. Dataset weights, augmentation settings, and cross-augmentation
 eligibility remain per entry. Omitting `group` preserves the previous isolated
 behavior by using `name` as the group.
+
+---
+
+## MIDI-frame beat/chord learning
+
+The MIDI-frame beat/chord model is kept independent from the regular audio AMT
+training stack under [`instrument_agnostic_amt/beat_chord`](instrument_agnostic_amt/beat_chord/README.md).
+It supports beat pretraining from MIDI tempo/signature maps, joint beat/chord
+training from AMT-generated merged MIDI, and beat/chord inference from MIDI.
+
+```bash
+# Beat pretraining from MIDI
+python pretrain_midi_frame_beat.py --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
+
+# Joint beat/chord training
+python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
+
+# Beat/chord inference
+python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.mid
+```
+
+Corrected prediction MIDIs placed under
+`beat_chord_dataset/key_only_dataset/midis/` are also used during chord/key
+training by default. Only `key_signature` events are treated as labels; chord
+markers, tempo/meter metadata, and beat information are never supervised from
+these files. Chord losses are masked and chord self-refinement feedback is
+detached for this auxiliary stream. Use `--skip_key_only` to disable it or
+`--key_only_loss_scale` to change its contribution. To avoid concentrating this
+small dataset into consecutive updates, one key-only batch is used every four
+training steps by default. Change the spacing with
+`--key_only_step_interval N`; setting it to `1` restores the previous
+every-step behavior. The loader still makes at most one pass through the
+key-only dataset per epoch. Minor signatures are mapped to the model's existing
+relative-major key classes.
+
+### Batch creation of uncorrected key-only candidates
+
+To reproduce the Colab stem workflow for every audio file in a directory and
+then add predicted beat, meter, chord, and key metadata, install the optional
+stem separator and run:
+
+```bash
+pip install stem-splitter
+python create_key_only_candidates.py \
+  --input-dir beat_chord_dataset/source_audio \
+  --output-dir beat_chord_dataset/key_only_candidates
+```
+
+The script uses the same per-stem model routing as the Colab notebook, merges
+the stem MIDIs, predicts note velocities, and runs `midi_frame_infer` before
+moving on to the next song.
+The current beat/chord checkpoint is selected by modification time from
+`beat_chord_checkpoints/midi_frame`; use `--beat-chord-checkpoint` to pin one.
+Final uncorrected files are written under `key_only_candidates/midis/`, separate
+from the supervised `key_only_dataset/midis/`. Intermediate stems, per-stem
+MIDIs, prediction JSON, Audacity labels, and `batch_summary.json` are retained.
+Interrupted runs can be resumed with the same command. Each valid separated
+stem, per-stem MIDI, merged MIDI, velocity MIDI, and beat/chord/key result is
+reused independently. A beat/chord/key result is considered complete only when
+both its MIDI and prediction JSON are readable; otherwise that inference is run
+again. Pass `--force` to rebuild everything or `--dry-run` to inspect the plan
+without loading models.
+
+Beat/chord inference also writes
+`beat_chord_predictions/<song>.beat_mapped.mid` by default. This Type 1 MIDI
+contains a conductor track with the predicted continuous tempo/time-signature
+map, a separate chord-marker track, and retimed copies of the original
+performance tracks. Event times are converted through absolute seconds so the
+notes remain aligned with paired audio; the saved file is reloaded and checked
+for at most 1 ms of note timing drift. Use `--beat_mapped_midi_path` to choose
+the destination or `--disable_beat_mapped_midi` to skip this export. Small
+within-bar beat timing differences are regularized into stable bar-level tempo
+regions while decoded downbeats remain aligned within 1 ms.
+A beat-level tempo curve is emitted only for a clear monotonic ritardando or
+accelerando, keeping the map readable without quantizing performance events.
+
+The model, datasets, losses, checkpoints, and CLIs are separate from `train.py`.
+See the [beat/chord pipeline guide](instrument_agnostic_amt/beat_chord/README.md)
+for the dataset layout and full commands.
 
 ---
 
