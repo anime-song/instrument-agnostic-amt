@@ -29,7 +29,7 @@ class ChordConfig:
 
     # 各損失の設定
     boundary_pos_weight: float = 5.0
-    key_boundary_pos_weight: float = 100.0
+    key_boundary_pos_weight: float = 150.0
     chord_boundary_loss_tolerance: int = 1
     key_boundary_loss_tolerance: int = 8
     focal_tversky_alpha: float = 0.3
