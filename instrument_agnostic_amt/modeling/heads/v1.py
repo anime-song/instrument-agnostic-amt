@@ -86,9 +86,8 @@ class V1SemiCRFHead(nn.Module):
         interval_features = self._expand_with_slots(
             self.interval_adapter(pitch_features)
         )
-        instrument_features = self._expand_with_slots(
-            self.instrument_adapter(pitch_features)
-        )
+        pitch_instrument_features = self.instrument_adapter(pitch_features)
+        instrument_features = self._expand_with_slots(pitch_instrument_features)
         interval_query, interval_key, interval_diag = self.interval_scorer(
             interval_features
         )
@@ -98,7 +97,9 @@ class V1SemiCRFHead(nn.Module):
             "interval_diag": interval_diag,
             "interval_features": interval_features,
             "instrument_features": instrument_features,
-            "instrument_logits": self.instrument_classifier(pitch_features),
+            "instrument_logits": self.instrument_classifier(
+                pitch_instrument_features
+            ),
             "frame_valid_mask": frame_valid_mask,
         }
 
