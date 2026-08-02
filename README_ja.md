@@ -7,8 +7,8 @@
 <table>
   <tr>
     <td align="center">
-      <a href="https://youtu.be/aXi4b672a6M">
-        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="採譜結果例" width="480">
+      <a href="https://youtu.be/3pCAjQuhzDA">
+        <img src="https://img.youtube.com/vi/3pCAjQuhzDA/0.jpg" alt="採譜結果例" width="480">
       </a>
       <br>
       <strong>採譜結果例</strong>
