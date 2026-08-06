@@ -7,8 +7,8 @@
 <table>
   <tr>
     <td align="center">
-      <a href="https://youtu.be/aXi4b672a6M">
-        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="採譜結果例" width="480">
+      <a href="https://youtu.be/3pCAjQuhzDA">
+        <img src="https://img.youtube.com/vi/3pCAjQuhzDA/0.jpg" alt="採譜結果例" width="480">
       </a>
       <br>
       <strong>採譜結果例</strong>
@@ -47,7 +47,7 @@
 
 | 日付 | 内容 |
 |---|---|
-| 2026-07-30 | MIDIフレームのビート・コード機能を `instrument_agnostic_amt/beat_chord` に統合。MIDIによるbeat事前学習、beat/chord joint学習、MIDI推論を追加。 |
+| 2026-07-30 | ビート・コード・キーの推論モデルをパイプラインに追加しました。デフォルトでは無効になっています。 |
 | 2026-07-24 | 分離ステム音声からノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
 | 2026-07-22 | ギター専用モデル v1.5（`--type guitar_v1_5`）を追加。Colab のステム分離ワークフローでは、ギターステムの既定モデルとして使用します。 |
 | 2026-07-16 | 🐛 データ拡張処理の不具合によりノートのタイミングにずれが生じていた問題を修正し、修正後にベースモデル v2（`--type bass_v2`）を再学習しました。再学習した `bass_v2` ではノート検出精度が向上し、1つのノートが複数の短いノートに過剰分割される問題も修正されています。これらの改善は `bass_v2` のみに適用されます。 |

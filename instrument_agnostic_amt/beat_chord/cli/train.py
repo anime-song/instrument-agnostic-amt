@@ -188,12 +188,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--meter_grid_kl_temperature", type=float, default=0.2)
     parser.add_argument("--beat_loss_tolerance", type=int, default=1)
     parser.add_argument("--major_grouping_loss_weight", type=float, default=1.0)
-    parser.add_argument(
-        "--major_grouping_accent_loss_weight", type=float, default=0.25
-    )
-    parser.add_argument(
-        "--major_grouping_accent_temperature", type=float, default=0.5
-    )
+    parser.add_argument("--major_grouping_accent_loss_weight", type=float, default=0.25)
+    parser.add_argument("--major_grouping_accent_temperature", type=float, default=0.5)
     parser.add_argument(
         "--meter_aware_crop_probability",
         type=float,

@@ -7,8 +7,8 @@
 <table>
   <tr>
     <td align="center">
-      <a href="https://youtu.be/aXi4b672a6M">
-        <img src="https://img.youtube.com/vi/aXi4b672a6M/0.jpg" alt="Transcription example" width="480">
+      <a href="https://youtu.be/3pCAjQuhzDA">
+        <img src="https://img.youtube.com/vi/3pCAjQuhzDA/0.jpg" alt="Transcription example" width="480">
       </a>
       <br>
       <strong>Transcription example</strong>
@@ -46,7 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
-| 2026-07-30 | Integrated the MIDI-frame beat/chord pipeline under `instrument_agnostic_amt/beat_chord`, including MIDI beat pretraining, joint beat/chord training, and MIDI inference. |
+| 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
 | 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
 | 2026-07-22 | Added guitar model v1.5 (`--type guitar_v1_5`). The Colab stem-separated workflow now uses it by default for guitar stems. |
 | 2026-07-16 | 🐛 Fixed a bug in the data augmentation pipeline that caused note timing misalignment, then retrained the bass v2 model (`--type bass_v2`) after the fix. The retrained `bass_v2` improves note detection accuracy and fixes the issue where notes were over-segmented into multiple short notes. These improvements apply only to `bass_v2`. |
