@@ -45,8 +45,8 @@ from infer_stem import run_stem_separated_transcription
 
 class TranskunTranscriber(BaseTranscriber):
 
-    def _transcribe_sync(self, input_path: str, output_folder: str):
-        stem_pipeline_result =run_stem_separated_transcription(
+    def _transcribe_sync(self, input_path: str, output_folder: str) -> str:
+        stem_pipeline_result = run_stem_separated_transcription(
             input_path,
             checkpoint_path=None,
             output_root=OUTPUT_ROOT,
@@ -60,15 +60,15 @@ class TranskunTranscriber(BaseTranscriber):
         )
         merged_midi_path = Path(stem_pipeline_result["merged_midi_path"])
 
-        # Move the merged MIDI file to the audio file's directory
-        audio_dir = Path(input_path).parent
+        # Move the merged MIDI file to the output folder
         new_midi_path = Path(output_folder) / merged_midi_path.name
         shutil.move(merged_midi_path, new_midi_path)
+        return str(new_midi_path)
 
-    async def transcribe(self, input_path: str, output_folder: str):
+    async def transcribe(self, input_path: str, output_folder: str) -> str:
         """异步包装同步推理"""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._transcribe_sync, input_path, output_folder)
+        return await loop.run_in_executor(None, self._transcribe_sync, input_path, output_folder)
 
 
 # ============ 以下为主应用逻辑 ============
@@ -145,10 +145,16 @@ async def download(file_id: str):
     file = next((f for f in UPLOADED_FILES if f["id"] == file_id), None)
     if not file:
         return JSONResponse({"error": "File not found"}, status_code=404)
-    midi_path = os.path.join("outputs", remove_extension(os.path.basename(file["file"])) + ".mid")
+    midi_path = file.get("output") or os.path.join(
+        "outputs", remove_extension(os.path.basename(file["file"])) + ".mid"
+    )
     if not os.path.exists(midi_path):
         return JSONResponse({"error": "MIDI not ready"}, status_code=404)
-    return FileResponse(midi_path, filename=f"{remove_extension(file['file'])}.mid", media_type="audio/midi")
+    return FileResponse(
+        midi_path,
+        filename=os.path.basename(midi_path),
+        media_type="audio/midi",
+    )
 
 # ---------- 转录 ----------
 async def process_transcription():
@@ -159,7 +165,9 @@ async def process_transcription():
             try:
                 file["status"] = "processing"
                 await broadcast_status()
-                await transcriber.transcribe(os.path.join("uploads", file["file"]), "outputs")
+                file["output"] = await transcriber.transcribe(
+                    os.path.join("uploads", file["file"]), "outputs"
+                )
                 file["status"] = "transcribed"
                 await broadcast_status()
             except Exception:
