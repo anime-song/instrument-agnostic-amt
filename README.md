@@ -468,6 +468,8 @@ The stem workflow restricts instrument classification to classes that are plausi
 
 Velocity prediction is enabled by default (`PREDICT_VELOCITY = True`). The velocity checkpoint, `best_velocity_model.pth`, is downloaded automatically from Hugging Face when needed, and the final file is written with a `_velocity.mid` suffix. Set `PREDICT_VELOCITY = False` in the notebook to skip this step.
 
+On GPUs with limited VRAM, set `LOW_VRAM_MODE = True` in the "Run stem-separated transcription" cell (or pass `low_vram_mode=True` to `run_stem_separated_transcription`). All models then stay resident in CPU RAM, and each stem's AMT model is moved to the GPU only while that stem is being transcribed, then moved back immediately, so at most one model occupies VRAM at a time. The same applies to `infer_list.py` runs.
+
 ### Standalone velocity prediction
 
 The velocity model is a separate post-processing model from the AMT note-detection model. Given an existing MIDI file and its separated stem audio, it replaces fixed note velocities with dynamics predicted for each note. The original tracks, pitches, and Note On/Off timing are preserved.

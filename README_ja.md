@@ -426,6 +426,8 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）。必要な velocity チェックポイント `best_velocity_model.pth` は Hugging Face から自動取得され、最終結果は `_velocity.mid` という接尾辞付きで保存されます。この処理を省略する場合は、ノートブック内で `PREDICT_VELOCITY = False` に設定してください。
 
+VRAM が少ない GPU を使う場合は、「Run stem-separated transcription」セルで `LOW_VRAM_MODE = True` に設定してください（`run_stem_separated_transcription` に `low_vram_mode=True` を渡すのと同じです）。すべてのモデルが CPU メモリに常駐し、各ステムを採譜する直前に対象の AMT モデルだけが GPU へ移動され、終わるとすぐ CPU へ戻ります。GPU 上に置かれるモデルは常に 1 つだけです。`infer_list.py` の実行でも同じ設定が使えます。
+
 ### velocity 予測の単体実行
 
 velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。
