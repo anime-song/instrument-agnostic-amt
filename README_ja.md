@@ -428,6 +428,10 @@ velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）�
 
 VRAM が少ない GPU を使う場合は、「Run stem-separated transcription」セルで `LOW_VRAM_MODE = True` に設定してください（`run_stem_separated_transcription` に `low_vram_mode=True` を渡すのと同じです）。すべてのモデルが CPU メモリに常駐し、各ステムを採譜する直前に対象の AMT モデルだけが GPU へ移動され、終わるとすぐ CPU へ戻ります。GPU 上に置かれるモデルは常に 1 つだけです。`infer_list.py` の実行でも同じ設定が使えます。
 
+低显存モードでは、ステム分離ステップも fp16 autocast で実行され、ピーク VRAM が 6GB 級の GPU に収まります。
+
+fp16 が遅い GPU（GTX 16 シリーズなど）では、`no_half=True` を渡すと分離が fp32 + チャンク半分で実行されます。
+
 ### velocity 予測の単体実行
 
 velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。

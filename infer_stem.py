@@ -220,6 +220,7 @@ def get_stem_pipeline_models(
     device_preference: torch.device | str | None = None,
     model_type: str = "default",
     low_vram_mode: bool = False,
+    no_half: bool = False,
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。
 
@@ -240,11 +241,33 @@ def get_stem_pipeline_models(
         model_type=model_type,
     )
     amt_cache_key = ("amt", str(resolved_checkpoint.resolve()), storage_device.type)
-    sep_cache_key = ("sep", storage_device.type)
+    if low_vram_mode:
+        sep_variant = "fp32_half_chunk" if no_half else "fp16"
+    else:
+        sep_variant = "fp32"
+    sep_cache_key = ("sep", storage_device.type, sep_variant)
 
     if sep_cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading Separation model on {storage_device} ...")
-        sep_config = SeparationConfig(skip_existing=True)
+        if low_vram_mode:
+            if no_half:
+                # fp16 非対応/低速な GPU 向け: fp32 のまま、チャンクを半分にして VRAM を抑える。
+                print("[LowVRAM] Separation uses fp32 with half chunks ...")
+                sep_config = SeparationConfig(
+                    skip_existing=True,
+                    use_half_precision=False,
+                    chunk_size=294_400,
+                    hop_size=147_200,
+                )
+            else:
+                # 低显存モードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
+                print("[LowVRAM] Separation uses fp16 autocast ...")
+                sep_config = SeparationConfig(
+                    skip_existing=True,
+                    use_half_precision=True,
+                )
+        else:
+            sep_config = SeparationConfig(skip_existing=True)
         sep_model = load_mss_model(sep_config, device=storage_device)
         sep_dtype = (
             torch.float16
@@ -314,6 +337,7 @@ def run_stem_separated_transcription(
     transcribe_lyrics: bool = False,
     whisper_lyrics_language: str | None = None,
     low_vram_mode: bool = False,
+    no_half: bool = False,
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
 
@@ -329,6 +353,7 @@ def run_stem_separated_transcription(
         checkpoint_path=checkpoint_path,
         model_type="default",
         low_vram_mode=low_vram_mode,
+        no_half=no_half,
     )
     device = bundle["device"]
     sep_config = bundle["sep_config"]
@@ -343,6 +368,7 @@ def run_stem_separated_transcription(
                 checkpoint_path=checkpoint_path,
                 model_type=model_type_key,
                 low_vram_mode=low_vram_mode,
+                no_half=no_half,
             )
         return amt_bundles[model_type_key]
 
