@@ -1,4 +1,6 @@
 import os
+# CUDA アロケータを expandable segments にして、断片化による OOM を防ぐ（torch より先に設定）。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import uuid
 import sys
 import torch
