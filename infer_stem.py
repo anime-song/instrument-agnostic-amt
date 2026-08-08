@@ -2,25 +2,42 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from pathlib import Path
 import shutil
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import librosa
 import numpy as np
 import pretty_midi
 import soundfile as sf
 import torch
+from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 import infer
 from infer_beat_chord import predict_beat_chord_for_midi
+from infer_instrument_refinement import (
+    ensure_refinement_checkpoint,
+    refine_midi_instruments,
+)
 from infer_velocity import predict_velocity_for_stem_midis
+from instrument_agnostic_amt.instrument_refinement.data.labels import (
+    inference_stem_group,
+)
+from instrument_agnostic_amt.instrument_refinement.modeling.checkpoints import (
+    load_refinement_model,
+)
 from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
-from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
-
 
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
 STEM_PIPELINE_CACHE: dict[tuple[str, ...], tuple[object, ...]] = {}
+
+# Instrument Refinement を適用しないステム。
+# drums:  候補がドラムだけになり、ドラムを除外すると候補が空になるため refine できない。
+# vocals: melody / vocal_harmony / choir の違いは音色ではなく役割（主旋律か副次声部か）で、
+#         音色の埋め込みで判断する refinement モデルでは原理的に判別できない。実際に
+#         リード全体がコーラス側へ倒れる例が出たため、AMT の判定をそのまま採用する。
+REFINEMENT_EXCLUDED_STEM_GROUPS = ("drums", "vocals")
 
 
 def merge_midis_logic(
@@ -146,6 +163,25 @@ def resolve_stem_paths(
     return resolved
 
 
+def _load_audio_channels_first(audio_file: Path) -> tuple[np.ndarray, int]:
+    """音声を (チャンネル, サンプル) の配列とサンプルレートで読む。
+
+    wav/flac/ogg/mp3 は soundfile で読み、それが扱えない形式（m4a など）だけ
+    librosa へフォールバックする。librosa は resampler の都合で環境によって
+    読み込みに失敗することがあるため、対応形式では通らないようにしている。
+    """
+    try:
+        data, sample_rate = sf.read(str(audio_file), dtype="float32", always_2d=True)
+        return data.T, int(sample_rate)
+    except sf.SoundFileError:
+        waveform, sample_rate = librosa.load(str(audio_file), sr=None, mono=False)
+        if waveform.ndim == 1:
+            waveform = waveform[None, :]
+        elif waveform.ndim == 2 and waveform.shape[0] > waveform.shape[1]:
+            waveform = waveform.T
+        return np.asarray(waveform, dtype=np.float32), int(sample_rate)
+
+
 def prepare_audio_for_stem_separation(
     audio_path: Path | str,
     *,
@@ -153,12 +189,7 @@ def prepare_audio_for_stem_separation(
 ) -> Path:
     """Stem Separation 向けに入力音声を一時的に 2ch WAV へそろえる。"""
     audio_file = Path(audio_path)
-    waveform, sample_rate = librosa.load(str(audio_file), sr=None, mono=False)
-
-    if waveform.ndim == 1:
-        waveform = waveform[None, :]
-    elif waveform.ndim == 2 and waveform.shape[0] > waveform.shape[1]:
-        waveform = waveform.T
+    waveform, sample_rate = _load_audio_channels_first(audio_file)
 
     source_channels = int(waveform.shape[0])
     if source_channels <= 0:
@@ -237,6 +268,114 @@ def get_stem_pipeline_models(
     }
 
 
+def get_refinement_models(
+    checkpoint_path: Path | str | None = None,
+    device_preference: torch.device | str | None = None,
+) -> dict[str, object]:
+    """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
+    if device_preference is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_preference)
+
+    resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
+    cache_key = ("refine", str(resolved_checkpoint), device.type)
+
+    if cache_key not in STEM_PIPELINE_CACHE:
+        print(f"Loading Instrument Refinement model on {device} ...")
+        refinement_model, refinement_config, _ = load_refinement_model(
+            resolved_checkpoint,
+            device=device,
+        )
+        STEM_PIPELINE_CACHE[cache_key] = (refinement_model, refinement_config)
+    else:
+        print(f"Reusing cached Instrument Refinement model on {device} ...")
+        refinement_model, refinement_config = STEM_PIPELINE_CACHE[cache_key]
+
+    return {
+        "device": device,
+        "checkpoint": resolved_checkpoint,
+        "refinement_model": refinement_model,
+        "refinement_config": refinement_config,
+    }
+
+
+def refine_stem_instrument_midis(
+    stem_midis: Mapping[str, Path | str],
+    stem_audios: Mapping[str, Path | str],
+    *,
+    output_dir: Path | str,
+    refinement_model: object,
+    refinement_config: object,
+    device: torch.device | str | None = None,
+    stem_names: Sequence[str] | None = None,
+    mode: str = "cluster",
+    window_seconds: float = 8.0,
+    stride_seconds: float = 4.0,
+    disable_tqdm: bool = True,
+) -> dict[str, Path]:
+    """ステム音声を使って各ステム MIDI の楽器ラベルを付け直す。
+
+    REFINEMENT_EXCLUDED_STEM_GROUPS のステムは stem_names で明示しても常にスキップする。
+    再ラベリングできたステムだけを stem 名 -> 新しい MIDI パスで返す。
+    """
+    output_directory = Path(output_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    selected_stem_names = (
+        {str(name).lower() for name in stem_names} if stem_names is not None else None
+    )
+    refined_midi_paths: dict[str, Path] = {}
+
+    for stem_name, midi_path in sorted(stem_midis.items()):
+        if (
+            selected_stem_names is not None
+            and stem_name.lower() not in selected_stem_names
+        ):
+            continue
+        stem_group = inference_stem_group(stem_name)
+        if stem_group in REFINEMENT_EXCLUDED_STEM_GROUPS:
+            print(f"Skipping instrument refinement for {stem_group} stem: {stem_name}")
+            continue
+
+        stem_audio_path = stem_audios.get(stem_name)
+        if stem_audio_path is None or not Path(stem_audio_path).exists():
+            print(f"Skipping instrument refinement for {stem_name}: stem audio not found")
+            continue
+
+        source_midi = Path(midi_path)
+        refined_midi = output_directory / f"{source_midi.stem}_refined.mid"
+        report = refine_midi_instruments(
+            stem_audio_path,
+            source_midi,
+            output_midi_path=refined_midi,
+            stem_name=stem_name,
+            device=device,
+            window_seconds=window_seconds,
+            stride_seconds=stride_seconds,
+            mode=mode,
+            disable_tqdm=disable_tqdm,
+            preloaded_model=refinement_model,
+            preloaded_config=refinement_config,
+        )
+        refined_midi_paths[stem_name] = refined_midi
+
+        refined_class_names = sorted(
+            {
+                cluster["candidates"][0]["class_name"]
+                for cluster in report["clusters"]
+                if cluster["candidates"]
+            }
+        )
+        print(
+            f"Refined stem: {stem_name} (notes={report['note_count']}, "
+            f"clusters={report['cluster_count']}, "
+            f"instruments={','.join(refined_class_names) or 'none'})"
+        )
+
+    return refined_midi_paths
+
+
 def resolve_stem_model_type(stem_name: str) -> str:
     """ステム名に対応する AMT モデルタイプを選択する。"""
     stem_name_lower = stem_name.lower()
@@ -262,13 +401,17 @@ def run_stem_separated_transcription(
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
     cleanup_separated_stems: bool = False,
+    refine_instruments: bool = False,
+    refinement_checkpoint_path: Path | str | None = None,
+    refinement_mode: str = "cluster",
+    refinement_stem_names: Sequence[str] | None = None,
     predict_velocity: bool = True,
     velocity_checkpoint_path: Path | str | None = None,
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     merge_onset_ms: float = 20.0,
 ) -> dict[str, object]:
-    """ステム分離 -> 各ステム採譜 -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
+    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
     audio_file = Path(audio_path)
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
@@ -293,6 +436,7 @@ def run_stem_separated_transcription(
     run_root = Path(output_root) / audio_file.stem
     stem_dir = run_root / "stems"
     stem_midi_dir = run_root / "stem_midis"
+    refined_stem_midi_dir = run_root / "refined_stem_midis"
     merged_dir = run_root / "merged"
     for directory in (stem_dir, stem_midi_dir, merged_dir):
         directory.mkdir(parents=True, exist_ok=True)
@@ -325,7 +469,7 @@ def run_stem_separated_transcription(
             raise RuntimeError(f"No stems found for {audio_file.stem}")
 
     # 4. 各ステムを採譜。
-    song_midi_paths: list[Path] = []
+    stem_midi_paths: dict[str, Path] = {}
     for stem_name, stem_path in sorted(stems.items()):
         if not transcribe_drum_stems and "drum" in stem_name.lower():
             print(f"Skipping drum stem: {stem_name}")
@@ -383,10 +527,41 @@ def run_stem_separated_transcription(
             instrument_volumes=instrument_volumes,
         )
         midi.write(str(output_midi))
-        song_midi_paths.append(output_midi)
+        stem_midi_paths[stem_name] = output_midi
 
-    if not song_midi_paths:
+    if not stem_midi_paths:
         raise RuntimeError("No stem MIDI files were generated")
+
+    # 4.5 Instrument Refinement でステム内の楽器ラベルを付け直す。
+    instruments_refined = False
+    if refine_instruments:
+        try:
+            print("Refining stem instrument labels...")
+            refinement_bundle = get_refinement_models(
+                checkpoint_path=refinement_checkpoint_path,
+                device_preference=device,
+            )
+            refined_midi_paths = refine_stem_instrument_midis(
+                stem_midis=stem_midi_paths,
+                stem_audios=stems,
+                output_dir=refined_stem_midi_dir,
+                refinement_model=refinement_bundle["refinement_model"],
+                refinement_config=refinement_bundle["refinement_config"],
+                device=device,
+                stem_names=refinement_stem_names,
+                mode=refinement_mode,
+                disable_tqdm=True,
+            )
+            if refined_midi_paths:
+                stem_midi_paths.update(refined_midi_paths)
+                instruments_refined = True
+                print(f"Refined stem MIDI files: {sorted(refined_midi_paths)}")
+            else:
+                print("Warning: No stem was eligible for instrument refinement")
+        except Exception as err:
+            print(f"Warning: Instrument refinement skipped due to error: {err}")
+
+    song_midi_paths = [stem_midi_paths[stem_name] for stem_name in sorted(stem_midi_paths)]
 
     # 5. ステムごとの MIDI を 1 本にまとめる。
     merged_midi_path = merged_dir / f"{audio_file.stem}.mid"
@@ -401,9 +576,9 @@ def run_stem_separated_transcription(
         try:
             print("Predicting note velocities from separated stems...")
             stem_midis_map = {
-                stem_name: stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid"
-                for stem_name in stems.keys()
-                if (stem_midi_dir / f"{audio_file.stem}_{stem_name}.mid").exists()
+                stem_name: midi_path
+                for stem_name, midi_path in stem_midi_paths.items()
+                if Path(midi_path).exists()
             }
             velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
             predict_velocity_for_stem_midis(
@@ -450,8 +625,11 @@ def run_stem_separated_transcription(
         "merged_midi_path": str(merged_midi_path),
         "stem_count": len(stems),
         "transcribed_stem_count": len(song_midi_paths),
+        "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
     }
+    if instruments_refined:
+        result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)
     print("Final Merged MIDI:", merged_midi_path)
     return result

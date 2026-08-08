@@ -30,8 +30,7 @@ def _load_pedalboard_modulation_plugins():
         from pedalboard import Chorus, Phaser
     except ImportError as exc:
         raise ImportError(
-            "pedalboard is required for chorus/phaser augmentation. "
-            "Please install it with `pip install pedalboard`."
+            "pedalboard is required for chorus/phaser augmentation. Please install it with `pip install pedalboard`."
         ) from exc
 
     _PEDALBOARD_CHORUS = Chorus
@@ -100,6 +99,59 @@ def transient_gain_augment(
     return y.astype(np.float32)
 
 
+_ENVELOPE_FOLLOWER = None
+
+
+def _follow_envelope(
+    sidechain: np.ndarray,
+    attack_coeff: float,
+    release_coeff: float,
+) -> np.ndarray:
+    """アタック/リリースで係数が変わる 1 次のエンベロープフォロワ。
+
+    係数が「今の入力と直前の出力の比較」で切り替わるため、この再帰は
+    lfilter のような線形フィルタへ落とせず、素直に 1 サンプルずつ回すしかない。
+    22050 Hz の 8 秒窓は 17 万サンプルあり、素の Python だと 1 本 70 ms かかる。
+
+    累算は float64 で行い、書き出すときだけ float32 に丸める。numba を使う場合も
+    この型の扱いをそろえてあるので、結果は 1 bit も変わらない。
+    """
+    n = sidechain.shape[0]
+    env = np.empty(n, dtype=np.float32)
+    prev = 0.0
+    for i in range(n):
+        current = float(sidechain[i])
+        coeff = attack_coeff if current > prev else release_coeff
+        prev = coeff * prev + (1.0 - coeff) * current
+        env[i] = prev
+    return env
+
+
+def _get_envelope_follower():
+    """numba があれば JIT 版を、無ければ素の Python 版を返す。
+
+    numba は librosa 経由で入っていることが多いだけで直接の依存ではないので、
+    欠けていても動くようにしておく（その場合は従来どおりの速度になる）。
+    """
+    global _ENVELOPE_FOLLOWER
+
+    if _ENVELOPE_FOLLOWER is not None:
+        return _ENVELOPE_FOLLOWER
+
+    try:
+        from numba import njit
+    except ImportError:
+        _ENVELOPE_FOLLOWER = _follow_envelope
+        return _ENVELOPE_FOLLOWER
+
+    try:
+        # cache=True にしておかないと DataLoader のワーカーごとに JIT が走る。
+        _ENVELOPE_FOLLOWER = njit(cache=True)(_follow_envelope)
+    except Exception:
+        _ENVELOPE_FOLLOWER = _follow_envelope
+    return _ENVELOPE_FOLLOWER
+
+
 def db_to_amp(db: float) -> float:
     return 10.0 ** (db / 20.0)
 
@@ -161,19 +213,11 @@ def compressor_augment(
     attack_coeff = np.exp(-1.0 / max(1.0, sample_rate * attack_ms / 1000.0))
     release_coeff = np.exp(-1.0 / max(1.0, sample_rate * release_ms / 1000.0))
 
-    env = np.empty_like(sidechain, dtype=np.float32)
-    prev = 0.0
-
-    for i in range(n):
-        current = float(sidechain[i])
-
-        if current > prev:
-            coeff = attack_coeff
-        else:
-            coeff = release_coeff
-
-        prev = coeff * prev + (1.0 - coeff) * current
-        env[i] = prev
+    env = _get_envelope_follower()(
+        np.ascontiguousarray(sidechain, dtype=np.float32),
+        float(attack_coeff),
+        float(release_coeff),
+    )
 
     env_db = amp_to_db(env)
 
@@ -608,17 +652,13 @@ class AudioAugmentor:
                 Lambda,
             )
         except ImportError:
-            raise ImportError(
-                "audiomentations is not installed. Please run `pip install audiomentations`"
-            )
+            raise ImportError("audiomentations is not installed. Please run `pip install audiomentations`")
 
         # Lambda内でランダムに失敗しないよう、初期化時に依存を確認する。
         _load_pedalboard_modulation_plugins()
 
         self.sample_rate = sample_rate
-        self.distortion_augmentations = _validate_distortion_augmentations(
-            distortion_augmentations
-        )
+        self.distortion_augmentations = _validate_distortion_augmentations(distortion_augmentations)
 
         nyq = sample_rate / 2
         high_shelf_max = min(9000.0, nyq * 0.85)
@@ -629,11 +669,9 @@ class AudioAugmentor:
                 PitchShift(
                     min_semitones=pitch_shift_semitones[0],
                     max_semitones=pitch_shift_semitones[1],
-                    p=0.5,
+                    p=0.1,
                 ),
-                SevenBandParametricEQ(
-                    min_gain_db=eq_db_range[0], max_gain_db=eq_db_range[1], p=0.5
-                ),
+                SevenBandParametricEQ(min_gain_db=eq_db_range[0], max_gain_db=eq_db_range[1], p=0.5),
                 SomeOf(
                     (1, 3),
                     [
@@ -825,9 +863,7 @@ class AudioAugmentor:
                     )
                 )
 
-        noise_transforms.append(
-            AddGaussianSNR(min_snr_db=snr_range[0], max_snr_db=snr_range[1], p=0.5)
-        )
+        noise_transforms.append(AddGaussianSNR(min_snr_db=snr_range[0], max_snr_db=snr_range[1], p=0.5))
         self.noise_transform = Compose(noise_transforms)
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
@@ -893,9 +929,7 @@ if __name__ == "__main__":
     import os
     import soundfile as sf
 
-    parser = argparse.ArgumentParser(
-        description="Save dry and chorus/phaser previews using librosa's trumpet example."
-    )
+    parser = argparse.ArgumentParser(description="Save dry and chorus/phaser previews using librosa's trumpet example.")
     parser.add_argument(
         "--out_dir",
         type=Path,
@@ -934,9 +968,7 @@ if __name__ == "__main__":
     try:
         import librosa
     except ImportError as exc:
-        raise ImportError(
-            "librosa is required for the preview. Please install it with `pip install librosa`."
-        ) from exc
+        raise ImportError("librosa is required for the preview. Please install it with `pip install librosa`.") from exc
 
     try:
         audio_path = librosa.ex("trumpet")

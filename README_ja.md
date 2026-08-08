@@ -417,14 +417,33 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 1. 入力した曲をステム分離する
 2. 各ステムを個別に採譜する
-3. ステムごとの MIDI を 1 本へマージする
-4. 対応する分離ステム音声から MIDI ノートごとの velocity を予測する
+3. （任意）instrument refinement モデルで各ノートの楽器を付け直す
+4. ステムごとの MIDI を 1 本へマージする
+5. 対応する分離ステム音声から MIDI ノートごとの velocity を予測する
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
 
 velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）。必要な velocity チェックポイント `best_velocity_model.pth` は Hugging Face から自動取得され、最終結果は `_velocity.mid` という接尾辞付きで保存されます。この処理を省略する場合は、ノートブック内で `PREDICT_VELOCITY = False` に設定してください。
+
+楽器の再判定（instrument refinement）はデフォルトで無効です（`REFINE_INSTRUMENTS = False`）。有効にすると、ステムごとの MIDI をマージする前に各分離ステムをもう一度聴き直し、ノートの楽器クラスを割り当て直します。そのため velocity 予測とマージ結果の両方が修正後の楽器を使います。再判定後のステム MIDI は、元の `stem_midis/` と並べて `refined_stem_midis/` に書き出されます。特定のチェックポイントを使う場合は `REFINEMENT_CHECKPOINT` を設定してください。空のままにすると `checkpoints/best_instrument_refinement.pth`、またはローカルで学習した `instrument_agnostic_amt/instrument_refinement/artifacts/checkpoints/best_model.pth` を解決し、どちらも無ければ Hugging Face からチェックポイントを取得します。
+
+ドラムとボーカルのステムは常にスキップされます。ドラムはドラム以外の候補クラスを持たないため、割り当て直す対象がありません。ボーカルを除外する理由はそれとは別で、`melody` と `vocal_harmony` の区別は音色ではなく音楽的な役割（主旋律か、その下に重ねるパートか）の問題であるのに対し、refinement モデルは音色の埋め込みから判断するためです。実際にはボーカルステム全体がどちらか一方に潰れてしまうため、AMT モデル自身のボーカルラベルをそのまま使います。
+
+### 楽器再判定（instrument refinement）の単体実行
+
+instrument refinement モデルは、採譜元となった分離ステム音声を使って、既存の MIDI にあるすべてのノートの楽器を判定し直します。ノートのタイミングとピッチは維持され、楽器の割り当て（トラックのプログラム番号と名前）だけが変わります。
+
+```bash
+python infer_instrument_refinement.py \
+  --audio separated_stems/song_other.wav \
+  --midi stem_midis/song_other.mid \
+  --stem-name other \
+  --output-midi song_other_refined.mid
+```
+
+`--stem-name` を指定すると、その分離ステムで妥当な楽器クラスだけに候補を絞ります。`--mode cluster`（既定）は音色の埋め込みが近いノートをグループにまとめ、グループごとに楽器を割り当てます。`--mode single` はステム全体に 1 つの楽器を割り当てます。`--checkpoint` を省略した場合は、上記のローカルパスから解決するか、Hugging Face から取得します。
 
 ### velocity 予測の単体実行
 

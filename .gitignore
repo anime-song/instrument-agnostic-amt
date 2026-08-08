@@ -243,3 +243,9 @@ beat_dataset_midi/
 batch_process_unlabeled.py
 configs/
 scripts/prepare_guitar_pro_beat_midis.py
+source_separation_dataset/
+instrument_refinement_datasets.local.json
+AGENTS.md
+colab_outputs/
+prepare_real_recordings.py
+run_refine_pipeline.py

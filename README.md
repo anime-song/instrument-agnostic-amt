@@ -459,14 +459,33 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 1. separates the uploaded song into stems,
 2. transcribes the separated stems individually,
-3. merges the per-stem MIDI files,
-4. predicts the velocity of each MIDI note from the corresponding separated stem audio.
+3. optionally relabels the instrument of each note with the instrument refinement model,
+4. merges the per-stem MIDI files,
+5. predicts the velocity of each MIDI note from the corresponding separated stem audio.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
 Velocity prediction is enabled by default (`PREDICT_VELOCITY = True`). The velocity checkpoint, `best_velocity_model.pth`, is downloaded automatically from Hugging Face when needed, and the final file is written with a `_velocity.mid` suffix. Set `PREDICT_VELOCITY = False` in the notebook to skip this step.
+
+Instrument refinement is disabled by default (`REFINE_INSTRUMENTS = False`). When it is enabled, each separated stem is listened to again and the instrument class of its notes is reassigned before the per-stem MIDI files are merged, so velocity prediction and the merged result both use the corrected instruments. Refined stem MIDI files are written to `refined_stem_midis/` next to the original `stem_midis/`. Set `REFINEMENT_CHECKPOINT` to use a specific checkpoint; leaving it empty resolves `checkpoints/best_instrument_refinement.pth` or a locally trained `instrument_agnostic_amt/instrument_refinement/artifacts/checkpoints/best_model.pth`, and otherwise downloads the checkpoint from Hugging Face.
+
+Drum and vocal stems are always skipped. Drums have no non-drum candidate classes, so there is nothing to reassign. Vocals are excluded for a different reason: telling `melody` from `vocal_harmony` is a question of musical role — lead line versus a part layered under it — rather than of timbre, and the refinement model decides from timbre embeddings. In practice it collapses an entire vocal stem onto one of the two, so the AMT model's own vocal labels are kept instead.
+
+### Standalone instrument refinement
+
+The instrument refinement model reclassifies the instrument of every note in an existing MIDI file using the separated stem audio it was transcribed from. Note timing and pitch are preserved; only the instrument assignment (track program and name) changes.
+
+```bash
+python infer_instrument_refinement.py \
+  --audio separated_stems/song_other.wav \
+  --midi stem_midis/song_other.mid \
+  --stem-name other \
+  --output-midi song_other_refined.mid
+```
+
+`--stem-name` restricts the candidate instruments to the classes that are plausible for that separated stem. `--mode cluster` (the default) groups notes with a similar timbre embedding and labels each group, while `--mode single` assigns one instrument to the whole stem. If `--checkpoint` is omitted, the checkpoint is resolved from the local paths described above or downloaded from Hugging Face.
 
 ### Standalone velocity prediction
 
