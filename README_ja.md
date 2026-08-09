@@ -47,8 +47,9 @@
 
 | 日付 | 内容 |
 |---|---|
+| 2026-08-09 | 🎹 分離ステムを使って AMT のノートに楽器クラスを振り直す Instrument Refinement モデルを追加しました。音色の近いものを同じクラスにまとめるので、1 曲の中で楽器がころころ入れ替わることが減り、手作業で修正する際の一貫性が高くなります。学習に使っていない RWC-I ベンチマークでは全体の top-1 が 71.3% から 74.5% に向上しましたが、**楽器単体で見ると上がったものと下がったものがあります**。楽器ごとの増減と、どの楽器がどの楽器に間違われるかは [RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK_ja.md) を参照してください。 |
 | 2026-07-30 | ビート・コード・キーの推論モデルをパイプラインに追加しました。デフォルトでは無効になっています。 |
-| 2026-07-24 | 分離ステム音声からノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
+| 2026-07-24 | 分離ステムからノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
 | 2026-07-22 | ギター専用モデル v1.5（`--type guitar_v1_5`）を追加。Colab のステム分離ワークフローでは、ギターステムの既定モデルとして使用します。 |
 | 2026-07-16 | 🐛 データ拡張処理の不具合によりノートのタイミングにずれが生じていた問題を修正し、修正後にベースモデル v2（`--type bass_v2`）を再学習しました。再学習した `bass_v2` ではノート検出精度が向上し、1つのノートが複数の短いノートに過剰分割される問題も修正されています。これらの改善は `bass_v2` のみに適用されます。 |
 | 2026-07-15 | 🎸 ベースモデル v2（`--type bass_v2`）を追加。楽器分類におけるスラップベースの分類精度が向上しました。 |
@@ -71,7 +72,7 @@
 - 🎹 **楽器を問わない採譜** — ピアノ、ギター、ベース、ボーカル、ストリングス、管楽器など
 - 🧠 **Neural Semi-CRF + Pitch Slot** — ピッチごとに最適なノート区間を Viterbi で一括デコード。Pitch Slot により同じ音程の重複ノートも同時に予測可能
 - 🎼 **HCQT 特徴量** — 5つの倍音 × ステレオ 2ch の Harmonic CQT で音高情報をしっかり捉える
-- 🎚️ **ノート単位の velocity 予測** — 専用の後処理モデルが分離ステム音声から MIDI ノートの強弱を推定
+- 🎚️ **ノート単位の velocity 予測** — 専用の後処理モデルが分離ステムから MIDI ノートの強弱を推定
 - 🔧 **豊富なデータ拡張** — ステムの混ぜ合わせ、IR リバーブ、EQ、ノイズ、ドラム追加など
 - 🧪 **[実験的] 楽器識別 & マルチトラック出力** — 33+ 楽器クラスの分類ヘッド付き（精度は改善中）
 
@@ -367,7 +368,7 @@ datasets:
 
 ## MIDIフレームによるビート・コード学習
 
-MIDIフレームのビート・コードモデルは、通常の音声AMT学習から独立させて
+MIDIフレームのビート・コードモデルは、通常のAMT学習から独立させて
 [`instrument_agnostic_amt/beat_chord`](instrument_agnostic_amt/beat_chord/README.md)
 に配置しています。MIDIのtempo・拍子情報を使うbeat事前学習、AMTで生成したmerged MIDIを
 使うbeat/chord joint学習、MIDIからのbeat/chord推論に対応します。
@@ -387,7 +388,7 @@ beat/chord推論では、既定で
 `beat_chord_predictions/<song>.beat_mapped.mid` も出力します。このType 1 MIDIには、
 予測した連続tempo・拍子mapのconductor track、独立したコードmarker track、
 および元の演奏trackを新しいtempo mapへ再配置したコピーが入ります。全イベントを一度
-絶対秒へ変換してから再配置するため、ペアの音声との同期は維持されます。保存後に再読込し、
+絶対秒へ変換してから再配置するため、ペアのオーディオとの同期は維持されます。保存後に再読込し、
 note時刻の誤差が1ms以内であることも検証します。保存先は
 `--beat_mapped_midi_path`、出力の無効化は `--disable_beat_mapped_midi` で指定できます。
 小節内の拍位置の小さな揺れは安定した小節単位tempo区間へ正規化し、検出したダウンビートは
@@ -419,7 +420,7 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 2. 各ステムを個別に採譜する
 3. （任意）instrument refinement モデルで各ノートの楽器を付け直す
 4. ステムごとの MIDI を 1 本へマージする
-5. 対応する分離ステム音声から MIDI ノートごとの velocity を予測する
+5. 対応する分離ステムから MIDI ノートごとの velocity を予測する
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
@@ -433,7 +434,7 @@ velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）�
 
 ### 楽器再判定（instrument refinement）の単体実行
 
-instrument refinement モデルは、採譜元となった分離ステム音声を使って、既存の MIDI にあるすべてのノートの楽器を判定し直します。ノートのタイミングとピッチは維持され、楽器の割り当て（トラックのプログラム番号と名前）だけが変わります。
+instrument refinement モデルは、採譜元となった分離ステムを使って、既存の MIDI にあるすべてのノートの楽器を判定し直します。ノートのタイミングとピッチは維持され、楽器の割り当て（トラックのプログラム番号と名前）だけが変わります。
 
 ```bash
 python infer_instrument_refinement.py \
@@ -447,7 +448,7 @@ python infer_instrument_refinement.py \
 
 ### velocity 予測の単体実行
 
-velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステム音声を入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。
+velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステムを入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。
 
 ```bash
 python infer_velocity.py \
@@ -456,7 +457,7 @@ python infer_velocity.py \
   --output-midi output_velocity.mid
 ```
 
-`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離音声を配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
 
 ### その他のオプション
 

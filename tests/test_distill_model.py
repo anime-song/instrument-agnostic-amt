@@ -83,6 +83,49 @@ def test_public_beat_chord_checkpoint_requires_quality_vocabulary() -> None:
         build_public_checkpoint(_source_checkpoint())
 
 
+def _refinement_checkpoint() -> dict[str, object]:
+    """instrument refinement 側の保存形式。beat/chord のメタデータは持たない。"""
+    return {
+        "checkpoint_format_version": 1,
+        "task": "instrument_refinement",
+        "epoch": 11,
+        "model_config": {"sample_rate": 22_050, "num_instrument_classes": 36},
+        "model_state_dict": {"weight": torch.tensor([1.0])},
+        "optimizer_state_dict": {"private": "training-only"},
+        "training_args": {"manifest": Path("/private/manifest.csv")},
+    }
+
+
+def test_refinement_checkpoint_keeps_the_task_its_loader_validates() -> None:
+    # load_refinement_model は task == "instrument_refinement" を要求するので、
+    # これを落とすと配布物が読めなくなる。
+    public = build_public_checkpoint(_refinement_checkpoint())
+
+    assert public["task"] == "instrument_refinement"
+    assert set(public) == {
+        "checkpoint_format",
+        "task",
+        "model_state_dict",
+        "model_config",
+    }
+    assert not _contains_path(public)
+
+
+def test_task_is_omitted_when_the_source_has_none() -> None:
+    source = _refinement_checkpoint()
+    source.pop("task")
+
+    assert "task" not in build_public_checkpoint(source)
+
+
+def test_blank_task_is_rejected_instead_of_being_published() -> None:
+    source = _refinement_checkpoint()
+    source["task"] = "   "
+
+    with pytest.raises(ValueError, match="task"):
+        build_public_checkpoint(source)
+
+
 def test_distill_rejects_ambiguous_non_state_dict_checkpoint() -> None:
     source = _source_checkpoint()
     source.pop("ema_state_dict")
