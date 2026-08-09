@@ -623,7 +623,7 @@ def run_stem_separated_transcription(
                 instrument_volumes=instrument_volumes,
             )
             midi.write(str(output_midi))
-            song_midi_paths.append(output_midi)
+            stem_midi_paths[stem_name]=output_midi
         finally:
             if low_vram_mode:
                 print(f"[LowVRAM] Moving AMT model ({model_type}) back to CPU ...")
