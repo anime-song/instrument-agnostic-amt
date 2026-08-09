@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-08-09 | 🎹 Added the Instrument Refinement model, which re-assigns instrument classes to AMT notes using the separated stem audio. It pulls timbrally close sounds onto a single class, so the instrument stops flickering within a piece and manual clean-up gets easier. Overall top-1 on the held-out RWC-I benchmark improves from 71.3% to 74.5%, but **individual instruments both gain and lose** — see [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md) for the per-instrument breakdown and what each instrument is confused with. |
 | 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
 | 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
 | 2026-07-22 | Added guitar model v1.5 (`--type guitar_v1_5`). The Colab stem-separated workflow now uses it by default for guitar stems. |
@@ -459,8 +460,9 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 1. separates the uploaded song into stems,
 2. transcribes the separated stems individually,
-3. merges the per-stem MIDI files,
-4. predicts the velocity of each MIDI note from the corresponding separated stem audio.
+3. optionally relabels the instrument of each note with the instrument refinement model,
+4. merges the per-stem MIDI files,
+5. predicts the velocity of each MIDI note from the corresponding separated stem audio.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
@@ -473,6 +475,23 @@ On GPUs with limited VRAM, set `LOW_VRAM_MODE = True` in the "Run stem-separated
 In low VRAM mode the stem separation step also runs with fp16 autocast, reducing its peak VRAM so it fits on a 6 GB GPU.
 
 On GPUs where fp16 is slow (e.g. GTX 16-series), pass `no_half=True` to run separation in fp32 with halved chunks instead.
+Instrument refinement is disabled by default (`REFINE_INSTRUMENTS = False`). When it is enabled, each separated stem is listened to again and the instrument class of its notes is reassigned before the per-stem MIDI files are merged, so velocity prediction and the merged result both use the corrected instruments. Refined stem MIDI files are written to `refined_stem_midis/` next to the original `stem_midis/`. Set `REFINEMENT_CHECKPOINT` to use a specific checkpoint; leaving it empty resolves `checkpoints/best_instrument_refinement.pth` or a locally trained `instrument_agnostic_amt/instrument_refinement/artifacts/checkpoints/best_model.pth`, and otherwise downloads the checkpoint from Hugging Face.
+
+Drum and vocal stems are always skipped. Drums have no non-drum candidate classes, so there is nothing to reassign. Vocals are excluded for a different reason: telling `melody` from `vocal_harmony` is a question of musical role — lead line versus a part layered under it — rather than of timbre, and the refinement model decides from timbre embeddings. In practice it collapses an entire vocal stem onto one of the two, so the AMT model's own vocal labels are kept instead.
+
+### Standalone instrument refinement
+
+The instrument refinement model reclassifies the instrument of every note in an existing MIDI file using the separated stem audio it was transcribed from. Note timing and pitch are preserved; only the instrument assignment (track program and name) changes.
+
+```bash
+python infer_instrument_refinement.py \
+  --audio separated_stems/song_other.wav \
+  --midi stem_midis/song_other.mid \
+  --stem-name other \
+  --output-midi song_other_refined.mid
+```
+
+`--stem-name` restricts the candidate instruments to the classes that are plausible for that separated stem. `--mode cluster` (the default) groups notes with a similar timbre embedding and labels each group, while `--mode single` assigns one instrument to the whole stem. If `--checkpoint` is omitted, the checkpoint is resolved from the local paths described above or downloaded from Hugging Face.
 
 ### Standalone velocity prediction
 

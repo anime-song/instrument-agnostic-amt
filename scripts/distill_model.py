@@ -127,6 +127,21 @@ def _extract_chord_quality_map(
     )
 
 
+def _extract_task(checkpoint: Mapping[str, Any]) -> str | None:
+    """モデルの種別を引き継ぐ。
+
+    instrument refinement のローダーは checkpoint["task"] を見て
+    「これは refinement のものか」を判定するので、落とすと配布物が読めなくなる。
+    固定の識別子でパスは含まないため、そのまま公開してよい。
+    """
+    task = checkpoint.get("task")
+    if task is None:
+        return None
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("checkpoint task must be a non-empty string")
+    return task
+
+
 def _extract_inference_config(
     checkpoint: Mapping[str, Any],
 ) -> dict[str, int] | None:
@@ -182,6 +197,9 @@ def build_public_checkpoint(
         "model_state_dict": _select_inference_state_dict(checkpoint),
         "model_config": model_config,
     }
+    task = _extract_task(checkpoint)
+    if task is not None:
+        public_checkpoint["task"] = task
     meter_classes = _extract_meter_classes(checkpoint, model_config)
     if meter_classes is not None:
         public_checkpoint["beat_meter_classes"] = meter_classes
