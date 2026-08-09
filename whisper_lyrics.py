@@ -94,6 +94,9 @@ def add_whisper_lyrics_to_vocals_midi(
     segments, info = model.transcribe(
         str(vocals_wav), language=language, word_timestamps=True, beam_size=5
     )
+    if info.language_probability < 0.65:
+        print("Language probability is less than 0.65, skipping transcription.")
+        return
     print(f"   Detected language: {info.language} (p={info.language_probability:.2f})")
 
     # 2. Read the stem MIDI via pretty_midi (builds an internal tempo map)
