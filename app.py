@@ -24,12 +24,7 @@ import json
 from typing import Optional
 
 OUTPUT_ROOT = "U:"  # @param {type:"string"}
-WINDOW_BATCH_SIZE = 4  # @param {type:"integer"}
-MAX_MIDI_MELODIC_INSTRUMENTS = 15  # @param {type:"integer"}
-SKIP_DRUM_STEMS = True  # @param {type:"boolean"}
 CLEANUP_SEPARATED_STEMS = True  # @param {type:"boolean"}
-MERGE_ONSET_MS = 50.0  # @param {type:"number"}
-
 
 
 def remove_extension(file: str):
@@ -50,14 +45,8 @@ class TranskunTranscriber(BaseTranscriber):
     def _transcribe_sync(self, input_path: str, output_folder: str) -> str:
         stem_pipeline_result = run_stem_separated_transcription(
             input_path,
-            checkpoint_path=None,
             output_root=OUTPUT_ROOT,
-            window_batch_size=WINDOW_BATCH_SIZE,
-            max_midi_melodic_instruments=MAX_MIDI_MELODIC_INSTRUMENTS,
             cleanup_separated_stems=CLEANUP_SEPARATED_STEMS,
-            merge_onset_ms=MERGE_ONSET_MS,
-            predict_beat_chord=True,
-            transcribe_lyrics=True,
             low_vram_mode=True
         )
         merged_midi_path = Path(stem_pipeline_result["merged_midi_path"])

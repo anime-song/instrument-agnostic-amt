@@ -21,7 +21,7 @@ from infer_instrument_refinement import (
     refine_midi_instruments,
 )
 from infer_velocity import predict_velocity_for_stem_midis
-from whisper_lyrics import add_whisper_lyrics_to_vocals_midi
+from instrument_agnostic_amt.whisper_lyrics import add_whisper_lyrics_to_vocals_midi
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
 )
@@ -468,16 +468,17 @@ def run_stem_separated_transcription(
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
     cleanup_separated_stems: bool = False,
-    refine_instruments: bool = False,
+    refine_instruments: bool = True,
     refinement_checkpoint_path: Path | str | None = None,
     refinement_mode: str = "cluster",
-    refinement_stem_names: Sequence[str] | None = None,
+    refinement_stem_names: Sequence[str] | None = ["piano","bass","guitar"],
     predict_velocity: bool = True,
     velocity_checkpoint_path: Path | str | None = None,
-    predict_beat_chord: bool = False,
+    predict_beat_chord: bool = True,
     beat_chord_checkpoint_path: Path | str | None = None,
-    merge_onset_ms: float = 20.0,
-    transcribe_lyrics: bool = False,
+    merge_onset_ms: float = 50.0,
+    transcribe_lyrics: bool = True,
+    lyrics_confidence_threshold: float = 0.65,
     whisper_lyrics_language: str | None = None,
     low_vram_mode: bool = False,
     no_half: bool = False,
@@ -638,6 +639,7 @@ def run_stem_separated_transcription(
                     stem_midi_path=output_midi,
                     language=whisper_lyrics_language,
                     target_track_name="vocals",
+                    lyrics_confidence_threshold=lyrics_confidence_threshold
                 )
             except Exception as e:
                 print(f"[WhisperLyrics] WARNING: lyrics insertion failed: {e}")
