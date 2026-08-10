@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import io
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,21 @@ def _repair_time_signatures(midi_data: mido.MidiFile) -> int:
     return repaired
 
 
+def _pretty_midi_from_mido(midi_data: mido.MidiFile) -> pretty_midi.PrettyMIDI:
+    """修復済みの mido オブジェクトから pretty_midi を組み立てる。
+
+    pretty_midi の版によって mido_object 引数が使えるかが異なる。使えない版では
+    修復済みの mido を BytesIO へ書き出してから読み直す。
+    """
+    try:
+        return pretty_midi.PrettyMIDI(mido_object=midi_data)
+    except TypeError:
+        buffer = io.BytesIO()
+        midi_data.save(file=buffer)
+        buffer.seek(0)
+        return pretty_midi.PrettyMIDI(midi_file=buffer)
+
+
 def _parse_repaired_midi(midi_path: Path, *, warn_repairs: bool) -> pretty_midi.PrettyMIDI | None:
     """壊れかけの MIDI を可能な範囲で直して読む。読めなければ None。
 
@@ -109,7 +125,7 @@ def _parse_repaired_midi(midi_path: Path, *, warn_repairs: bool) -> pretty_midi.
         # （曲本体は正常なのに、末尾だけで読み込みが落ちるケースがある。）
         repaired_end_ticks = 0
         try:
-            midi = pretty_midi.PrettyMIDI(mido_object=midi_data)
+            midi = _pretty_midi_from_mido(midi_data)
         except ValueError as error:
             if "largest tick" not in str(error):
                 raise
@@ -119,7 +135,7 @@ def _parse_repaired_midi(midi_path: Path, *, warn_repairs: bool) -> pretty_midi.
                     repaired_end_ticks += 1
             if not repaired_end_ticks:
                 raise
-            midi = pretty_midi.PrettyMIDI(mido_object=midi_data)
+            midi = _pretty_midi_from_mido(midi_data)
     except Exception as error:
         warnings.warn(
             f"Skipping unreadable MIDI note targets in {midi_path}: {error}",
