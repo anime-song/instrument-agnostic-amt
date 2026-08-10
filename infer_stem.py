@@ -338,29 +338,32 @@ def get_stem_pipeline_models(
 def get_refinement_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
+    low_vram_mode: bool = False,
 ) -> dict[str, object]:
     """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
     if device_preference is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        compute_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
-        device = torch.device(device_preference)
+        compute_device = torch.device(device_preference)
+
+    storage_device = torch.device("cpu") if low_vram_mode else compute_device
 
     resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
-    cache_key = ("refine", str(resolved_checkpoint), device.type)
+    cache_key = ("refine", str(resolved_checkpoint), storage_device.type)
 
     if cache_key not in STEM_PIPELINE_CACHE:
-        print(f"Loading Instrument Refinement model on {device} ...")
+        print(f"Loading Instrument Refinement model on {storage_device} ...")
         refinement_model, refinement_config, _ = load_refinement_model(
             resolved_checkpoint,
-            device=device,
+            device=storage_device,
         )
         STEM_PIPELINE_CACHE[cache_key] = (refinement_model, refinement_config)
     else:
-        print(f"Reusing cached Instrument Refinement model on {device} ...")
+        print(f"Reusing cached Instrument Refinement model on {storage_device} ...")
         refinement_model, refinement_config = STEM_PIPELINE_CACHE[cache_key]
 
     return {
-        "device": device,
+        "device": compute_device,
         "checkpoint": resolved_checkpoint,
         "refinement_model": refinement_model,
         "refinement_config": refinement_config,
@@ -375,6 +378,7 @@ def refine_stem_instrument_midis(
     refinement_model: object,
     refinement_config: object,
     device: torch.device | str | None = None,
+    low_vram_mode: bool = False,
     stem_names: Sequence[str] | None = None,
     mode: str = "cluster",
     window_seconds: float = 8.0,
@@ -412,19 +416,27 @@ def refine_stem_instrument_midis(
 
         source_midi = Path(midi_path)
         refined_midi = output_directory / f"{source_midi.stem}_refined.mid"
-        report = refine_midi_instruments(
-            stem_audio_path,
-            source_midi,
-            output_midi_path=refined_midi,
-            stem_name=stem_name,
-            device=device,
-            window_seconds=window_seconds,
-            stride_seconds=stride_seconds,
-            mode=mode,
-            disable_tqdm=disable_tqdm,
-            preloaded_model=refinement_model,
-            preloaded_config=refinement_config,
-        )
+        if low_vram_mode:
+            print(f"[LowVRAM] Moving refinement model ({stem_name}) to {device} ...")
+            _move_model(refinement_model, device)
+        try:
+            report = refine_midi_instruments(
+                stem_audio_path,
+                source_midi,
+                output_midi_path=refined_midi,
+                stem_name=stem_name,
+                device=device,
+                window_seconds=window_seconds,
+                stride_seconds=stride_seconds,
+                mode=mode,
+                disable_tqdm=disable_tqdm,
+                preloaded_model=refinement_model,
+                preloaded_config=refinement_config,
+            )
+        finally:
+            if low_vram_mode:
+                print(f"[LowVRAM] Moving refinement model ({stem_name}) back to CPU ...")
+                _move_model(refinement_model, "cpu")
         refined_midi_paths[stem_name] = refined_midi
 
         refined_class_names = sorted(
@@ -655,6 +667,7 @@ def run_stem_separated_transcription(
             refinement_bundle = get_refinement_models(
                 checkpoint_path=refinement_checkpoint_path,
                 device_preference=device,
+                low_vram_mode=low_vram_mode,
             )
             refined_midi_paths = refine_stem_instrument_midis(
                 stem_midis=stem_midi_paths,
@@ -663,6 +676,7 @@ def run_stem_separated_transcription(
                 refinement_model=refinement_bundle["refinement_model"],
                 refinement_config=refinement_bundle["refinement_config"],
                 device=device,
+                low_vram_mode=low_vram_mode,
                 stem_names=refinement_stem_names,
                 mode=refinement_mode,
                 disable_tqdm=True,
