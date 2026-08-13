@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class TaskFeatureAdapter(nn.Module):
@@ -36,6 +37,37 @@ class IntervalScorer(nn.Module):
         self, features: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         projected = self.proj(features)
+        return self._split_projection(projected)
+
+    def project_factorized(
+        self,
+        pitch_features: torch.Tensor,
+        instrument_features: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        """Project additive pitch/instrument features without forming every pair.
+
+        The pitch projection includes the Linear bias exactly once.  The
+        instrument projection intentionally omits it, so adding both projections
+        is mathematically identical to ``self.proj(pitch + instrument)``.
+        """
+
+        pitch_projected = self.proj(pitch_features)
+        instrument_projected = F.linear(
+            instrument_features,
+            self.proj.weight,
+            bias=None,
+        )
+        return (
+            self._split_projection(pitch_projected),
+            self._split_projection(instrument_projected),
+        )
+
+    def _split_projection(
+        self, projected: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query, key, diagonal = torch.split(
             projected, [self.head_dim, self.head_dim, 1], dim=-1
         )

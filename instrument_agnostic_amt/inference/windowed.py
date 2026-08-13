@@ -9,8 +9,8 @@ import torch
 from tqdm.auto import tqdm
 
 from ..modeling.heads.semi_crf import (
-    decode_pitch_intervals,
-    decode_pitch_intervals_sparse,
+    decode_factorized_pair_intervals,
+    decode_factorized_pair_intervals_sparse,
 )
 from ..modeling.model import (
     MIN_MIDI_PITCH,
@@ -689,14 +689,26 @@ def decode_notes(
 
         interval_features = outputs.get("interval_features")
         pair_gate_logits = outputs.get("pair_gate_logits")
+        pitch_interval_query = outputs.get("pitch_interval_query")
+        pitch_interval_key = outputs.get("pitch_interval_key")
+        pitch_interval_diag = outputs.get("pitch_interval_diag")
+        instrument_interval_query = outputs.get("instrument_interval_query")
+        instrument_interval_key = outputs.get("instrument_interval_key")
+        instrument_interval_diag = outputs.get("instrument_interval_diag")
         frame_valid_mask = outputs.get("frame_valid_mask")
         if (
             interval_features is None
             or pair_gate_logits is None
+            or pitch_interval_query is None
+            or pitch_interval_key is None
+            or pitch_interval_diag is None
+            or instrument_interval_query is None
+            or instrument_interval_key is None
+            or instrument_interval_diag is None
             or frame_valid_mask is None
         ):
             raise ValueError(
-                "Filtered V2 inference requires interval_features and pair_gate_logits"
+                "Factorized V2 inference requires interval projections and pair gate logits"
             )
         valid_lengths = frame_valid_mask.to(dtype=torch.long).sum(dim=-1)
 
@@ -730,44 +742,49 @@ def decode_notes(
                 window_start_frame=int(start_frame),
                 valid_model_frames=sample_valid_length,
             )
-            pair_features, _, _ = model.build_pair_interval_features(
-                interval_features[sample_index : sample_index + 1],
+            selected_pairs = model.build_selected_pair_indices(
                 [pair_ids],
             )
-            interval_query, interval_key, interval_diag = (
-                model.score_pair_interval_features(pair_features)
-            )
-            interval_query_batched = interval_query.unsqueeze(0)
-            interval_key_batched = interval_key.unsqueeze(0)
-            interval_diag_batched = interval_diag.unsqueeze(0)
 
             if settings.semi_crf_sparse_decode:
-                decoded_intervals = decode_pitch_intervals_sparse(
-                    interval_query_batched,
-                    interval_key_batched,
-                    interval_diag_batched,
+                decoded_intervals = decode_factorized_pair_intervals_sparse(
+                    pitch_interval_query[sample_index : sample_index + 1],
+                    pitch_interval_key[sample_index : sample_index + 1],
+                    pitch_interval_diag[sample_index : sample_index + 1],
+                    instrument_interval_query,
+                    instrument_interval_key,
+                    instrument_interval_diag,
+                    selected_pairs.batch_indices,
+                    selected_pairs.instrument_indices,
+                    selected_pairs.pitch_indices,
                     valid_lengths[sample_index : sample_index + 1],
                     length_scaling=str(config.semi_crf_length_scaling),
                     length_penalty=float(config.semi_crf_length_penalty),
                     note_bias=float(settings.note_bias),
                     track_batch_size=int(settings.track_batch_size),
-                    forced_start_pos=[forced_start_pos],
+                    forced_start_pos=forced_start_pos,
                     sparse_topk_per_start=int(settings.semi_crf_sparse_topk_per_start),
                     sparse_score_threshold=settings.semi_crf_sparse_score_threshold,
                     sparse_max_span_frames=settings.semi_crf_sparse_max_span_frames,
-                )[0]
+                )
             else:
-                decoded_intervals = decode_pitch_intervals(
-                    interval_query_batched,
-                    interval_key_batched,
-                    interval_diag_batched,
+                decoded_intervals = decode_factorized_pair_intervals(
+                    pitch_interval_query[sample_index : sample_index + 1],
+                    pitch_interval_key[sample_index : sample_index + 1],
+                    pitch_interval_diag[sample_index : sample_index + 1],
+                    instrument_interval_query,
+                    instrument_interval_key,
+                    instrument_interval_diag,
+                    selected_pairs.batch_indices,
+                    selected_pairs.instrument_indices,
+                    selected_pairs.pitch_indices,
                     valid_lengths[sample_index : sample_index + 1],
                     length_scaling=str(config.semi_crf_length_scaling),
                     length_penalty=float(config.semi_crf_length_penalty),
                     note_bias=float(settings.note_bias),
                     track_batch_size=int(settings.track_batch_size),
-                    forced_start_pos=[forced_start_pos],
-                )[0]
+                    forced_start_pos=forced_start_pos,
+                )
 
             decoded_interval_count += sum(len(track) for track in decoded_intervals)
 
@@ -775,7 +792,8 @@ def decode_notes(
             if use_boundary_head:
                 boundary_logits, boundary_entries = (
                     model.predict_flat_interval_boundaries(
-                        pair_features.float(),
+                        interval_features[sample_index : sample_index + 1].float(),
+                        selected_pairs,
                         decoded_intervals,
                     )
                 )
