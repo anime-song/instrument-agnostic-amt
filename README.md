@@ -177,7 +177,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # Instrument taxonomy definition
 ├── gm_instrument_classes.json  # General MIDI metadata
 ├── dataset_config.yaml         # Multi-dataset weighted sampling config
-├── requirements.txt            # Dependencies
+├── pyproject.toml              # Project metadata & dependencies (uv)
+├── uv.lock                     # Locked dependency versions
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer (top-level model)
@@ -200,24 +201,60 @@ instrument_agnostic_amt/
 
 ### Requirements
 
-- Python 3.10+
-- CUDA GPU (12GB+ VRAM recommended)
+- Python 3.10 – 3.14
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from the committed `uv.lock`
+- One of the following devices:
+  - NVIDIA GPU (12GB+ VRAM recommended; on Linux the lockfile installs CUDA 13.0 wheels)
+  - Apple Silicon Mac on macOS 14+ (MPS backend; PyTorch 2.13 has no wheels for Intel Macs)
+  - CPU (works, but slow)
+
+> On Windows the lockfile currently resolves to CPU-only PyTorch wheels.
 
 ```bash
 # Clone
-git clone https://github.com/anime-song/instrument-agnostic-amt.git
-cd instrument-agnostic-amt
+git clone https://github.com/ntamotsu/fork-instrument-agnostic-amt.git
+cd fork-instrument-agnostic-amt
 
-# Virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# Core dependencies for inference (exact versions from uv.lock)
+uv sync --locked
 
-# Dependencies
-pip install -r requirements.txt
+# Optional extras, depending on what you want to run
+uv sync --locked --extra stem        # stem-separated workflow (infer_stem.py)
+uv sync --locked --extra evaluation  # evaluation scripts under evaluation/
+uv sync --locked --all-extras        # everything, including training dependencies
 ```
 
-> `audiomentations` is needed for training augmentation. You can skip it if you only need inference.
+`uv sync` creates `.venv/`. The commands in this README assume that environment is active (`source .venv/bin/activate`); alternatively, prefix each command with `uv run`, e.g. `uv run python infer.py --audio input_song.wav`.
+
+### Verified environments
+
+- **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), and `--compile` of the core AMT forward. A full stem-separated end-to-end run with the released checkpoints has **not** been executed on MPS yet.
+- **CUDA** — a regression suite for Colab Tesla T4 is included (see below), but it has not been executed on an actual T4 runtime yet.
+
+### Running the tests
+
+```bash
+uv sync --locked --all-extras   # test collection imports the stem extra
+uv run pytest
+```
+
+CUDA- and MPS-specific tests are skipped automatically when the accelerator is unavailable. The `torch.compile` regression tests are opt-in because compilation is slow:
+
+```bash
+RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/test_cuda_inference.py
+```
+
+### CUDA regression on Colab (Tesla T4)
+
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) reproduces the CUDA regression suite on a Colab GPU runtime: it clones the requested branch, installs the locked dependencies with `uv sync --locked --all-extras`, asserts that the runtime GPU is a Tesla T4, and runs the full test suite plus the CUDA compile regression. On a fresh T4 runtime:
+
+```bash
+curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
+python colab_t4_regression.py --branch codex/mps-inference
+```
+
+This script has not been run to completion on an actual T4 yet, so treat the CUDA 13.0 / T4 combination as unverified until it passes.
 
 ---
 
@@ -261,13 +298,12 @@ This creates:
 
 ### 3. (Optional) Resample audio
 
-If your audio files are not at 22050 Hz:
+If your audio files are not at 22050 Hz, resample them **in place** (the original container format and sample subtype are preserved):
 
 ```bash
 python preprocess/resample_only.py \
-  --input_dir ./raw_stems \
-  --output_dir ./stems \
-  --target_sr 22050
+  --input ./stems \
+  --resample-rate 22050
 ```
 
 ## Training
@@ -374,7 +410,7 @@ training from AMT-generated merged MIDI, and beat/chord inference from MIDI.
 
 ```bash
 # Beat pretraining from MIDI
-python pretrain_midi_frame_beat.py --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
+python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
 # Joint beat/chord training
 python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
@@ -404,15 +440,16 @@ then add predicted beat, meter, chord, and key metadata, install the optional
 stem separator and run:
 
 ```bash
-pip install stem-splitter
-python create_key_only_candidates.py \
+uv sync --locked --extra stem
+uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates import main; main()" \
   --input-dir beat_chord_dataset/source_audio \
   --output-dir beat_chord_dataset/key_only_candidates
 ```
 
 The script uses the same per-stem model routing as the Colab notebook, merges
 the stem MIDIs, predicts note velocities, and runs `midi_frame_infer` before
-moving on to the next song.
+moving on to the next song. The batch runner accepts the same `--device`,
+`--amp`, `--amp-dtype`, `--compile`, and `--compile-mode` options as `infer.py`.
 The current beat/chord checkpoint is selected by modification time from
 `beat_chord_checkpoints/midi_frame`; use `--beat-chord-checkpoint` to pin one.
 Final uncorrected files are written under `key_only_candidates/midis/`, separate
@@ -454,6 +491,30 @@ python infer.py --audio input_song.wav
 
 > **Note**: If `--checkpoint` is not provided, the model will be automatically downloaded from Hugging Face.
 
+### Device selection and performance options
+
+`--device` defaults to `auto`, which picks the first available backend in the order **CUDA → MPS → CPU**. A device can also be pinned explicitly; requesting an unavailable device fails with an error instead of silently falling back.
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+**Mixed precision (`--amp`)** is strictly opt-in — it is never enabled implicitly — and works on both CUDA and MPS. It applies autocast to the forward pass only; it does **not** convert the model weights to half precision. `--amp-dtype` selects `fp16` or `bf16`. When omitted, CUDA uses bf16 if the GPU supports it (fp16 otherwise), and MPS defaults to fp16 (`--amp-dtype bf16` is also available on MPS).
+
+```bash
+python infer.py --audio input_song.wav --device mps --amp                  # fp16 autocast on MPS
+python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
+```
+
+**`torch.compile` (`--compile`)** is also opt-in and currently applies only to the core AMT forward pass — the velocity, instrument refinement, and beat/chord models are not compiled yet. `--compile-mode` accepts `default`, `reduce-overhead`, `max-autotune`, and `max-autotune-no-cudagraphs`. The first processed window includes the compilation time, so short inputs may not benefit. On MPS, Inductor does not support the complex-valued CQT stage: warnings are printed and the run can end up slower than eager mode, so measure on your own audio before adopting it.
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -465,6 +526,8 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 5. predicts the velocity of each MIDI note from the corresponding separated stem audio.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
+
+The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`; on Colab GPU runtimes, `DEVICE = "auto"` selects CUDA.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
@@ -524,12 +587,16 @@ python infer.py \
 | `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
-| `--amp` | `false` | Enable mixed precision inference |
+| `--device` | `auto` | Inference device. `auto` picks CUDA → MPS → CPU; `cuda` / `mps` / `cpu` can be set explicitly |
+| `--amp` | `false` | Opt-in mixed precision (autocast) on CUDA/MPS |
+| `--amp-dtype` | device default | `fp16` / `bf16`. Defaults to bf16 on CUDA (when supported) and fp16 on MPS |
+| `--compile` | `false` | Opt-in `torch.compile` of the core AMT forward |
+| `--compile-mode` | `default` | Also accepts `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
 | `--window-batch-size` | `1` | Windows to process at once |
 | `--merge-gap-ms` | 1 hop | Merge threshold for small note gaps |
-| `--merge-onset-ms` | `20.0` | Merge threshold for near-simultaneous onsets |
+| `--merge-onset-ms` | `50.0` | Merge threshold for near-simultaneous onsets |
 | `--max-midi-melodic-instruments` | `15` | Max instrument tracks |
 | `--allowed-instruments` | all classes | Instrument classification candidates. Accepts comma-separated names or repeated arguments; softmax probabilities are renormalized within the selected classes |
 | `--silence-gate-rms-dbfs` | `-72` | RMS threshold to skip silent windows |

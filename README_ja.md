@@ -178,7 +178,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # 楽器分類の定義
 ├── gm_instrument_classes.json  # General MIDI メタデータ
 ├── dataset_config.yaml         # データセットの重み付け設定
-├── requirements.txt            # 依存パッケージ
+├── pyproject.toml              # プロジェクト定義と依存パッケージ（uv）
+├── uv.lock                     # 依存バージョンのロックファイル
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer（モデル本体）
@@ -201,24 +202,60 @@ instrument_agnostic_amt/
 
 ### 必要なもの
 
-- Python 3.10+
-- CUDA 対応 GPU（VRAM 12GB 以上推奨）
+- Python 3.10 〜 3.14
+- [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
+- PyTorch 2.13.0 / torchaudio 2.11.0 — コミット済みの `uv.lock` から自動でインストールされます
+- 以下のいずれかのデバイス:
+  - NVIDIA GPU（VRAM 12GB 以上推奨。Linux ではロックファイルが CUDA 13.0 の wheel をインストールします）
+  - Apple Silicon Mac（macOS 14 以降、MPS バックエンド。PyTorch 2.13 は Intel Mac 向け wheel を提供していません）
+  - CPU（動きますが遅いです）
+
+> Windows では、現在のロックファイルは CPU 版の PyTorch wheel に解決されます。
 
 ```bash
 # クローン
-git clone https://github.com/anime-song/instrument-agnostic-amt.git
-cd instrument-agnostic-amt
+git clone https://github.com/ntamotsu/fork-instrument-agnostic-amt.git
+cd fork-instrument-agnostic-amt
 
-# 仮想環境
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# 推論用のコア依存パッケージ（uv.lock のバージョンに固定）
+uv sync --locked
 
-# 依存パッケージ
-pip install -r requirements.txt
+# 用途に応じたオプション依存
+uv sync --locked --extra stem        # ステム分離ワークフロー（infer_stem.py）
+uv sync --locked --extra evaluation  # evaluation/ 以下の評価スクリプト
+uv sync --locked --all-extras        # 学習用も含めてすべて
 ```
 
-> `audiomentations` は学習時のオーグメンテーションで使います。推論だけなら入れなくても動きます。
+`uv sync` を実行すると `.venv/` が作られます。この README のコマンド例は、この環境を有効化した状態（`source .venv/bin/activate`）を想定しています。有効化しない場合は、各コマンドの先頭に `uv run` を付けてください（例: `uv run python infer.py --audio input_song.wav`）。
+
+### 動作確認済みの環境
+
+- **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、コア forward の `--compile`。ただし、公開チェックポイントを使ったステム分離のエンドツーエンド実行は MPS では**未実施**です。
+- **CUDA** — Colab の Tesla T4 向け回帰スクリプトを同梱していますが（後述）、実際の T4 上ではまだ実行していません。
+
+### テストの実行
+
+```bash
+uv sync --locked --all-extras   # テスト収集に stem extra が必要です
+uv run pytest
+```
+
+CUDA / MPS 専用のテストは、アクセラレータが無い環境では自動的にスキップされます。`torch.compile` の回帰テストはコンパイルに時間がかかるためオプトインです:
+
+```bash
+RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/test_cuda_inference.py
+```
+
+### Colab（Tesla T4）での CUDA 回帰テスト
+
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) は、Colab の GPU ランタイム上で CUDA 回帰テスト一式を再現します。指定ブランチをクローンし、`uv sync --locked --all-extras` でロック済み依存をインストールし、ランタイムの GPU が Tesla T4 であることを確認したうえで、テストスイート全体と CUDA compile 回帰を実行します。新しい T4 ランタイムで:
+
+```bash
+curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
+python colab_t4_regression.py --branch codex/mps-inference
+```
+
+このスクリプトはまだ実際の T4 上で完走させていないため、CUDA 13.0 / T4 の組み合わせは、テストが通るまでは未検証として扱ってください。
 
 ---
 
@@ -262,13 +299,12 @@ python preprocess/prepare_dataset.py \
 
 ### 3. （任意）リサンプリング
 
-オーディオファイルが 22050 Hz でない場合:
+オーディオファイルが 22050 Hz でない場合は、**その場で上書き**リサンプリングします（元のファイル形式とサンプルフォーマットは維持されます）:
 
 ```bash
 python preprocess/resample_only.py \
-  --input_dir ./raw_stems \
-  --output_dir ./stems \
-  --target_sr 22050
+  --input ./stems \
+  --resample-rate 22050
 ```
 
 ## 学習
@@ -375,7 +411,7 @@ MIDIフレームのビート・コードモデルは、通常のAMT学習から�
 
 ```bash
 # MIDIからbeatを事前学習
-python pretrain_midi_frame_beat.py --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
+python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
 # beat/chordをjoint学習
 python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
@@ -383,6 +419,45 @@ python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
 # beat/chordを推論
 python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.mid
 ```
+
+`beat_chord_dataset/key_only_dataset/midis/` に置いた修正済み予測MIDIは、既定で
+chord/key学習にも利用されます。ラベルとして扱うのは `key_signature` イベントだけで、
+コードマーカー、tempo/拍子メタデータ、ビート情報をこれらのファイルから学習することは
+ありません。この補助データに対してはchord lossをマスクし、chordの自己refinement
+フィードバックもdetachします。`--skip_key_only` で無効化、`--key_only_loss_scale`
+で寄与率を変更できます。この小さなデータセットが連続した更新に集中しないよう、
+既定では4学習ステップに1回だけkey-onlyバッチを使います。間隔は
+`--key_only_step_interval N` で変更でき、`1` にすると従来の毎ステップ動作に戻ります。
+エポックあたりのkey-onlyデータセットの走査は最大1回のままです。マイナーキーは、
+モデルが持つ平行長調のキークラスへマップされます。
+
+### 未修正key-only候補の一括生成
+
+ディレクトリ内のすべてのオーディオに対して Colab のステムワークフローを再現し、
+予測したビート・拍子・コード・キーのメタデータを付与するには、オプションのステム
+分離器をインストールしてから一括実行します:
+
+```bash
+uv sync --locked --extra stem
+uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates import main; main()" \
+  --input-dir beat_chord_dataset/source_audio \
+  --output-dir beat_chord_dataset/key_only_candidates
+```
+
+このバッチ処理は Colab ノートブックと同じステム別のモデル振り分けを使い、ステムMIDIの
+マージ、ノートvelocityの予測、`midi_frame_infer` の実行までを済ませてから次の曲へ
+進みます。`infer.py` と同じ `--device` / `--amp` / `--amp-dtype` / `--compile` /
+`--compile-mode` オプションも指定できます。
+beat/chordチェックポイントは `beat_chord_checkpoints/midi_frame` から更新時刻で
+選択されます。固定したい場合は `--beat-chord-checkpoint` を指定してください。
+最終的な未修正ファイルは、教師データ用の `key_only_dataset/midis/` とは別に
+`key_only_candidates/midis/` へ書き出されます。中間生成物（分離ステム、ステム別MIDI、
+予測JSON、Audacityラベル、`batch_summary.json`）は保持されます。中断しても同じ
+コマンドで再開でき、有効な分離ステム、ステム別MIDI、マージMIDI、velocity MIDI、
+beat/chord/key結果はそれぞれ独立に再利用されます。beat/chord/key結果は、MIDIと
+予測JSONの両方が読める場合のみ完了とみなし、揃っていなければその推論だけをやり直します。
+すべて作り直す場合は `--force`、モデルを読み込まずに実行計画だけ確認する場合は
+`--dry-run` を指定してください。
 
 beat/chord推論では、既定で
 `beat_chord_predictions/<song>.beat_mapped.mid` も出力します。このType 1 MIDIには、
@@ -412,6 +487,30 @@ python infer.py --audio input_song.wav
 
 > **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
 
+### デバイス選択とパフォーマンスオプション
+
+`--device` の既定値は `auto` で、**CUDA → MPS → CPU** の順に利用可能なバックエンドを選びます。デバイスを明示することもでき、利用できないデバイスを指定した場合は暗黙のフォールバックはせずエラーで停止します。
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+**混合精度（`--amp`）** は明示的なオプトインで、暗黙に有効化されることはありません。CUDA と MPS の両方で利用できます。forward パスに autocast を適用するだけで、モデルの重み自体を half 精度へ変換する機能では**ありません**。`--amp-dtype` では `fp16` / `bf16` を選べます。省略した場合、CUDA では GPU が対応していれば bf16（非対応なら fp16）、MPS では fp16 が既定です（MPS でも `--amp-dtype bf16` を明示できます）。
+
+```bash
+python infer.py --audio input_song.wav --device mps --amp                  # MPS で fp16 autocast
+python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
+```
+
+**`torch.compile`（`--compile`）** も明示的なオプトインで、現時点でコンパイル対象はコア AMT の forward パスのみです。velocity、instrument refinement、beat/chord の各モデルはまだコンパイルされません。`--compile-mode` には `default` / `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` を指定できます。最初のウィンドウ処理にはコンパイル時間が含まれるため、短い入力では効果が出ないことがあります。また MPS では、複素数を使う CQT 部分を Inductor がサポートしていないため警告が表示され、eager 実行より遅くなる場合があります。手元の音源で計測してから採用してください。
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
 ### Google Colab のステム分離ワークフロー
 
 Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
@@ -423,6 +522,8 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 5. 対応する分離ステムから MIDI ノートごとの velocity を予測する
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
+
+ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
 
@@ -482,12 +583,16 @@ python infer.py \
 | `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: 従来のギター専用モデル、`guitar_v1_5`: 新しいギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: その他楽器専用モデル |
 | `--audio` | （必須） | 入力オーディオのパス |
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
-| `--amp` | `false` | 混合精度推論を有効化 |
+| `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda` / `mps` / `cpu` の明示も可 |
+| `--amp` | `false` | CUDA/MPS での混合精度（autocast）をオプトインで有効化 |
+| `--amp-dtype` | デバイス既定 | `fp16` / `bf16`。既定は CUDA では bf16（対応時）、MPS では fp16 |
+| `--compile` | `false` | コア AMT forward への `torch.compile` をオプトインで有効化 |
+| `--compile-mode` | `default` | `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` も指定可 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
 | `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
 | `--window-batch-size` | `1` | まとめて処理するウィンドウ数 |
 | `--merge-gap-ms` | 1 hop 分 | ノート間ギャップのマージ閾値 |
-| `--merge-onset-ms` | `20.0` | 近いオンセットのマージ閾値 |
+| `--merge-onset-ms` | `50.0` | 近いオンセットのマージ閾値 |
 | `--max-midi-melodic-instruments` | `15` | 楽器トラックの上限 |
 | `--allowed-instruments` | 全クラス | 楽器分類の候補。カンマ区切りまたは引数を繰り返して指定。softmax 使用時は指定候補内で確率を再正規化 |
 | `--silence-gate-rms-dbfs` | `-72` | 無音スキップの RMS 閾値 |
