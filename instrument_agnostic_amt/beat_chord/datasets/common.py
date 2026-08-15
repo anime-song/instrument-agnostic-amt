@@ -6,15 +6,7 @@ from pathlib import Path
 
 import torch
 
-
-def require_torchaudio():
-    try:
-        import torchaudio
-    except ImportError as exc:
-        raise ImportError(
-            "torchaudio is required for MIDI-frame dataset metadata"
-        ) from exc
-    return torchaudio
+from ...data.audio import inspect_audio
 
 
 @dataclass(frozen=True)
@@ -55,7 +47,7 @@ class AudioDurationEntry:
 
 
 class AudioDurationCache:
-    """torchaudio.info の結果を dataset root に保存して初期化時間を短縮する。"""
+    """音声メタデータを dataset root に保存して初期化時間を短縮する。"""
 
     def __init__(self, *, audio_dir: Path, cache_path: Path) -> None:
         self.audio_dir = Path(audio_dir)
@@ -103,9 +95,8 @@ class AudioDurationCache:
 
 
 def read_audio_duration_entry(audio_path: Path) -> AudioDurationEntry:
-    torchaudio = require_torchaudio()
     audio_path = Path(audio_path)
-    info = torchaudio.info(str(audio_path))
+    info = inspect_audio(audio_path)
     sample_rate = int(info.sample_rate)
     num_frames = int(info.num_frames)
     if sample_rate <= 0:

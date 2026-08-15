@@ -5,8 +5,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List
 
-import torchaudio
+import soundfile as sf
+import torch
 import torchaudio.functional as AF
+
+from instrument_agnostic_amt.data.audio import inspect_audio, read_audio_frames
 
 
 def _iter_audio_files(path: Path) -> Iterable[Path]:
@@ -23,19 +26,24 @@ def _iter_audio_files(path: Path) -> Iterable[Path]:
 
 
 def needs_resample(file_path: Path, target_sample_rate: int) -> bool:
-    metadata = torchaudio.info(str(file_path), backend="soundfile")
+    metadata = inspect_audio(file_path)
     return metadata.sample_rate != target_sample_rate
 
 
 def resample_in_place(file_path: Path, target_sample_rate: int) -> None:
-    metadata = torchaudio.info(str(file_path))
+    metadata = inspect_audio(file_path)
     source_sample_rate = metadata.sample_rate
 
-    waveform, _ = torchaudio.load(str(file_path))
+    waveform_array, _ = read_audio_frames(file_path)
+    waveform = torch.from_numpy(waveform_array)
     waveform = AF.resample(
         waveform, orig_freq=source_sample_rate, new_freq=target_sample_rate
     )
-    torchaudio.save(str(file_path), waveform, sample_rate=target_sample_rate)
+    sf.write(
+        str(file_path),
+        waveform.transpose(0, 1).contiguous().numpy(),
+        samplerate=target_sample_rate,
+    )
 
 
 def main() -> None:
