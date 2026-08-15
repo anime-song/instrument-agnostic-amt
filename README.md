@@ -229,7 +229,7 @@ uv sync --locked --all-extras        # everything, including training dependenci
 
 ### Verified environments
 
-- **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), and `--compile` of the core AMT forward. A full stem-separated end-to-end run with the released checkpoints has **not** been executed on MPS yet.
+- **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), `--compile` of the core AMT forward, and `--compile-velocity` of the velocity forward (including its eager fallback for the trailing window). A full stem-separated end-to-end run with the released checkpoints has **not** been executed on MPS yet.
 - **CUDA** — a regression suite for Colab Tesla T4 is included (see below), but it has not been executed on an actual T4 runtime yet.
 
 ### Running the tests
@@ -449,7 +449,8 @@ uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates im
 The script uses the same per-stem model routing as the Colab notebook, merges
 the stem MIDIs, predicts note velocities, and runs `midi_frame_infer` before
 moving on to the next song. The batch runner accepts the same `--device`,
-`--amp`, `--amp-dtype`, `--compile`, and `--compile-mode` options as `infer.py`.
+`--amp`, `--amp-dtype`, `--compile`, and `--compile-mode` options as `infer.py`,
+plus `--compile-velocity` to also compile the velocity step.
 The current beat/chord checkpoint is selected by modification time from
 `beat_chord_checkpoints/midi_frame`; use `--beat-chord-checkpoint` to pin one.
 Final uncorrected files are written under `key_only_candidates/midis/`, separate
@@ -508,11 +509,14 @@ python infer.py --audio input_song.wav --device mps --amp                  # fp1
 python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
 ```
 
-**`torch.compile` (`--compile`)** is also opt-in and currently applies only to the core AMT forward pass — the velocity, instrument refinement, and beat/chord models are not compiled yet. `--compile-mode` accepts `default`, `reduce-overhead`, `max-autotune`, and `max-autotune-no-cudagraphs`. The first processed window includes the compilation time, so short inputs may not benefit. On MPS, Inductor does not support the complex-valued CQT stage: warnings are printed and the run can end up slower than eager mode, so measure on your own audio before adopting it.
+**`torch.compile` (`--compile`)** is also opt-in and applies only to the core AMT forward pass — the instrument refinement and beat/chord models are not compiled yet. `--compile-mode` accepts `default`, `reduce-overhead`, `max-autotune`, and `max-autotune-no-cudagraphs`. The first processed window includes the compilation time, so short inputs may not benefit. On MPS, Inductor does not support the complex-valued CQT stage: warnings are printed and the run can end up slower than eager mode, so measure on your own audio before adopting it.
+
+**Velocity compilation (`--compile-velocity`)** is a separate opt-in, independent of `--compile`, available on the velocity CLI (`infer_velocity.py`) and the key-only batch runner; it shares `--compile-mode`. Only the velocity model forward is compiled — MIDI parsing and windowing stay eager — and only fixed-length full windows run compiled: the trailing partial window and songs shorter than one window automatically fall back to the retained eager model, so their output is identical to a plain eager run. (Variable-length windows hit a PyTorch 2.13 Inductor/Metal failure on MPS, and zero-padding would change the existing short-window results, so those windows are simply not compiled.) On full windows the compiled output matches eager within ~2e-5. The MPS caveats above apply here too: first-call compile cost and complex-op warnings mean a speedup is not guaranteed — measure first.
 
 ```bash
 python infer.py --audio input_song.wav --compile
 python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity   # velocity model
 ```
 
 ### Stem-separated workflow in Google Colab
@@ -527,7 +531,7 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
-The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`; on Colab GPU runtimes, `DEVICE = "auto"` selects CUDA.
+The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, `COMPILE_VELOCITY`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`; `COMPILE_MODEL` compiles the core AMT forward, while the independent `COMPILE_VELOCITY` compiles the velocity forward. On Colab GPU runtimes, `DEVICE = "auto"` selects CUDA.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
@@ -562,7 +566,7 @@ python infer_velocity.py \
   --output-midi output_velocity.mid
 ```
 
-If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
+If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. Opt-in `--compile-velocity` (sharing `--compile-mode`) compiles the velocity forward; see "Device selection and performance options" above for how full and trailing windows are handled. The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
 
 ### Additional options
 

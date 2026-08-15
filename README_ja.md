@@ -230,7 +230,7 @@ uv sync --locked --all-extras        # 学習用も含めてすべて
 
 ### 動作確認済みの環境
 
-- **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、コア forward の `--compile`。ただし、公開チェックポイントを使ったステム分離のエンドツーエンド実行は MPS では**未実施**です。
+- **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、コア forward の `--compile`、velocity forward の `--compile-velocity`（末尾窓の eager フォールバック含む）。ただし、公開チェックポイントを使ったステム分離のエンドツーエンド実行は MPS では**未実施**です。
 - **CUDA** — Colab の Tesla T4 向け回帰スクリプトを同梱していますが（後述）、実際の T4 上ではまだ実行していません。
 
 ### テストの実行
@@ -447,7 +447,8 @@ uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates im
 このバッチ処理は Colab ノートブックと同じステム別のモデル振り分けを使い、ステムMIDIの
 マージ、ノートvelocityの予測、`midi_frame_infer` の実行までを済ませてから次の曲へ
 進みます。`infer.py` と同じ `--device` / `--amp` / `--amp-dtype` / `--compile` /
-`--compile-mode` オプションも指定できます。
+`--compile-mode` オプションに加えて、velocity ステップをコンパイルする
+`--compile-velocity` も指定できます。
 beat/chordチェックポイントは `beat_chord_checkpoints/midi_frame` から更新時刻で
 選択されます。固定したい場合は `--beat-chord-checkpoint` を指定してください。
 最終的な未修正ファイルは、教師データ用の `key_only_dataset/midis/` とは別に
@@ -504,11 +505,14 @@ python infer.py --audio input_song.wav --device mps --amp                  # MPS
 python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
 ```
 
-**`torch.compile`（`--compile`）** も明示的なオプトインで、現時点でコンパイル対象はコア AMT の forward パスのみです。velocity、instrument refinement、beat/chord の各モデルはまだコンパイルされません。`--compile-mode` には `default` / `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` を指定できます。最初のウィンドウ処理にはコンパイル時間が含まれるため、短い入力では効果が出ないことがあります。また MPS では、複素数を使う CQT 部分を Inductor がサポートしていないため警告が表示され、eager 実行より遅くなる場合があります。手元の音源で計測してから採用してください。
+**`torch.compile`（`--compile`）** も明示的なオプトインで、コンパイル対象はコア AMT の forward パスのみです。instrument refinement、beat/chord の各モデルはまだコンパイルされません。`--compile-mode` には `default` / `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` を指定できます。最初のウィンドウ処理にはコンパイル時間が含まれるため、短い入力では効果が出ないことがあります。また MPS では、複素数を使う CQT 部分を Inductor がサポートしていないため警告が表示され、eager 実行より遅くなる場合があります。手元の音源で計測してから採用してください。
+
+**Velocity のコンパイル（`--compile-velocity`）** は `--compile` とは独立した別のオプトインで、velocity CLI（`infer_velocity.py`）と key-only バッチ処理で使えます（`--compile-mode` は共用）。コンパイルされるのは velocity モデルの forward だけで、MIDI 解析や窓分割は eager のままです。さらに、コンパイル済み forward を使うのは固定長のフル窓だけで、末尾の端数窓や 1 窓に満たない短い曲は、保持している eager モデルへ自動的にフォールバックします（そのため末尾の出力は通常の eager 実行と完全に一致します）。可変長の窓は PyTorch 2.13 の Inductor/Metal 制限により MPS でハードエラーになり、ゼロ padding は既存の短尺出力と同値にならないため、この振り分けにしています。フル窓での compiled と eager の差は最大 2e-5 程度です。MPS の注意点は上と同じで、初回コンパイルのコストと複素演算の警告があり、必ず速くなるとは限りません。まず計測してください。
 
 ```bash
 python infer.py --audio input_song.wav --compile
 python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity   # velocity モデル
 ```
 
 ### Google Colab のステム分離ワークフロー
@@ -523,7 +527,7 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
-ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。
+ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_VELOCITY`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。`COMPILE_MODEL` はコア AMT forward を、独立した `COMPILE_VELOCITY` は velocity forward をコンパイルします。Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
 
@@ -558,7 +562,7 @@ python infer_velocity.py \
   --output-midi output_velocity.mid
 ```
 
-`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。`--compile-velocity`（`--compile-mode` 共用）で velocity forward のコンパイルをオプトインできます。フル窓と末尾窓の扱いは上の「デバイス選択とパフォーマンスオプション」を参照してください。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
 
 ### その他のオプション
 
