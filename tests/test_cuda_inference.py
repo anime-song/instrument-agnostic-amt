@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import copy
+import os
+
+import pytest
+import torch
+
+from instrument_agnostic_amt.runtime import maybe_compile_forward, resolve_device
+from tests.test_mps_inference import _small_amt_model
+
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is not available",
+)
+
+
+def _run_core_forward(
+    model: torch.nn.Module,
+    waveform: torch.Tensor,
+    valid_frames: torch.Tensor,
+    *,
+    amp: bool,
+) -> dict[str, torch.Tensor | None]:
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.float16,
+        enabled=amp,
+    ):
+        return model(
+            waveform,
+            valid_audio_frames=valid_frames,
+            include_aux_outputs=False,
+        )
+
+
+def test_auto_device_selects_cuda_on_cuda_host() -> None:
+    assert resolve_device("auto").type == "cuda"
+
+
+@pytest.mark.parametrize("amp", [False, True])
+def test_core_amt_forward_runs_on_cuda(amp: bool) -> None:
+    model = _small_amt_model().to("cuda")
+    waveform = torch.randn(1, 2, 4096, device="cuda")
+    valid_frames = torch.tensor([4096], device="cuda")
+
+    outputs = _run_core_forward(
+        model,
+        waveform,
+        valid_frames,
+        amp=amp,
+    )
+
+    tensors = [value for value in outputs.values() if isinstance(value, torch.Tensor)]
+    assert tensors
+    assert all(value.device.type == "cuda" for value in tensors)
+    assert all(torch.isfinite(value).all() for value in tensors)
+
+
+def test_core_amt_cuda_matches_cpu_in_fp32() -> None:
+    torch.manual_seed(11)
+    cpu_model = _small_amt_model()
+    cuda_model = copy.deepcopy(cpu_model).to("cuda")
+    waveform = torch.randn(1, 2, 4096)
+    valid_frames = torch.tensor([4096])
+
+    cpu_outputs = cpu_model(
+        waveform,
+        valid_audio_frames=valid_frames,
+        include_aux_outputs=False,
+    )
+    cuda_outputs = _run_core_forward(
+        cuda_model,
+        waveform.to("cuda"),
+        valid_frames.to("cuda"),
+        amp=False,
+    )
+
+    for name, cpu_value in cpu_outputs.items():
+        cuda_value = cuda_outputs[name]
+        if not isinstance(cpu_value, torch.Tensor):
+            assert cuda_value is None
+            continue
+        assert isinstance(cuda_value, torch.Tensor)
+        torch.testing.assert_close(
+            cuda_value.cpu(),
+            cpu_value,
+            rtol=5e-3,
+            atol=5e-4,
+        )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
+    reason="accelerator compile regression is opt-in",
+)
+def test_core_amt_compiled_forward_runs_on_cuda() -> None:
+    torch.manual_seed(29)
+    model = _small_amt_model().to("cuda")
+    compiled_forward = maybe_compile_forward(model, enabled=True)
+    waveform = torch.randn(1, 2, 4096).to("cuda")
+    valid_frames = torch.tensor([4096], device="cuda")
+
+    for amp in (False, True):
+        eager_outputs = _run_core_forward(
+            model,
+            waveform,
+            valid_frames,
+            amp=amp,
+        )
+        outputs = _run_core_forward(
+            compiled_forward,
+            waveform,
+            valid_frames,
+            amp=amp,
+        )
+        tensors = [
+            value for value in outputs.values() if isinstance(value, torch.Tensor)
+        ]
+        assert tensors
+        assert all(value.device.type == "cuda" for value in tensors)
+        assert all(torch.isfinite(value).all() for value in tensors)
+        for name, eager_value in eager_outputs.items():
+            compiled_value = outputs[name]
+            if not isinstance(eager_value, torch.Tensor):
+                assert compiled_value is None
+                continue
+            assert isinstance(compiled_value, torch.Tensor)
+            if eager_value.dtype == torch.float16:
+                rtol, atol = 2e-2, 2e-3
+            elif eager_value.is_floating_point() or eager_value.is_complex():
+                rtol, atol = 1e-4, 1e-5
+            else:
+                rtol, atol = 0.0, 0.0
+            torch.testing.assert_close(
+                compiled_value,
+                eager_value,
+                rtol=rtol,
+                atol=atol,
+            )
