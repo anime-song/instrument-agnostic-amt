@@ -10,9 +10,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union  # noqa: UP035
 
 import torch
 import torch.nn.functional as F
+import torchaudio.functional as AF
 from torch import nn
 from torch.utils.data import Dataset
 
+from ...data.audio import inspect_audio, read_audio_frames
 from .meter_grouping import major_grouping_loss
 
 
@@ -224,16 +226,6 @@ def beat_dataset_has_wav_audio(root: str | Path) -> bool:
     return audio_dir.exists() and any(audio_dir.glob("*.wav"))
 
 
-def _require_torchaudio():
-    try:
-        import torchaudio
-    except ImportError as exc:
-        raise ImportError(
-            "BeatDataset requires torchaudio to load audio files"
-        ) from exc
-    return torchaudio
-
-
 class BeatDataset(Dataset):
     """
     beat_chord_dataset/beat_dataset を読む Dataset。
@@ -275,7 +267,6 @@ class BeatDataset(Dataset):
 
         # 1. wav と JSON ラベルを stem 名で対応付ける。
         #    label/song.beat.beats.json に対して audio/song.wav を探す。
-        torchaudio = _require_torchaudio()
         label_suffix = ".beat.beats.json"
         audio_by_stem = {
             path.stem: path for path in self.audio_dir.glob("*.wav") if path.is_file()
@@ -410,9 +401,7 @@ class BeatDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
         rng = random.Random(self.seed + self.epoch * len(self.items) + idx)
-        torchaudio = _require_torchaudio()
-
-        info = torchaudio.info(str(item["audio_path"]))
+        info = inspect_audio(item["audio_path"])
         source_sample_rate = int(info.sample_rate)
         duration_sec = float(info.num_frames) / float(source_sample_rate)
 
@@ -434,11 +423,12 @@ class BeatDataset(Dataset):
         # 2. wav を窓単位で読み、モデルの sample_rate と 2ch 入力にそろえる。
         source_offset = int(round(window_start_sec * source_sample_rate))
         source_frames = int(math.ceil(self.window_sec * source_sample_rate))
-        audio, loaded_sample_rate = torchaudio.load(
-            str(item["audio_path"]),
+        audio_array, loaded_sample_rate = read_audio_frames(
+            item["audio_path"],
             frame_offset=source_offset,
             num_frames=source_frames,
         )
+        audio = torch.from_numpy(audio_array)
         source_sample_rate = loaded_sample_rate
 
         if audio.shape[0] > 2:
@@ -447,7 +437,7 @@ class BeatDataset(Dataset):
             audio = audio.repeat(2, 1)
 
         if source_sample_rate != self.sample_rate:
-            audio = torchaudio.functional.resample(
+            audio = AF.resample(
                 audio,
                 orig_freq=source_sample_rate,
                 new_freq=self.sample_rate,

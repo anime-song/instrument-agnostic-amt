@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
 
+from ...data.audio import inspect_audio, read_audio_frames
 from ..data.modulation import (
     ModulationAugmentConfig,
     inject_synthetic_boundaries,
@@ -115,7 +116,7 @@ def _require_torchaudio():
         import torchaudio
     except ImportError as exc:
         raise ImportError(
-            "ChordDataset requires torchaudio to load audio files"
+            "ChordDataset requires torchaudio to resample audio files"
         ) from exc
     return torchaudio
 
@@ -334,11 +335,12 @@ class ChordDataset(Dataset):
         num_frames: int,
     ) -> torch.Tensor:
         """同じ窓位置の音声を読み、学習入力の長さへ正規化する。"""
-        audio, source_sample_rate = torchaudio.load(
-            str(audio_path),
+        audio_array, source_sample_rate = read_audio_frames(
+            audio_path,
             frame_offset=int(frame_offset),
             num_frames=int(num_frames),
         )
+        audio = torch.from_numpy(audio_array)
 
         # 1. チャンネル数を 2ch にそろえる。
         if audio.shape[0] > 2:
@@ -508,7 +510,7 @@ class ChordDataset(Dataset):
         rng = random.Random(self.seed + self.epoch * len(self.items) + idx)
         torchaudio = _require_torchaudio()
 
-        info = torchaudio.info(str(item["audio_path"]))
+        info = inspect_audio(item["audio_path"])
         source_sample_rate = int(info.sample_rate)
         duration_sec = float(info.num_frames) / source_sample_rate
 

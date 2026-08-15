@@ -1,0 +1,58 @@
+[project]
+name = "instrument-agnostic-amt"
+version = "0.1.0"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "dlchordx",
+    "einops",
+    "mido",
+    "numpy",
+    "pretty-midi",
+    "pyyaml",
+    "scipy",
+    "soundfile",
+    "torch==2.13.0",
+    "torchaudio==2.11.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+evaluation = [
+    "mir-eval",
+]
+stem = [
+    "chord-romanizer",
+    "librosa",
+    "stem-splitter",
+]
+training = [
+    "audiomentations",
+    "pedalboard",
+    "tensorboard",
+    "torch-optimizer",
+    "wandb",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
