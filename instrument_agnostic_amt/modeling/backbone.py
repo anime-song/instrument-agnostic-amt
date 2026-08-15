@@ -227,13 +227,31 @@ class StemConv(nn.Module):
             nn.GELU(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x) + self.freq_embed[:, :, :, : int(x.shape[-1])]
         x = self.conv2(x)
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
         return self.block4(x)
+
+    @torch.compiler.disable
+    def _forward_float32(self, x: torch.Tensor) -> torch.Tensor:
+        # MPS の AOT コンパイルは内側の autocast 無効化を保持しないため、
+        # この FP32 island は eager のまま実行する。
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            return self._forward_impl(x.float())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.training
+            and torch.is_autocast_enabled(x.device.type)
+            and torch.get_autocast_dtype(x.device.type) == torch.float16
+        ):
+            # FP16 AMP では畳み込みステムの精度劣化が大きいため、推論時だけ
+            # StemConv 全体を FP32 island として実行する。
+            return self._forward_float32(x)
+        return self._forward_impl(x)
 
 
 class PitchQueryEmbedding(nn.Module):
