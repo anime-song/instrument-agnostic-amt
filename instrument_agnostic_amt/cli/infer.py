@@ -191,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         help="Compile the core AMT forward with TorchInductor",
     )
     parser.add_argument(
+        "--compile-scope",
+        choices=("regional", "whole"),
+        default="regional",
+        help="Compile Transformer regions (default) or the whole AMT forward",
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=(
             "default",
@@ -545,6 +551,7 @@ def main() -> None:
         model,
         enabled=bool(args.compile),
         mode=str(args.compile_mode),
+        scope=str(args.compile_scope),
     )
     settings = resolve_inference_settings(config, training_args, args)
     requested_instrument_ids = (

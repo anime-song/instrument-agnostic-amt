@@ -134,6 +134,8 @@ def test_batch_cli_exposes_core_amt_amp_and_compile_options() -> None:
             "--amp-dtype",
             "bf16",
             "--compile",
+            "--compile-scope",
+            "whole",
             "--compile-mode",
             "max-autotune",
         ]
@@ -142,6 +144,7 @@ def test_batch_cli_exposes_core_amt_amp_and_compile_options() -> None:
     assert args.amp is True
     assert args.amp_dtype == "bf16"
     assert args.compile is True
+    assert args.compile_scope == "whole"
     assert args.compile_mode == "max-autotune"
 
 
@@ -153,10 +156,11 @@ def test_batch_cli_velocity_compile_is_explicit_and_independent_from_core_amt() 
 
     assert (
         default_args.compile_velocity,
+        default_args.compile_scope,
         velocity_args.compile,
         velocity_args.compile_velocity,
         velocity_args.compile_mode,
-    ) == (False, False, True, "reduce-overhead")
+    ) == (False, "regional", False, True, "reduce-overhead")
 
 
 def test_batch_runner_routes_amp_and_compiled_forward_to_core_amt(
@@ -272,7 +276,7 @@ def test_batch_runner_reuses_compiled_velocity_forward_across_outputs(
     eager_model = FakeModel()
     compiled_forward = object()
     config = object()
-    compile_calls: list[tuple[object, bool, str]] = []
+    compile_calls: list[tuple[object, bool, str, str]] = []
     inference_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(candidates, "resolve_device", lambda _value: torch.device("cpu"))
@@ -287,8 +291,9 @@ def test_batch_runner_reuses_compiled_velocity_forward_across_outputs(
         *,
         enabled: bool,
         mode: str,
+        scope: str,
     ) -> object:
-        compile_calls.append((model, enabled, mode))
+        compile_calls.append((model, enabled, mode, scope))
         return compiled_forward
 
     def fake_predict(**kwargs: object) -> Path:
@@ -323,6 +328,7 @@ def test_batch_runner_reuses_compiled_velocity_forward_across_outputs(
         cleanup_stems=False,
         compile_velocity=True,
         compile_mode="max-autotune",
+        compile_scope="regional",
     )
     apply_kwargs = {
         "stems": {"piano": tmp_path / "piano.wav"},
@@ -339,7 +345,7 @@ def test_batch_runner_reuses_compiled_velocity_forward_across_outputs(
         output_midi=tmp_path / "second.mid",
     )
 
-    assert compile_calls == [(eager_model, True, "max-autotune")]
+    assert compile_calls == [(eager_model, True, "max-autotune", "regional")]
     assert [
         (
             call["preloaded_model"],

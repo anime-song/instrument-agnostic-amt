@@ -231,6 +231,7 @@ def get_stem_pipeline_models(
     model_type: str = "default",
     compile_model: bool = False,
     compile_mode: str = "default",
+    compile_scope: str = "regional",
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
     device = resolve_device(device_preference)
@@ -239,12 +240,16 @@ def get_stem_pipeline_models(
         None if checkpoint_path in (None, "", "DEFAULT") else Path(checkpoint_path),
         model_type=model_type,
     )
+    compile_cache_key = (
+        ("compiled", str(compile_scope), str(compile_mode))
+        if compile_model
+        else ("eager",)
+    )
     amt_cache_key = (
         "amt",
         str(resolved_checkpoint.resolve()),
         str(device),
-        "compiled" if compile_model else "eager",
-        str(compile_mode),
+        *compile_cache_key,
     )
     sep_cache_key = ("sep", str(device))
 
@@ -270,6 +275,7 @@ def get_stem_pipeline_models(
             amt_model,
             enabled=bool(compile_model),
             mode=str(compile_mode),
+            scope=str(compile_scope),
         )
         STEM_PIPELINE_CACHE[amt_cache_key] = (
             amt_model,
@@ -302,17 +308,22 @@ def get_velocity_models(
     *,
     compile_velocity: bool = False,
     compile_mode: str = "default",
+    compile_scope: str = "regional",
     window_seconds: float = 8.0,
 ) -> tuple[object, object, object]:
     """Velocityのeagerモデルと固定長窓用forwardを再利用する。"""
     device = resolve_device(device_preference)
     resolved_checkpoint = ensure_velocity_checkpoint(checkpoint_path)
+    compile_cache_key = (
+        ("compiled", str(compile_scope), str(compile_mode))
+        if compile_velocity
+        else ("eager",)
+    )
     cache_key = (
         "velocity",
         str(resolved_checkpoint.resolve()),
         str(device),
-        "compiled" if compile_velocity else "eager",
-        str(compile_mode),
+        *compile_cache_key,
         str(float(window_seconds)),
     )
 
@@ -330,6 +341,7 @@ def get_velocity_models(
         model,
         enabled=bool(compile_velocity),
         mode=str(compile_mode),
+        scope=str(compile_scope),
     )
     bundle = (model, forward_model, config)
     STEM_PIPELINE_CACHE[cache_key] = bundle
@@ -481,6 +493,7 @@ def run_stem_separated_transcription(
     compile_model: bool = False,
     compile_velocity: bool = False,
     compile_mode: str = "default",
+    compile_scope: str = "regional",
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
     audio_file = Path(audio_path)
@@ -493,6 +506,7 @@ def run_stem_separated_transcription(
         model_type="default",
         compile_model=compile_model,
         compile_mode=compile_mode,
+        compile_scope=compile_scope,
     )
     device = bundle["device"]
     amt_amp_enabled = bool(amp and is_amp_supported(device))
@@ -511,6 +525,7 @@ def run_stem_separated_transcription(
                 model_type=model_type_key,
                 compile_model=compile_model,
                 compile_mode=compile_mode,
+                compile_scope=compile_scope,
             )
         return amt_bundles[model_type_key]
 
@@ -670,6 +685,7 @@ def run_stem_separated_transcription(
                 device_preference=device,
                 compile_velocity=compile_velocity,
                 compile_mode=compile_mode,
+                compile_scope=compile_scope,
                 window_seconds=8.0,
             )
             predict_velocity_for_stem_midis(
@@ -684,6 +700,7 @@ def run_stem_separated_transcription(
                 disable_tqdm=True,
                 compile_velocity=compile_velocity,
                 compile_mode=compile_mode,
+                compile_scope=compile_scope,
                 preloaded_model=velocity_model,
                 preloaded_config=velocity_config,
                 preloaded_forward=velocity_forward,

@@ -400,6 +400,7 @@ class StemTranscriptionRunner:
         compile_model: bool = False,
         compile_velocity: bool = False,
         compile_mode: str = "default",
+        compile_scope: str = "regional",
     ) -> None:
         self.device = resolve_device(device)
         self.amt_checkpoint_dir = Path(amt_checkpoint_dir).resolve()
@@ -418,6 +419,7 @@ class StemTranscriptionRunner:
         self.compile_model = bool(compile_model)
         self.compile_velocity = bool(compile_velocity)
         self.compile_mode = str(compile_mode)
+        self.compile_scope = str(compile_scope)
         self._separation_bundle: tuple[Any, Any, torch.dtype] | None = None
         self._amt_bundles: dict[str, tuple[Any, Any, Any, Any]] = {}
         self._velocity_bundle: tuple[Any, Any, Any] | None = None
@@ -478,6 +480,7 @@ class StemTranscriptionRunner:
             model,
             enabled=self.compile_model,
             mode=self.compile_mode,
+            scope=self.compile_scope,
         )
         self._amt_bundles[model_type] = (model, forward_model, config, settings)
         return self._amt_bundles[model_type]
@@ -500,6 +503,7 @@ class StemTranscriptionRunner:
                 model,
                 enabled=self.compile_velocity,
                 mode=self.compile_mode,
+                scope=self.compile_scope,
             )
             self._velocity_bundle = (model, forward_model, config)
         return self._velocity_bundle
@@ -654,6 +658,9 @@ class StemTranscriptionRunner:
                 window_seconds=8.0,
                 max_melodic_instruments=self.max_melodic_instruments,
                 disable_tqdm=True,
+                compile_velocity=self.compile_velocity,
+                compile_mode=self.compile_mode,
+                compile_scope=self.compile_scope,
                 preloaded_model=model,
                 preloaded_forward=forward_model,
                 preloaded_config=config,
@@ -879,6 +886,11 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile-velocity", action="store_true")
     parser.add_argument(
+        "--compile-scope",
+        choices=("regional", "whole"),
+        default="regional",
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=(
             "default",
@@ -1018,6 +1030,7 @@ def run_batch(args: argparse.Namespace) -> list[CandidateResult]:
         compile_model=args.compile,
         compile_velocity=args.compile_velocity,
         compile_mode=args.compile_mode,
+        compile_scope=args.compile_scope,
     )
 
     repository_root = Path(__file__).resolve().parents[2]

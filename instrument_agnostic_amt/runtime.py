@@ -66,10 +66,31 @@ def maybe_compile_forward(
     *,
     enabled: bool,
     mode: str = "default",
+    scope: str = "regional",
 ) -> torch.nn.Module:
-    """元モデルを保持したまま、推論用forwardだけを必要時にコンパイルする。"""
+    """推論forwardを指定範囲だけ必要時にコンパイルする。"""
     if not enabled:
         return model
+    if scope == "regional":
+        backbone = getattr(model, "backbone", None)
+        layers = getattr(backbone, "layers", None)
+        if layers is None:
+            raise ValueError(
+                "Regional compile requires model.backbone.layers"
+            )
+        targets = tuple(module for pair in layers for module in pair)
+        if not targets:
+            raise ValueError("Regional compile found no Transformer modules")
+        for target in targets:
+            target.compile(
+                backend="inductor",
+                mode=mode,
+                fullgraph=False,
+                dynamic=None,
+            )
+        return model
+    if scope != "whole":
+        raise ValueError(f"Unsupported compile scope: {scope}")
     return torch.compile(
         model,
         backend="inductor",

@@ -86,6 +86,7 @@ def test_core_inference_cli_defaults_to_auto_device_and_device_amp_dtype(
     assert args.device == "auto"
     assert args.amp_dtype is None
     assert args.compile is False
+    assert args.compile_scope == "regional"
     assert args.compile_mode == "default"
 
 
@@ -100,6 +101,8 @@ def test_core_inference_cli_accepts_compile_options(
             "--audio",
             "input.wav",
             "--compile",
+            "--compile-scope",
+            "whole",
             "--compile-mode",
             "max-autotune",
         ],
@@ -108,6 +111,7 @@ def test_core_inference_cli_accepts_compile_options(
     args = parse_args()
 
     assert args.compile is True
+    assert args.compile_scope == "whole"
     assert args.compile_mode == "max-autotune"
 
 
@@ -117,7 +121,7 @@ def test_process_file_keeps_forward_model_optional_for_existing_callers() -> Non
     assert parameter.default is None
 
 
-def test_compile_forward_is_opt_in_and_preserves_the_eager_model(
+def test_whole_compile_forward_is_opt_in_and_preserves_the_eager_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     eager_model = torch.nn.Linear(2, 2)
@@ -133,7 +137,12 @@ def test_compile_forward_is_opt_in_and_preserves_the_eager_model(
     assert maybe_compile_forward(eager_model, enabled=False) is eager_model
     assert compile_calls == []
     assert (
-        maybe_compile_forward(eager_model, enabled=True, mode="max-autotune")
+        maybe_compile_forward(
+            eager_model,
+            enabled=True,
+            mode="max-autotune",
+            scope="whole",
+        )
         is compiled_forward
     )
     assert compile_calls == [
@@ -146,6 +155,52 @@ def test_compile_forward_is_opt_in_and_preserves_the_eager_model(
             },
         )
     ]
+
+
+class _RegionalTarget(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.compile_calls: list[dict[str, object]] = []
+
+    def compile(self, **kwargs: object) -> None:
+        self.compile_calls.append(kwargs)
+
+
+class _RegionalModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_extractor = _RegionalTarget()
+        self.backbone = torch.nn.Module()
+        self.backbone.layers = torch.nn.ModuleList(
+            [torch.nn.ModuleList([_RegionalTarget(), _RegionalTarget()])]
+        )
+        self.head = _RegionalTarget()
+
+
+def test_regional_compile_is_default_and_only_compiles_transformer_children() -> None:
+    model = _RegionalModel()
+    state_keys = tuple(model.state_dict())
+    targets = [module for pair in model.backbone.layers for module in pair]
+
+    forward = maybe_compile_forward(model, enabled=True, mode="reduce-overhead")
+
+    assert forward is model
+    assert tuple(model.state_dict()) == state_keys
+    assert all(
+        target.compile_calls
+        == [
+            {
+                "backend": "inductor",
+                "mode": "reduce-overhead",
+                "fullgraph": False,
+                "dynamic": None,
+            }
+        ]
+        for target in targets
+    )
+    assert model.feature_extractor.compile_calls == []
+    assert model.head.compile_calls == []
 
 
 def test_empty_device_cache_supports_cuda_and_mps(

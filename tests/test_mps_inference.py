@@ -97,13 +97,16 @@ def _small_velocity_model(
     device: torch.device | str = "cpu",
     *,
     predict_stem_gain: bool = True,
+    encoder_num_layers: int = 0,
 ) -> VelocityPredictionModel:
     with torch.random.fork_rng():
         torch.manual_seed(42)
+        model_kwargs = _small_v1_kwargs()
+        model_kwargs["encoder_num_layers"] = encoder_num_layers
         model = (
             VelocityPredictionModel(
                 VelocityModelConfig(
-                    **_small_v1_kwargs(),
+                    **model_kwargs,
                     note_hidden_size=8,
                     num_stem_classes=1,
                     local_frame_offsets=(0,),
@@ -449,6 +452,7 @@ def test_beat_chord_checkpoint_loads_on_mps(tmp_path: Path) -> None:
 def test_core_amt_compiled_forward_runs_on_mps() -> None:
     torch.manual_seed(23)
     model = _small_amt_model().to("mps")
+    eager_model = copy.deepcopy(model)
     compiled_forward = maybe_compile_forward(model, enabled=True)
     waveform = torch.randn(1, 2, 4096).to("mps")
     valid_frames = torch.tensor([4096], device="mps")
@@ -459,7 +463,7 @@ def test_core_amt_compiled_forward_runs_on_mps() -> None:
             dtype=amp_dtype or torch.bfloat16,
             enabled=amp_dtype is not None,
         ):
-            eager_outputs = model(
+            eager_outputs = eager_model(
                 waveform,
                 valid_audio_frames=valid_frames,
                 include_aux_outputs=False,
@@ -502,15 +506,68 @@ def test_core_amt_compiled_forward_runs_on_mps() -> None:
     os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
     reason="accelerator compile regression is opt-in",
 )
+def test_core_amt_whole_compiled_forward_runs_on_mps() -> None:
+    torch.manual_seed(31)
+    model = _small_amt_model().to("mps")
+    eager_model = copy.deepcopy(model)
+    compiled_forward = maybe_compile_forward(
+        model,
+        enabled=True,
+        scope="whole",
+    )
+    waveform = torch.randn(1, 2, 4096, device="mps")
+    valid_frames = torch.tensor([4096], device="mps")
+
+    with torch.inference_mode():
+        eager_outputs = eager_model(
+            waveform,
+            valid_audio_frames=valid_frames,
+            include_aux_outputs=False,
+        )
+        compiled_outputs = compiled_forward(
+            waveform,
+            valid_audio_frames=valid_frames,
+            include_aux_outputs=False,
+        )
+
+    for name, eager_value in eager_outputs.items():
+        compiled_value = compiled_outputs[name]
+        if not isinstance(eager_value, torch.Tensor):
+            assert compiled_value is None
+            continue
+        assert isinstance(compiled_value, torch.Tensor)
+        assert compiled_value.device.type == "mps"
+        assert torch.isfinite(compiled_value).all()
+        torch.testing.assert_close(
+            compiled_value,
+            eager_value,
+            rtol=1e-4,
+            atol=1e-3,
+        )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
+    reason="accelerator compile regression is opt-in",
+)
 def test_velocity_compiled_forward_handles_varying_note_counts_on_mps() -> None:
     device = torch.device("mps")
-    model = _small_velocity_model(device, predict_stem_gain=False)
+    model = _small_velocity_model(
+        device,
+        predict_stem_gain=False,
+        encoder_num_layers=1,
+    )
+    eager_model = copy.deepcopy(model)
     compiled_forward = maybe_compile_forward(model, enabled=True)
 
     with torch.inference_mode():
-        for note_count in (1, 2, 3):
-            inputs = _velocity_inputs(note_count, device=device)
-            eager_outputs = model(**inputs)
+        for note_count, sample_count in ((1, 1024), (2, 768), (3, 640)):
+            inputs = _velocity_inputs(
+                note_count,
+                device=device,
+                sample_count=sample_count,
+            )
+            eager_outputs = eager_model(**inputs)
             compiled_outputs = compiled_forward(**inputs)
 
             assert compiled_outputs.keys() == eager_outputs.keys()
