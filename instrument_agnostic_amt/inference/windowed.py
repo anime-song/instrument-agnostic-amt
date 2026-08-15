@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import replace
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from tqdm.auto import tqdm
+
+from ..runtime import is_amp_supported
 
 from ..modeling.heads.semi_crf import (
     decode_factorized_pair_intervals,
@@ -554,6 +556,7 @@ def decode_notes(
     amp_dtype: torch.dtype,
     settings: InferenceSettings,
     velocity: int,
+    forward_model: Callable[..., dict[str, torch.Tensor | None]] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
     if config.semi_crf_version == "v1":
         from .v1_windowed import decode_v1_notes
@@ -568,6 +571,7 @@ def decode_notes(
             amp_dtype=amp_dtype,
             settings=settings,
             velocity=velocity,
+            forward_model=forward_model,
         )
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
@@ -635,6 +639,7 @@ def decode_notes(
         disable=bool(settings.disable_tqdm),
     )
 
+    inference_model = model if forward_model is None else forward_model
     for batch_starts in progress:
         window_tensors = []
         valid_audio_frames = []
@@ -679,9 +684,9 @@ def decode_notes(
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
-            enabled=bool(amp_enabled and device.type == "cuda"),
+            enabled=bool(amp_enabled and is_amp_supported(device)),
         ):
-            outputs = model(
+            outputs = inference_model(
                 batch_waveform,
                 valid_audio_frames=valid_audio_frames_tensor,
                 include_aux_outputs=False,

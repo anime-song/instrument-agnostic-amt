@@ -26,6 +26,12 @@ from ..modeling.checkpoints import (
     load_compatible_weights,
 )
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
+from ..runtime import (
+    is_amp_supported,
+    maybe_compile_forward,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -168,13 +174,32 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=None, help="Output directory for --audio-dir"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--device",
+        type=str,
+        default="auto",
+        help="Inference device: auto, cuda, mps, or cpu",
     )
-    parser.add_argument("--amp", action="store_true", help="Enable CUDA autocast")
+    parser.add_argument("--amp", action="store_true", help="Enable accelerator autocast")
     parser.add_argument(
         "--amp-dtype",
         choices=("fp16", "bf16"),
-        default="bf16" if torch.cuda.is_bf16_supported() else "fp16",
+        default=None,
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the core AMT forward with TorchInductor",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
+        help="torch.compile mode used when --compile is enabled",
     )
     parser.add_argument(
         "--window-ms",
@@ -345,12 +370,6 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def resolve_amp_dtype(device: torch.device, dtype_str: str) -> torch.dtype:
-    if dtype_str == "bf16":
-        return torch.bfloat16
-    return torch.float16
-
-
 def load_model(
     checkpoint_path: Path, *, device: torch.device
 ) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig, dict[str, Any]]:
@@ -461,6 +480,7 @@ def process_file(
     output_midi_path: Path,
     *,
     model: AudioSemiCRFTransformer,
+    forward_model: torch.nn.Module | None = None,
     config: SemiCRFModelConfig,
     instrument_id: int | None,
     settings: InferenceSettings,
@@ -480,6 +500,7 @@ def process_file(
         amp_dtype=amp_dtype,
         settings=settings,
         velocity=int(args.velocity),
+        forward_model=forward_model,
     )
     midi, midi_stats = build_midi(
         notes,
@@ -512,14 +533,19 @@ def process_file(
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
-    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_enabled = bool(args.amp and is_amp_supported(device))
     instrument_id = (
         resolve_instrument_id(args.instrument) if args.instrument is not None else None
     )
     checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
     model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
+    forward_model = maybe_compile_forward(
+        model,
+        enabled=bool(args.compile),
+        mode=str(args.compile_mode),
+    )
     settings = resolve_inference_settings(config, training_args, args)
     requested_instrument_ids = (
         (int(instrument_id),)
@@ -548,6 +574,7 @@ def main() -> None:
                 audio_path,
                 output_path,
                 model=model,
+                forward_model=forward_model,
                 config=config,
                 instrument_id=instrument_id,
                 settings=settings,
@@ -568,6 +595,7 @@ def main() -> None:
         audio_path,
         output_path,
         model=model,
+        forward_model=forward_model,
         config=config,
         instrument_id=instrument_id,
         settings=settings,

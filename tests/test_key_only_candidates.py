@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pretty_midi
 import pytest
+import torch
 
 from instrument_agnostic_amt.beat_chord import key_only_candidates as candidates
 from instrument_agnostic_amt.beat_chord.key_only_candidates import (
@@ -123,6 +125,121 @@ def test_checkpoint_auto_resolution_prefers_current_mtime(tmp_path: Path) -> Non
 )
 def test_stem_model_types_match_colab(stem_name: str, expected: str) -> None:
     assert resolve_stem_model_type(stem_name) == expected
+
+
+def test_batch_cli_exposes_core_amt_amp_and_compile_options() -> None:
+    args = parse_arguments(
+        [
+            "--amp",
+            "--amp-dtype",
+            "bf16",
+            "--compile",
+            "--compile-mode",
+            "max-autotune",
+        ]
+    )
+
+    assert args.amp is True
+    assert args.amp_dtype == "bf16"
+    assert args.compile is True
+    assert args.compile_mode == "max-autotune"
+
+
+def test_batch_runner_routes_amp_and_compiled_forward_to_core_amt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infer as amt_infer
+
+    eager_model = object()
+    compiled_forward = object()
+    inference_calls: list[dict[str, object]] = []
+
+    class _Waveform:
+        def to(self, _device: torch.device) -> "_Waveform":
+            return self
+
+    class _Midi:
+        @staticmethod
+        def write(path: str) -> None:
+            Path(path).write_bytes(b"midi")
+
+    monkeypatch.setattr(candidates, "resolve_device", lambda _value: torch.device("mps"))
+    monkeypatch.setattr(
+        candidates,
+        "maybe_compile_forward",
+        lambda model, **_kwargs: compiled_forward if model is eager_model else model,
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: tmp_path / "checkpoint.pth",
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (
+            eager_model,
+            SimpleNamespace(num_instrument_classes=2, sample_rate=1_000),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "resolve_stem_instrument_class_ids",
+        lambda _stem_name: (0,),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "filter_supported_instrument_class_ids",
+        lambda values, **_kwargs: values,
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_audio",
+        lambda *_args, **_kwargs: (_Waveform(), 1_000, 2),
+    )
+
+    def fake_run_inference(**kwargs: object) -> tuple[list[object], dict, dict]:
+        inference_calls.append(kwargs)
+        return [], {}, {}
+
+    monkeypatch.setattr(amt_infer, "run_inference", fake_run_inference)
+    monkeypatch.setattr(amt_infer, "_build_midi", lambda *_args, **_kwargs: _Midi())
+    monkeypatch.setattr(
+        candidates,
+        "is_valid_midi_file",
+        lambda path: Path(path).is_file(),
+    )
+    runner = StemTranscriptionRunner(
+        device="mps",
+        amt_checkpoint_dir=tmp_path,
+        separation_checkpoint=tmp_path / "separation.pth",
+        velocity_checkpoint=tmp_path / "velocity.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=False,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+        amp=True,
+        amp_dtype="bf16",
+        compile_model=True,
+    )
+
+    runner._transcribe_stem(
+        stem_name="piano",
+        stem_path=tmp_path / "piano.wav",
+        output_midi=tmp_path / "piano.mid",
+    )
+
+    assert len(inference_calls) == 1
+    assert inference_calls[0]["model"] is eager_model
+    assert inference_calls[0]["forward_model"] is compiled_forward
+    assert inference_calls[0]["amp_enabled"] is True
+    assert inference_calls[0]["amp_dtype"] is torch.bfloat16
 
 
 def test_merge_stem_midis_limits_instruments_and_long_notes(
