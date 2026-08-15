@@ -235,10 +235,7 @@ class StemConv(nn.Module):
         x = self.block3(x)
         return self.block4(x)
 
-    @torch.compiler.disable
     def _forward_float32(self, x: torch.Tensor) -> torch.Tensor:
-        # MPS の AOT コンパイルは内側の autocast 無効化を保持しないため、
-        # この FP32 island は eager のまま実行する。
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             return self._forward_impl(x.float())
 

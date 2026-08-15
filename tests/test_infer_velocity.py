@@ -177,13 +177,13 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
-def test_velocity_compile_uses_eager_forward_for_partial_tail(
+def test_velocity_compile_uses_regional_forward_for_full_and_partial_windows(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """固定長窓だけcompileし、短い末尾窓は元モデルへ戻す。"""
+    """regional compileした同じモデルで固定長窓と短い末尾窓を処理する。"""
 
     guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
     guitar_midi.instruments[0].notes.append(
@@ -196,13 +196,11 @@ def test_velocity_compile_uses_eager_forward_for_partial_tail(
     )
     guitar_midi.write(str(mock_stem_midis["guitar"]))
 
-    eager_audio_lengths: list[int] = []
     compiled_audio_lengths: list[int] = []
-    compile_calls: list[tuple[object, bool, str, str]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
 
     class EagerVelocityModel:
         def __call__(self, audio: torch.Tensor, **kwargs: torch.Tensor):
-            eager_audio_lengths.append(int(audio.shape[-1]))
             return {
                 "velocity_expected": torch.full_like(
                     kwargs["note_start_seconds"],
@@ -233,9 +231,8 @@ def test_velocity_compile_uses_eager_forward_for_partial_tail(
         *,
         enabled: bool,
         mode: str,
-        scope: str,
     ) -> object:
-        compile_calls.append((model, enabled, mode, scope))
+        compile_calls.append((model, enabled, mode))
         return compiled_forward
 
     monkeypatch.setattr(velocity_infer, "maybe_compile_forward", fake_compile)
@@ -249,13 +246,12 @@ def test_velocity_compile_uses_eager_forward_for_partial_tail(
         window_seconds=1.25,
         compile_velocity=True,
         compile_mode="reduce-overhead",
-        compile_scope="whole",
         disable_tqdm=True,
     )
 
-    assert compile_calls == [(eager_model, True, "reduce-overhead", "whole")]
-    assert compiled_audio_lengths == [int(1.25 * config.sample_rate)]
-    assert eager_audio_lengths == [
+    assert compile_calls == [(eager_model, True, "reduce-overhead")]
+    assert compiled_audio_lengths == [
+        int(1.25 * config.sample_rate),
         2 * config.sample_rate - int(1.25 * config.sample_rate)
     ]
 
@@ -266,84 +262,7 @@ def test_velocity_compile_uses_eager_forward_for_partial_tail(
         for note in instrument.notes
     }
     assert velocities_by_start[0.1] == 91
-    assert velocities_by_start[1.6] == 31
-
-
-def test_velocity_regional_compile_uses_in_place_model_for_partial_tail(
-    mock_stem_midis: dict[str, Path],
-    mock_audio_stems: dict[str, Path],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
-    guitar_midi.instruments[0].notes.append(
-        pretty_midi.Note(
-            velocity=80,
-            pitch=64,
-            start=1.6,
-            end=1.9,
-        )
-    )
-    guitar_midi.write(str(mock_stem_midis["guitar"]))
-
-    audio_lengths: list[int] = []
-
-    class RegionalVelocityModel:
-        compiled = False
-
-        def __call__(self, audio: torch.Tensor, **kwargs: torch.Tensor):
-            audio_lengths.append(int(audio.shape[-1]))
-            value = 91.0 if self.compiled else 31.0
-            return {
-                "velocity_expected": torch.full_like(
-                    kwargs["note_start_seconds"],
-                    value,
-                )
-            }
-
-    model = RegionalVelocityModel()
-    config = VelocityModelConfig(sample_rate=22050, predict_stem_gain=False)
-    monkeypatch.setattr(
-        velocity_infer,
-        "load_velocity_model",
-        lambda *_args, **_kwargs: (model, config),
-    )
-
-    def fake_compile(
-        target: RegionalVelocityModel,
-        *,
-        enabled: bool,
-        mode: str,
-        scope: str,
-    ) -> RegionalVelocityModel:
-        assert (enabled, mode, scope) == (True, "default", "regional")
-        target.compiled = True
-        return target
-
-    monkeypatch.setattr(velocity_infer, "maybe_compile_forward", fake_compile)
-
-    output_path = tmp_path / "regional_velocity.mid"
-    predict_velocity_for_stem_midis(
-        stem_midis=mock_stem_midis,
-        stem_audios=mock_audio_stems,
-        output_midi_path=output_path,
-        device="cpu",
-        window_seconds=1.25,
-        compile_velocity=True,
-        compile_scope="regional",
-        disable_tqdm=True,
-    )
-
-    assert audio_lengths == [
-        int(1.25 * config.sample_rate),
-        2 * config.sample_rate - int(1.25 * config.sample_rate),
-    ]
-    output = pretty_midi.PrettyMIDI(str(output_path))
-    assert {
-        note.velocity
-        for instrument in output.instruments
-        for note in instrument.notes
-    } == {91}
+    assert velocities_by_start[1.6] == 91
 
 
 def test_velocity_cli_compile_is_opt_in(
@@ -361,7 +280,6 @@ def test_velocity_cli_compile_is_opt_in(
     )
     defaults = velocity_infer.parse_args()
     assert defaults.compile_velocity is False
-    assert defaults.compile_scope == "regional"
     assert defaults.compile_mode == "default"
 
     monkeypatch.setattr(
@@ -373,16 +291,33 @@ def test_velocity_cli_compile_is_opt_in(
             "--stem-files",
             "piano.wav",
             "--compile-velocity",
-            "--compile-scope",
-            "whole",
             "--compile-mode",
             "max-autotune",
         ],
     )
     enabled = velocity_infer.parse_args()
     assert enabled.compile_velocity is True
-    assert enabled.compile_scope == "whole"
     assert enabled.compile_mode == "max-autotune"
+
+
+def test_velocity_cli_rejects_removed_compile_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer_velocity",
+            "--midi",
+            "input.mid",
+            "--stem-files",
+            "piano.wav",
+            "--compile-scope",
+            "whole",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        velocity_infer.parse_args()
 
 
 def test_preloaded_velocity_forward_requires_matching_eager_model() -> None:

@@ -444,7 +444,6 @@ def predict_velocity_for_stem_midis(
     disable_tqdm: bool = False,
     compile_velocity: bool = False,
     compile_mode: str = "default",
-    compile_scope: str = "regional",
     preloaded_model: VelocityPredictionModel | None = None,
     preloaded_config: VelocityModelConfig | None = None,
     preloaded_forward: Any | None = None,
@@ -490,7 +489,6 @@ def predict_velocity_for_stem_midis(
             model,
             enabled=bool(compile_velocity),
             mode=str(compile_mode),
-            scope=str(compile_scope),
         )
     )
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
@@ -635,15 +633,7 @@ def predict_velocity_for_stem_midis(
                 torch.from_numpy(stem_indices[indices_in_win]).unsqueeze(0).to(device=target_device)
             )
 
-            # whole-model compileはMPSで可変長Tを再compileできないため末尾を
-            # eagerへ戻す。regional compileではmodel内のTransformerだけが
-            # in-placeでcompiledになり、同じ分岐で短い末尾も安全に処理できる。
-            active_forward = (
-                forward_model
-                if int(sub_audio.shape[-1]) == window_samples
-                else model
-            )
-            outputs = active_forward(
+            outputs = forward_model(
                 sub_audio,
                 note_start_seconds=note_start_tensor,
                 note_end_seconds=note_end_tensor,
@@ -740,7 +730,6 @@ def predict_velocity_for_midi(
     disable_tqdm: bool = False,
     compile_velocity: bool = False,
     compile_mode: str = "default",
-    compile_scope: str = "regional",
 ) -> Path:
     """単一のMIDIファイルを受け取った場合の互換用エントリポイント。"""
     midi_file_path = Path(midi_path)
@@ -782,7 +771,6 @@ def predict_velocity_for_midi(
         disable_tqdm=disable_tqdm,
         compile_velocity=compile_velocity,
         compile_mode=compile_mode,
-        compile_scope=compile_scope,
     )
 
     for temp_p in stem_midis.values():
@@ -833,13 +821,7 @@ def parse_args() -> argparse.Namespace:
         "--compile-velocity",
         dest="compile_velocity",
         action="store_true",
-        help="Compile fixed-length velocity-model forward passes with torch.compile",
-    )
-    parser.add_argument(
-        "--compile-scope",
-        choices=("regional", "whole"),
-        default="regional",
-        help="Compile Transformer regions (default) or the whole velocity forward",
+        help="Compile shared velocity-model Transformer regions with torch.compile",
     )
     parser.add_argument(
         "--compile-mode",
@@ -892,7 +874,6 @@ def main() -> None:
         apply_stem_gain_to_cc7=args.apply_cc7_gain,
         compile_velocity=args.compile_velocity,
         compile_mode=args.compile_mode,
-        compile_scope=args.compile_scope,
     )
     print(f"Successfully generated velocity-predicted MIDI: {output_path}")
 

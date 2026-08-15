@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,14 @@ from instrument_agnostic_amt.taxonomy.instrument_classes import (
 )
 
 
+def test_stem_pipeline_compile_api_has_no_scope_switch() -> None:
+    assert "compile_scope" not in signature(get_stem_pipeline_models).parameters
+    assert "compile_scope" not in signature(get_velocity_models).parameters
+    assert "compile_scope" not in signature(
+        infer_stem.run_stem_separated_transcription
+    ).parameters
+
+
 def test_resolve_stem_model_type() -> None:
     assert resolve_stem_model_type("drums_stem") == "drums"
     assert resolve_stem_model_type("bass_stem") == "bass_v2"
@@ -44,7 +53,7 @@ def test_stem_pipeline_compiles_only_the_amt_forward(
     checkpoint.write_bytes(b"")
     eager_model = torch.nn.Linear(2, 2)
     compiled_forward = object()
-    compile_calls: list[tuple[object, bool, str, str]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
 
     monkeypatch.setattr(
         infer_stem.infer,
@@ -62,9 +71,8 @@ def test_stem_pipeline_compiles_only_the_amt_forward(
         *,
         enabled: bool,
         mode: str,
-        scope: str,
     ) -> object:
-        compile_calls.append((model, enabled, mode, scope))
+        compile_calls.append((model, enabled, mode))
         return compiled_forward
 
     monkeypatch.setattr(infer_stem, "maybe_compile_forward", fake_compile)
@@ -80,12 +88,11 @@ def test_stem_pipeline_compiles_only_the_amt_forward(
         device_preference="cpu",
         compile_model=True,
         compile_mode="max-autotune",
-        compile_scope="regional",
     )
 
     assert bundle["amt_model"] is eager_model
     assert bundle["amt_forward"] is compiled_forward
-    assert compile_calls == [(eager_model, True, "max-autotune", "regional")]
+    assert compile_calls == [(eager_model, True, "max-autotune")]
 
 
 def test_velocity_pipeline_compile_is_independent_and_cached(
@@ -97,7 +104,7 @@ def test_velocity_pipeline_compile_is_independent_and_cached(
     eager_model = torch.nn.Linear(2, 2)
     compiled_forward = object()
     load_calls: list[tuple[Path, torch.device]] = []
-    compile_calls: list[tuple[object, bool, str, str]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
 
     monkeypatch.setattr(
         infer_stem,
@@ -120,9 +127,8 @@ def test_velocity_pipeline_compile_is_independent_and_cached(
         *,
         enabled: bool,
         mode: str,
-        scope: str,
     ) -> object:
-        compile_calls.append((model, enabled, mode, scope))
+        compile_calls.append((model, enabled, mode))
         return compiled_forward
 
     monkeypatch.setattr(infer_stem, "maybe_compile_forward", fake_compile)
@@ -133,48 +139,31 @@ def test_velocity_pipeline_compile_is_independent_and_cached(
         device_preference="cpu",
         compile_velocity=True,
         compile_mode="reduce-overhead",
-        compile_scope="regional",
-        window_seconds=8.0,
     )
     second = get_velocity_models(
         checkpoint_path=checkpoint,
         device_preference="cpu",
         compile_velocity=True,
         compile_mode="reduce-overhead",
-        compile_scope="regional",
-        window_seconds=8.0,
     )
-    different_scope = get_velocity_models(
+    different_mode = get_velocity_models(
         checkpoint_path=checkpoint,
         device_preference="cpu",
         compile_velocity=True,
-        compile_mode="reduce-overhead",
-        compile_scope="whole",
-        window_seconds=8.0,
-    )
-    different_window = get_velocity_models(
-        checkpoint_path=checkpoint,
-        device_preference="cpu",
-        compile_velocity=True,
-        compile_mode="reduce-overhead",
-        compile_scope="regional",
-        window_seconds=4.0,
+        compile_mode="max-autotune",
     )
 
     assert first is second
-    assert different_scope is not first
-    assert different_window is not first
+    assert different_mode is not first
     assert first[0] is eager_model
     assert first[1] is compiled_forward
     assert load_calls == [
         (checkpoint, torch.device("cpu")),
         (checkpoint, torch.device("cpu")),
-        (checkpoint, torch.device("cpu")),
     ]
     assert compile_calls == [
-        (eager_model, True, "reduce-overhead", "regional"),
-        (eager_model, True, "reduce-overhead", "whole"),
-        (eager_model, True, "reduce-overhead", "regional"),
+        (eager_model, True, "reduce-overhead"),
+        (eager_model, True, "max-autotune"),
     ]
 
 

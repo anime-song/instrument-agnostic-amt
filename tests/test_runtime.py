@@ -86,8 +86,30 @@ def test_core_inference_cli_defaults_to_auto_device_and_device_amp_dtype(
     assert args.device == "auto"
     assert args.amp_dtype is None
     assert args.compile is False
-    assert args.compile_scope == "regional"
     assert args.compile_mode == "default"
+
+
+def test_compile_api_exposes_only_regional_compile() -> None:
+    assert "scope" not in signature(maybe_compile_forward).parameters
+
+
+def test_core_inference_cli_rejects_removed_compile_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "amt-infer",
+            "--audio",
+            "input.wav",
+            "--compile-scope",
+            "whole",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_core_inference_cli_accepts_compile_options(
@@ -101,8 +123,6 @@ def test_core_inference_cli_accepts_compile_options(
             "--audio",
             "input.wav",
             "--compile",
-            "--compile-scope",
-            "whole",
             "--compile-mode",
             "max-autotune",
         ],
@@ -111,7 +131,6 @@ def test_core_inference_cli_accepts_compile_options(
     args = parse_args()
 
     assert args.compile is True
-    assert args.compile_scope == "whole"
     assert args.compile_mode == "max-autotune"
 
 
@@ -119,42 +138,6 @@ def test_process_file_keeps_forward_model_optional_for_existing_callers() -> Non
     parameter = signature(process_file).parameters["forward_model"]
 
     assert parameter.default is None
-
-
-def test_whole_compile_forward_is_opt_in_and_preserves_the_eager_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    eager_model = torch.nn.Linear(2, 2)
-    compiled_forward = object()
-    compile_calls: list[tuple[object, dict[str, object]]] = []
-
-    def fake_compile(model: object, **kwargs: object) -> object:
-        compile_calls.append((model, kwargs))
-        return compiled_forward
-
-    monkeypatch.setattr(torch, "compile", fake_compile)
-
-    assert maybe_compile_forward(eager_model, enabled=False) is eager_model
-    assert compile_calls == []
-    assert (
-        maybe_compile_forward(
-            eager_model,
-            enabled=True,
-            mode="max-autotune",
-            scope="whole",
-        )
-        is compiled_forward
-    )
-    assert compile_calls == [
-        (
-            eager_model,
-            {
-                "backend": "inductor",
-                "mode": "max-autotune",
-                "fullgraph": False,
-            },
-        )
-    ]
 
 
 class _RegionalTarget(torch.nn.Module):

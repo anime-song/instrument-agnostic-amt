@@ -506,50 +506,6 @@ def test_core_amt_compiled_forward_runs_on_mps() -> None:
     os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
     reason="accelerator compile regression is opt-in",
 )
-def test_core_amt_whole_compiled_forward_runs_on_mps() -> None:
-    torch.manual_seed(31)
-    model = _small_amt_model().to("mps")
-    eager_model = copy.deepcopy(model)
-    compiled_forward = maybe_compile_forward(
-        model,
-        enabled=True,
-        scope="whole",
-    )
-    waveform = torch.randn(1, 2, 4096, device="mps")
-    valid_frames = torch.tensor([4096], device="mps")
-
-    with torch.inference_mode():
-        eager_outputs = eager_model(
-            waveform,
-            valid_audio_frames=valid_frames,
-            include_aux_outputs=False,
-        )
-        compiled_outputs = compiled_forward(
-            waveform,
-            valid_audio_frames=valid_frames,
-            include_aux_outputs=False,
-        )
-
-    for name, eager_value in eager_outputs.items():
-        compiled_value = compiled_outputs[name]
-        if not isinstance(eager_value, torch.Tensor):
-            assert compiled_value is None
-            continue
-        assert isinstance(compiled_value, torch.Tensor)
-        assert compiled_value.device.type == "mps"
-        assert torch.isfinite(compiled_value).all()
-        torch.testing.assert_close(
-            compiled_value,
-            eager_value,
-            rtol=1e-4,
-            atol=1e-3,
-        )
-
-
-@pytest.mark.skipif(
-    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
-    reason="accelerator compile regression is opt-in",
-)
 def test_velocity_compiled_forward_handles_varying_note_counts_on_mps() -> None:
     device = torch.device("mps")
     model = _small_velocity_model(
