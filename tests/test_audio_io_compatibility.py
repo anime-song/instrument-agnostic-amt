@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 
+import preprocess.resample_only as resample_only
 from instrument_agnostic_amt.beat_chord.datasets.common import (
     read_audio_duration_entry,
 )
@@ -119,3 +121,25 @@ def test_resample_in_place_rewrites_audio_at_target_rate(tmp_path: Path) -> None
         4_000,
         4_000,
     )
+    assert info.subtype == "FLOAT"
+
+
+def test_resample_in_place_keeps_original_when_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "sample.wav"
+    _write_mono_wav(audio_path, sample_rate=8_000, frames=8_000)
+    original_bytes = audio_path.read_bytes()
+
+    def fail_after_truncating_target(path: str, *_args: object, **_kwargs: object) -> None:
+        Path(path).write_bytes(b"")
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(resample_only.sf, "write", fail_after_truncating_target)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        resample_in_place(audio_path, 4_000)
+
+    assert audio_path.read_bytes() == original_bytes
+    assert list(tmp_path.iterdir()) == [audio_path]
