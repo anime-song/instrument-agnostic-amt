@@ -13,6 +13,7 @@ import infer_stem
 from infer_stem import (
     get_refinement_models,
     get_stem_pipeline_models,
+    get_velocity_models,
     merge_midis_logic,
     refine_stem_instrument_midis,
     resolve_stem_model_type,
@@ -83,6 +84,81 @@ def test_stem_pipeline_compiles_only_the_amt_forward(
     assert bundle["amt_model"] is eager_model
     assert bundle["amt_forward"] is compiled_forward
     assert compile_calls == [(eager_model, True, "max-autotune")]
+
+
+def test_velocity_pipeline_compile_is_independent_and_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "velocity.pth"
+    checkpoint.write_bytes(b"")
+    eager_model = torch.nn.Linear(2, 2)
+    compiled_forward = object()
+    load_calls: list[tuple[Path, torch.device]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
+
+    monkeypatch.setattr(
+        infer_stem,
+        "ensure_velocity_checkpoint",
+        lambda _path: checkpoint,
+    )
+
+    def fake_load(
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object]:
+        load_calls.append((path, device))
+        return eager_model, object()
+
+    monkeypatch.setattr(infer_stem, "load_velocity_model", fake_load)
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    monkeypatch.setattr(infer_stem, "maybe_compile_forward", fake_compile)
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    first = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+        window_seconds=8.0,
+    )
+    second = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+        window_seconds=8.0,
+    )
+    different_window = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+        window_seconds=4.0,
+    )
+
+    assert first is second
+    assert different_window is not first
+    assert first[0] is eager_model
+    assert first[1] is compiled_forward
+    assert load_calls == [
+        (checkpoint, torch.device("cpu")),
+        (checkpoint, torch.device("cpu")),
+    ]
+    assert compile_calls == [
+        (eager_model, True, "reduce-overhead"),
+        (eager_model, True, "reduce-overhead"),
+    ]
 
 
 def test_refinement_cache_distinguishes_cuda_device_indices(

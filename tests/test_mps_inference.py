@@ -93,6 +93,65 @@ def _small_v1_kwargs() -> dict[str, object]:
     }
 
 
+def _small_velocity_model(
+    device: torch.device | str = "cpu",
+    *,
+    predict_stem_gain: bool = True,
+) -> VelocityPredictionModel:
+    with torch.random.fork_rng():
+        torch.manual_seed(42)
+        model = (
+            VelocityPredictionModel(
+                VelocityModelConfig(
+                    **_small_v1_kwargs(),
+                    note_hidden_size=8,
+                    num_stem_classes=1,
+                    local_frame_offsets=(0,),
+                    predict_stem_gain=predict_stem_gain,
+                )
+            )
+            .eval()
+            .to(device)
+        )
+    return model
+
+
+def _velocity_inputs(
+    note_count: int,
+    *,
+    device: torch.device | str = "cpu",
+    sample_count: int = 1024,
+) -> dict[str, torch.Tensor]:
+    # アクセラレータ間で同じ入力値を使えるよう、CPU上で決定的に生成する。
+    waveform = torch.linspace(-0.25, 0.25, steps=2 * sample_count).reshape(
+        1, 1, 2, sample_count
+    )
+    note_starts = torch.linspace(0.004, 0.030, steps=note_count).reshape(
+        1, note_count
+    )
+    return {
+        "audio": waveform.to(device),
+        "note_start_seconds": note_starts.to(device),
+        "note_end_seconds": (note_starts + 0.008).to(device),
+        "note_pitch": (
+            (torch.arange(note_count) % 12 + 21).reshape(1, note_count).to(device)
+        ),
+        "note_program": torch.zeros(
+            1, note_count, dtype=torch.long, device=device
+        ),
+        "note_is_drum": torch.zeros(
+            1, note_count, dtype=torch.bool, device=device
+        ),
+        "note_stem_index": torch.zeros(
+            1, note_count, dtype=torch.long, device=device
+        ),
+        "stem_class_id": torch.zeros(1, 1, dtype=torch.long, device=device),
+        "valid_audio_frames": torch.full(
+            (1, 1), sample_count, dtype=torch.long, device=device
+        ),
+    }
+
+
 def test_recursive_cqt_mps_matches_cpu() -> None:
     generator = torch.Generator().manual_seed(42)
     waveform = torch.randn(2, 4096, generator=generator)
@@ -242,27 +301,10 @@ def test_v2_semi_crf_decode_runs_on_mps_and_matches_cpu() -> None:
 
 def test_velocity_forward_runs_on_mps() -> None:
     device = torch.device("mps")
-    model = VelocityPredictionModel(
-        VelocityModelConfig(
-            **_small_v1_kwargs(),
-            note_hidden_size=8,
-            num_stem_classes=1,
-            local_frame_offsets=(0,),
-        )
-    ).eval().to(device)
+    model = _small_velocity_model(device)
 
     with torch.inference_mode():
-        outputs = model(
-            torch.randn(1, 1, 2, 1024, device=device),
-            note_start_seconds=torch.tensor([[0.004]], device=device),
-            note_end_seconds=torch.tensor([[0.012]], device=device),
-            note_pitch=torch.tensor([[24]], device=device),
-            note_program=torch.tensor([[0]], device=device),
-            note_is_drum=torch.tensor([[False]], device=device),
-            note_stem_index=torch.tensor([[0]], device=device),
-            stem_class_id=torch.tensor([[0]], device=device),
-            valid_audio_frames=torch.tensor([[1024]], device=device),
-        )
+        outputs = model(**_velocity_inputs(1, device=device))
 
     assert outputs["velocity_logits"].shape == (1, 1, 127)
     assert all(
@@ -454,3 +496,31 @@ def test_core_amt_compiled_forward_runs_on_mps() -> None:
                 rtol=rtol,
                 atol=atol,
             )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
+    reason="accelerator compile regression is opt-in",
+)
+def test_velocity_compiled_forward_handles_varying_note_counts_on_mps() -> None:
+    device = torch.device("mps")
+    model = _small_velocity_model(device, predict_stem_gain=False)
+    compiled_forward = maybe_compile_forward(model, enabled=True)
+
+    with torch.inference_mode():
+        for note_count in (1, 2, 3):
+            inputs = _velocity_inputs(note_count, device=device)
+            eager_outputs = model(**inputs)
+            compiled_outputs = compiled_forward(**inputs)
+
+            assert compiled_outputs.keys() == eager_outputs.keys()
+            for name, eager_value in eager_outputs.items():
+                compiled_value = compiled_outputs[name]
+                assert compiled_value.device.type == "mps"
+                assert torch.isfinite(compiled_value).all()
+                torch.testing.assert_close(
+                    compiled_value,
+                    eager_value,
+                    rtol=1e-4,
+                    atol=1e-5,
+                )

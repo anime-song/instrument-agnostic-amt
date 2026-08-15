@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from instrument_agnostic_amt.runtime import maybe_compile_forward, resolve_device
-from tests.test_mps_inference import _small_amt_model
+from tests.test_mps_inference import (
+    _small_amt_model,
+    _small_velocity_model,
+    _velocity_inputs,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -139,3 +143,31 @@ def test_core_amt_compiled_forward_runs_on_cuda() -> None:
                 rtol=rtol,
                 atol=atol,
             )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
+    reason="accelerator compile regression is opt-in",
+)
+def test_velocity_compiled_forward_handles_varying_note_counts_on_cuda() -> None:
+    device = torch.device("cuda")
+    model = _small_velocity_model(device, predict_stem_gain=False)
+    compiled_forward = maybe_compile_forward(model, enabled=True)
+
+    with torch.inference_mode():
+        for note_count in (1, 2, 3):
+            inputs = _velocity_inputs(note_count, device=device)
+            eager_outputs = model(**inputs)
+            compiled_outputs = compiled_forward(**inputs)
+
+            assert compiled_outputs.keys() == eager_outputs.keys()
+            for name, eager_value in eager_outputs.items():
+                compiled_value = compiled_outputs[name]
+                assert compiled_value.device.type == "cuda"
+                assert torch.isfinite(compiled_value).all()
+                torch.testing.assert_close(
+                    compiled_value,
+                    eager_value,
+                    rtol=1e-4,
+                    atol=1e-5,
+                )

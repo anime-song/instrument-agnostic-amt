@@ -177,6 +177,157 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
+def test_velocity_compile_uses_eager_forward_for_partial_tail(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """固定長窓だけcompileし、短い末尾窓は元モデルへ戻す。"""
+
+    guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
+    guitar_midi.instruments[0].notes.append(
+        pretty_midi.Note(
+            velocity=80,
+            pitch=64,
+            start=1.6,
+            end=1.9,
+        )
+    )
+    guitar_midi.write(str(mock_stem_midis["guitar"]))
+
+    eager_audio_lengths: list[int] = []
+    compiled_audio_lengths: list[int] = []
+    compile_calls: list[tuple[object, bool, str]] = []
+
+    class EagerVelocityModel:
+        def __call__(self, audio: torch.Tensor, **kwargs: torch.Tensor):
+            eager_audio_lengths.append(int(audio.shape[-1]))
+            return {
+                "velocity_expected": torch.full_like(
+                    kwargs["note_start_seconds"],
+                    31.0,
+                )
+            }
+
+    eager_model = EagerVelocityModel()
+
+    def compiled_forward(audio: torch.Tensor, **kwargs: torch.Tensor):
+        compiled_audio_lengths.append(int(audio.shape[-1]))
+        return {
+            "velocity_expected": torch.full_like(
+                kwargs["note_start_seconds"],
+                91.0,
+            )
+        }
+
+    config = VelocityModelConfig(sample_rate=22050, predict_stem_gain=False)
+    monkeypatch.setattr(
+        velocity_infer,
+        "load_velocity_model",
+        lambda *_args, **_kwargs: (eager_model, config),
+    )
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    monkeypatch.setattr(velocity_infer, "maybe_compile_forward", fake_compile)
+
+    output_path = tmp_path / "compiled_velocity.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=1.25,
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+        disable_tqdm=True,
+    )
+
+    assert compile_calls == [(eager_model, True, "reduce-overhead")]
+    assert compiled_audio_lengths == [int(1.25 * config.sample_rate)]
+    assert eager_audio_lengths == [
+        2 * config.sample_rate - int(1.25 * config.sample_rate)
+    ]
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    velocities_by_start = {
+        round(note.start, 1): note.velocity
+        for instrument in output.instruments
+        for note in instrument.notes
+    }
+    assert velocities_by_start[0.1] == 91
+    assert velocities_by_start[1.6] == 31
+
+
+def test_velocity_cli_compile_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer_velocity",
+            "--midi",
+            "input.mid",
+            "--stem-files",
+            "piano.wav",
+        ],
+    )
+    defaults = velocity_infer.parse_args()
+    assert defaults.compile_velocity is False
+    assert defaults.compile_mode == "default"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer_velocity",
+            "--midi",
+            "input.mid",
+            "--stem-files",
+            "piano.wav",
+            "--compile-velocity",
+            "--compile-mode",
+            "max-autotune",
+        ],
+    )
+    enabled = velocity_infer.parse_args()
+    assert enabled.compile_velocity is True
+    assert enabled.compile_mode == "max-autotune"
+
+
+def test_preloaded_velocity_forward_requires_matching_eager_model() -> None:
+    with pytest.raises(
+        ValueError,
+        match="preloaded_forward requires preloaded_model and preloaded_config",
+    ):
+        predict_velocity_for_stem_midis(
+            stem_midis={},
+            stem_audios={},
+            device="cpu",
+            preloaded_forward=object(),
+        )
+
+
+@pytest.mark.parametrize("window_seconds", [0.0, -1.0])
+def test_velocity_inference_rejects_nonpositive_window(
+    window_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="window_seconds must be positive"):
+        predict_velocity_for_stem_midis(
+            stem_midis={},
+            stem_audios={},
+            device="cpu",
+            window_seconds=window_seconds,
+        )
+
+
 def test_template_midi_preserves_note_structure_and_uses_stem_velocities(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],

@@ -145,6 +145,20 @@ def test_batch_cli_exposes_core_amt_amp_and_compile_options() -> None:
     assert args.compile_mode == "max-autotune"
 
 
+def test_batch_cli_velocity_compile_is_explicit_and_independent_from_core_amt() -> None:
+    default_args = parse_arguments([])
+    velocity_args = parse_arguments(
+        ["--compile-velocity", "--compile-mode", "reduce-overhead"]
+    )
+
+    assert (
+        default_args.compile_velocity,
+        velocity_args.compile,
+        velocity_args.compile_velocity,
+        velocity_args.compile_mode,
+    ) == (False, False, True, "reduce-overhead")
+
+
 def test_batch_runner_routes_amp_and_compiled_forward_to_core_amt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -240,6 +254,103 @@ def test_batch_runner_routes_amp_and_compiled_forward_to_core_amt(
     assert inference_calls[0]["forward_model"] is compiled_forward
     assert inference_calls[0]["amp_enabled"] is True
     assert inference_calls[0]["amp_dtype"] is torch.bfloat16
+
+
+def test_batch_runner_reuses_compiled_velocity_forward_across_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from instrument_agnostic_amt.velocity.cli import infer_velocity
+
+    class FakeModel:
+        def to(self, _device: torch.device) -> "FakeModel":
+            return self
+
+        def eval(self) -> "FakeModel":
+            return self
+
+    eager_model = FakeModel()
+    compiled_forward = object()
+    config = object()
+    compile_calls: list[tuple[object, bool, str]] = []
+    inference_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(candidates, "resolve_device", lambda _value: torch.device("cpu"))
+    monkeypatch.setattr(
+        infer_velocity,
+        "load_velocity_model",
+        lambda *_args, **_kwargs: (eager_model, config),
+    )
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    def fake_predict(**kwargs: object) -> Path:
+        inference_calls.append(kwargs)
+        output_midi = Path(str(kwargs["output_midi_path"]))
+        _write_midi(
+            output_midi,
+            program=0,
+            name="piano",
+            notes=[(0.0, 1.0, 60)],
+        )
+        return output_midi
+
+    monkeypatch.setattr(candidates, "maybe_compile_forward", fake_compile)
+    monkeypatch.setattr(
+        infer_velocity,
+        "predict_velocity_for_stem_midis",
+        fake_predict,
+    )
+    runner = StemTranscriptionRunner(
+        device="cpu",
+        amt_checkpoint_dir=tmp_path,
+        separation_checkpoint=tmp_path / "separation.pth",
+        velocity_checkpoint=tmp_path / "velocity.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=True,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+        compile_velocity=True,
+        compile_mode="max-autotune",
+    )
+    apply_kwargs = {
+        "stems": {"piano": tmp_path / "piano.wav"},
+        "stem_midis": {"piano": tmp_path / "piano.mid"},
+        "template_midi": tmp_path / "template.mid",
+    }
+
+    runner._apply_velocity(
+        **apply_kwargs,
+        output_midi=tmp_path / "first.mid",
+    )
+    runner._apply_velocity(
+        **apply_kwargs,
+        output_midi=tmp_path / "second.mid",
+    )
+
+    assert compile_calls == [(eager_model, True, "max-autotune")]
+    assert [
+        (
+            call["preloaded_model"],
+            call["preloaded_forward"],
+            call["preloaded_config"],
+        )
+        for call in inference_calls
+    ] == [
+        (eager_model, compiled_forward, config),
+        (eager_model, compiled_forward, config),
+    ]
 
 
 def test_merge_stem_midis_limits_instruments_and_long_notes(
@@ -440,9 +551,11 @@ def test_batch_completes_each_song_before_starting_the_next(
     _touch(checkpoint)
     quality_json.write_text("{}", encoding="utf-8")
     events: list[tuple[str, str]] = []
+    runner_options: dict[str, object] = {}
 
     class FakeRunner:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, **kwargs: object) -> None:
+            runner_options.update(kwargs)
             self.current_song = ""
 
         def run_song(self, audio_path: str, *, output_root: Path) -> Path:
@@ -498,6 +611,7 @@ def test_batch_completes_each_song_before_starting_the_next(
             str(checkpoint),
             "--quality-json",
             str(quality_json),
+            "--compile-velocity",
         ]
     )
 
@@ -516,6 +630,10 @@ def test_batch_completes_each_song_before_starting_the_next(
         "completed",
         "completed",
     ]
+    assert (
+        runner_options["compile_model"],
+        runner_options["compile_velocity"],
+    ) == (False, True)
 
 
 def test_batch_reruns_prediction_when_only_final_midi_exists(
