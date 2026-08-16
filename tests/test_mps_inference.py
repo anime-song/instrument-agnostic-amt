@@ -436,13 +436,18 @@ def test_beat_chord_checkpoint_loads_on_mps(tmp_path: Path) -> None:
         checkpoint_path,
     )
 
-    loaded_model, loaded_config, _ = load_beat_chord_model(
+    loaded_model, loaded_config, metadata = load_beat_chord_model(
         checkpoint_path,
         device="mps",
     )
 
     assert loaded_config == config
     assert all(parameter.device.type == "mps" for parameter in loaded_model.parameters())
+    checkpoint = metadata["checkpoint"]
+    assert isinstance(checkpoint, dict)
+    checkpoint_state = checkpoint["model_state_dict"]
+    assert isinstance(checkpoint_state, dict)
+    assert all(tensor.device.type == "cpu" for tensor in checkpoint_state.values())
 
 
 @pytest.mark.skipif(

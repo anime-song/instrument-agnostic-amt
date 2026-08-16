@@ -80,7 +80,7 @@ def load_beat_chord_model(
     if not checkpoint_file.exists():
         raise FileNotFoundError(f"Beat/chord checkpoint not found: {checkpoint_file}")
 
-    checkpoint = torch.load(checkpoint_file, map_location=device_obj, weights_only=False)
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
     model_config_dict = checkpoint["model_config"]
     model_config = MidiFrameModelConfig(**model_config_dict)
 
