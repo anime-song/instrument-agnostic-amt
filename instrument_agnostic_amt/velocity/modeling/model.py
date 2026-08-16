@@ -411,6 +411,7 @@ class VelocityPredictionModel(nn.Module):
         stem_mask: torch.Tensor | None = None,
         valid_audio_frames: torch.Tensor | None = None,
         include_aux_outputs: bool = False,
+        include_stem_gain: bool = True,
     ) -> dict[str, torch.Tensor]:
         if audio.ndim != 4 or audio.shape[2] != 2:
             raise ValueError("audio must have shape [B, S, 2, T]")
@@ -484,7 +485,11 @@ class VelocityPredictionModel(nn.Module):
             "velocity_logits": velocity_logits,
             "velocity_expected": velocity_expected,
         }
-        if self.stem_gain_head is not None and self.global_audio_projection is not None:
+        if (
+            include_stem_gain
+            and self.stem_gain_head is not None
+            and self.global_audio_projection is not None
+        ):
             global_frames = pitch_features.mean(dim=3)
             global_audio = _masked_mean(global_frames, frame_valid_mask, dim=2)
             global_audio = self.global_audio_projection(global_audio)

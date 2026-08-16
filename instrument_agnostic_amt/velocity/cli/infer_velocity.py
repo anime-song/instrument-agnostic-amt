@@ -491,6 +491,9 @@ def predict_velocity_for_stem_midis(
             mode=str(compile_mode),
         )
     )
+    configure_stem_gain = (
+        isinstance(model, VelocityPredictionModel) and forward_model is model
+    )
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
         raise ValueError(
             "This velocity checkpoint does not contain a stem-gain prediction head"
@@ -633,16 +636,20 @@ def predict_velocity_for_stem_midis(
                 torch.from_numpy(stem_indices[indices_in_win]).unsqueeze(0).to(device=target_device)
             )
 
-            outputs = forward_model(
-                sub_audio,
-                note_start_seconds=note_start_tensor,
-                note_end_seconds=note_end_tensor,
-                note_pitch=note_pitch_tensor,
-                note_program=note_program_tensor,
-                note_is_drum=note_is_drum_tensor,
-                note_stem_index=note_stem_index_tensor,
-                stem_class_id=stem_class_tensor,
-            )
+            forward_kwargs: dict[str, Any] = {
+                "note_start_seconds": note_start_tensor,
+                "note_end_seconds": note_end_tensor,
+                "note_pitch": note_pitch_tensor,
+                "note_program": note_program_tensor,
+                "note_is_drum": note_is_drum_tensor,
+                "note_stem_index": note_stem_index_tensor,
+                "stem_class_id": stem_class_tensor,
+            }
+            if configure_stem_gain:
+                forward_kwargs["include_stem_gain"] = bool(
+                    apply_stem_gain_to_cc7
+                )
+            outputs = forward_model(sub_audio, **forward_kwargs)
 
             velocity_expected = outputs["velocity_expected"].squeeze(0).cpu().numpy()
             velocity_clamped = np.clip(np.round(velocity_expected), 1, 127).astype(np.int32)

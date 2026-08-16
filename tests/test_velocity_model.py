@@ -122,6 +122,47 @@ def test_velocity_only_model_retains_absolute_audio_level() -> None:
     assert model.velocity_head.weight.grad is not None
 
 
+def test_velocity_model_can_skip_unused_stem_gain_head() -> None:
+    config = VelocityModelConfig(
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        dropout=0.0,
+        use_gradient_checkpoint=False,
+        predict_stem_gain=True,
+    )
+    model = VelocityPredictionModel(config, backbone=_FakePitchBackbone()).eval()
+    batch = _batch()
+
+    with torch.inference_mode():
+        reference = forward_velocity_batch(model, batch)
+        velocity_only = model(
+            batch["audio"],
+            valid_audio_frames=batch["valid_audio_frames"],
+            note_start_seconds=batch["note_start_seconds"],
+            note_end_seconds=batch["note_end_seconds"],
+            note_pitch=batch["note_pitch"],
+            note_program=batch["note_program"],
+            note_is_drum=batch["note_is_drum"],
+            note_stem_index=batch["note_stem_index"],
+            stem_class_id=batch["stem_class_id"],
+            note_mask=batch["note_mask"],
+            stem_mask=batch["stem_mask"],
+            include_stem_gain=False,
+        )
+
+    assert "stem_gain_db" in reference
+    assert "stem_gain_db" not in velocity_only
+    assert torch.equal(
+        velocity_only["velocity_expected"],
+        reference["velocity_expected"],
+    )
+
+
 def test_velocity_loss_handles_empty_note_targets() -> None:
     batch = _batch()
     batch["note_mask"].zero_()
