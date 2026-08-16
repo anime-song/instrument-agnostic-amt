@@ -423,7 +423,13 @@ class VelocityPredictionModel(nn.Module):
         flat_audio = audio.reshape(
             batch_size * stem_count, channel_count, sample_count
         )
-        backbone_output = self.backbone(flat_audio)
+        if isinstance(self.backbone, V1Backbone):
+            backbone_output = self.backbone(
+                flat_audio,
+                include_aux_outputs=False,
+            )
+        else:
+            backbone_output = self.backbone(flat_audio)
         flat_pitch_features = backbone_output.pitch_query_features
         if flat_pitch_features.shape[2] != self.config.pitch_query_count:
             raise ValueError("backbone pitch-query count does not match model config")
