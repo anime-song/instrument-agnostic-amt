@@ -25,7 +25,7 @@ from tqdm.auto import tqdm
 
 from ...inference.audio import load_audio
 from ...inference.instruments import resolve_stem_instrument_class_ids
-from ...runtime import resolve_device
+from ...runtime import copy_tensors_to_cpu_once, resolve_device
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -247,10 +247,24 @@ def _scan_windows(
             ),
             window_seconds=window_seconds,
         )
-        window_logits_batch = outputs["window_logits"].float().cpu().numpy()
-        window_embeddings_batch = outputs["window_embedding"].float().cpu().numpy()
-        note_logits_batch = outputs["note_logits"].float().cpu().numpy()
-        note_embeddings_batch = outputs["note_embedding"].float().cpu().numpy()
+        (
+            window_logits_tensor,
+            window_embeddings_tensor,
+            note_logits_tensor,
+            note_embeddings_tensor,
+        ) = copy_tensors_to_cpu_once(
+            (
+                outputs["window_logits"].float(),
+                outputs["window_embedding"].float(),
+                outputs["note_logits"].float(),
+                outputs["note_embedding"].float(),
+            )
+        )
+        del outputs
+        window_logits_batch = window_logits_tensor.numpy()
+        window_embeddings_batch = window_embeddings_tensor.numpy()
+        note_logits_batch = note_logits_tensor.numpy()
+        note_embeddings_batch = note_embeddings_tensor.numpy()
         for batch_index, indices in enumerate(indices_batch):
             window_logits.append(
                 _mask_logits(window_logits_batch[batch_index], allowed)

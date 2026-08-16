@@ -6,6 +6,7 @@ from inspect import signature
 import pytest
 import torch
 
+import instrument_agnostic_amt.runtime as runtime
 from instrument_agnostic_amt.cli.infer import parse_args, process_file
 from instrument_agnostic_amt.runtime import (
     empty_device_cache,
@@ -255,3 +256,43 @@ def test_empty_device_cache_supports_cuda_and_mps(
     empty_device_cache(torch.device("cpu"))
 
     assert calls == ["cuda", "mps"]
+
+
+def test_copy_tensors_to_cpu_once_preserves_cpu_tensors() -> None:
+    tensors = (
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        torch.arange(4, dtype=torch.float32).reshape(1, 4),
+    )
+
+    copied = runtime.copy_tensors_to_cpu_once(tensors)
+
+    assert len(copied) == len(tensors)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(copied, tensors))
+    assert [value.dtype for value in copied] == [value.dtype for value in tensors]
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="MPS上のdevice-to-host転送回数を検査するテストです",
+)
+def test_copy_tensors_to_cpu_once_uses_one_mps_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cpu_calls: list[tuple[int, ...]] = []
+    original_cpu = torch.Tensor.cpu
+
+    def counted_cpu(tensor: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        cpu_calls.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counted_cpu)
+    tensors = (
+        torch.arange(6, device="mps", dtype=torch.float32).reshape(2, 3),
+        torch.arange(4, device="mps", dtype=torch.float32).reshape(1, 4),
+    )
+
+    copied = runtime.copy_tensors_to_cpu_once(tensors)
+
+    assert cpu_calls == [(10,)]
+    assert torch.equal(copied[0], torch.arange(6, dtype=torch.float32).reshape(2, 3))
+    assert torch.equal(copied[1], torch.arange(4, dtype=torch.float32).reshape(1, 4))

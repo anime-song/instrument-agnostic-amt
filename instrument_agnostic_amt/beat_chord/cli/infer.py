@@ -34,7 +34,7 @@ from ..decoding.legacy_grid import (
 )
 from ..midi_roll import MidiFrameLoader, MidiFrameLoaderConfig
 from ..tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
-from ...runtime import resolve_device
+from ...runtime import copy_tensors_to_cpu_once, resolve_device
 
 
 HF_CHECKPOINT_BASE_URL = (
@@ -267,21 +267,29 @@ def run_beat_chord_inference(
             if omit_aux_outputs:
                 model_kwargs["include_aux_outputs"] = False
             outputs = model(roll_batch, **model_kwargs)
-            beat_probs = torch.sigmoid(outputs["beat_logits"]).cpu()
-            downbeat_probs = torch.sigmoid(outputs["downbeat_logits"]).cpu()
-            group_boundary_probs = torch.sigmoid(
-                outputs["group_boundary_logits"]
-            ).cpu()
-            meter_logits_batch = outputs["meter_logits"].cpu()
-            chord_logits_batch = outputs["root_chord_logits"].cpu()
-            chord_boundary_probs = torch.sigmoid(
-                outputs["chord_boundary_logits"]
-            ).cpu()
-            bass_logits_batch = outputs["bass_logits"].cpu()
-            key_boundary_probs = torch.sigmoid(
-                outputs["key_boundary_logits"]
-            ).cpu()
-            key_logits_batch = outputs["key_logits"].cpu()
+            (
+                beat_probs,
+                downbeat_probs,
+                group_boundary_probs,
+                meter_logits_batch,
+                chord_logits_batch,
+                chord_boundary_probs,
+                bass_logits_batch,
+                key_boundary_probs,
+                key_logits_batch,
+            ) = copy_tensors_to_cpu_once(
+                (
+                    torch.sigmoid(outputs["beat_logits"]),
+                    torch.sigmoid(outputs["downbeat_logits"]),
+                    torch.sigmoid(outputs["group_boundary_logits"]),
+                    outputs["meter_logits"],
+                    outputs["root_chord_logits"],
+                    torch.sigmoid(outputs["chord_boundary_logits"]),
+                    outputs["bass_logits"],
+                    torch.sigmoid(outputs["key_boundary_logits"]),
+                    outputs["key_logits"],
+                )
+            )
 
         for batch_index, batch_start_frame in enumerate(pending_start_frames):
             target = slice(batch_start_frame, batch_start_frame + model_frames)
