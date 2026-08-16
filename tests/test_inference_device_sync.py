@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -141,6 +143,26 @@ class _NoCandidateForward:
         }
 
 
+class _LifetimeTrackingV2Forward(_NoCandidateForward):
+    def __init__(self) -> None:
+        self.previous_outputs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self.alive_before_forward: list[int] = []
+
+    def __call__(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        self.alive_before_forward.append(
+            sum(reference() is not None for reference in self.previous_outputs)
+        )
+        outputs = super().__call__(waveform, **kwargs)
+        self.previous_outputs = [
+            weakref.ref(value) for value in outputs.values()
+        ]
+        return outputs
+
+
 class _V1NoIntervalModel:
     _use_interval_instrument_head = False
 
@@ -178,6 +200,28 @@ class _V1NoIntervalForward:
             "instrument_features": None,
             "instrument_logits": None,
         }
+
+
+class _LifetimeTrackingV1Forward(_V1NoIntervalForward):
+    def __init__(self) -> None:
+        self.previous_outputs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self.alive_before_forward: list[int] = []
+
+    def __call__(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor | None]:
+        self.alive_before_forward.append(
+            sum(reference() is not None for reference in self.previous_outputs)
+        )
+        outputs = super().__call__(waveform, **kwargs)
+        self.previous_outputs = [
+            weakref.ref(value)
+            for value in outputs.values()
+            if isinstance(value, torch.Tensor)
+        ]
+        return outputs
 
 
 class _V1FrameInstrumentForward(_V1NoIntervalForward):
@@ -219,6 +263,39 @@ def test_pair_candidate_selection_avoids_scalar_tensor_reads() -> None:
 
     assert selected == [0, 1, 88]
     assert _local_scalar_read_count(profiler) == 0
+
+
+def test_v2_releases_previous_window_outputs_before_next_forward() -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v2",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        window_batch_size=1,
+    )
+    forward = _LifetimeTrackingV2Forward()
+
+    notes, stats = decode_notes(
+        _NoCandidateModel(),  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 400),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=forward,
+    )
+
+    assert notes == []
+    assert stats["decoded_window_count"] == 2
+    assert forward.alive_before_forward == [0, 0]
 
 
 def test_profiler_detects_deliberate_scalar_tensor_read() -> None:
@@ -570,6 +647,54 @@ def test_v1_decode_bulk_reads_valid_lengths_for_a_window_batch(
     assert stats["decoded_window_count"] == 1
     assert stats["skipped_silent_window_count"] == 1
     assert _local_scalar_read_count(profiler) == 0
+
+
+def test_v1_releases_previous_window_outputs_before_next_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v1",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        window_batch_size=1,
+        allowed_instrument_ids=(0,),
+    )
+
+    def no_intervals(
+        interval_query: torch.Tensor,
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[list[list[tuple[int, int]]]]:
+        return [
+            [[] for _ in range(88)]
+            for _ in range(int(interval_query.shape[0]))
+        ]
+
+    monkeypatch.setattr(v1_windowed, "decode_pitch_intervals", no_intervals)
+    forward = _LifetimeTrackingV1Forward()
+
+    notes, stats = decode_v1_notes(
+        _V1NoIntervalModel(),  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 400),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=forward,
+    )
+
+    assert notes == []
+    assert stats["decoded_window_count"] == 2
+    assert forward.alive_before_forward == [0, 0]
 
 
 def test_v1_decode_uses_sparse_decoder_when_requested(

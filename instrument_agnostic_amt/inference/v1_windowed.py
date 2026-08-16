@@ -373,6 +373,16 @@ def decode_v1_notes(
                         note.instrument_id = 0
                         stitcher.notes_by_pair[track].append(note)
 
+        del (
+            outputs,
+            batch,
+            valid_mask,
+            valid_lengths,
+            interval_features,
+            instrument_features,
+            frame_logits,
+        )
+
     notes = stitcher.finalize()
     for note in notes:
         note.instrument_id = (

@@ -830,7 +830,20 @@ def decode_notes(
                 valid_model_frames=sample_valid_length,
             )
 
-        del outputs, batch_waveform
+        del (
+            outputs,
+            batch_waveform,
+            interval_features,
+            pair_gate_logits,
+            pitch_interval_query,
+            pitch_interval_key,
+            pitch_interval_diag,
+            instrument_interval_query,
+            instrument_interval_key,
+            instrument_interval_diag,
+            frame_valid_mask,
+            valid_lengths,
+        )
 
     notes = note_stitcher.finalize()
     return notes, {
