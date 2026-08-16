@@ -290,6 +290,7 @@ def run_beat_chord_inference(
                     outputs["key_logits"],
                 )
             )
+            del outputs
 
         for batch_index, batch_start_frame in enumerate(pending_start_frames):
             target = slice(batch_start_frame, batch_start_frame + model_frames)

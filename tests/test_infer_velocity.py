@@ -272,6 +272,7 @@ def test_velocity_inference_skips_unused_stem_gain_head(
     tmp_path: Path,
 ) -> None:
     include_stem_gain_values: list[bool] = []
+    inference_mode_values: list[bool] = []
 
     class FakeVelocityModel:
         def to(self, _device: torch.device) -> FakeVelocityModel:
@@ -288,6 +289,7 @@ def test_velocity_inference_skips_unused_stem_gain_head(
             **kwargs: torch.Tensor,
         ) -> dict[str, torch.Tensor]:
             include_stem_gain_values.append(include_stem_gain)
+            inference_mode_values.append(torch.is_inference_mode_enabled())
             outputs = {
                 "velocity_expected": torch.full_like(
                     kwargs["note_start_seconds"],
@@ -320,6 +322,7 @@ def test_velocity_inference_skips_unused_stem_gain_head(
     )
 
     assert include_stem_gain_values == [False]
+    assert inference_mode_values == [True]
 
 
 def test_velocity_cli_compile_is_opt_in(

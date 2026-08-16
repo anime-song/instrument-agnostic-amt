@@ -597,7 +597,7 @@ def predict_velocity_for_stem_midis(
     predicted_velocities = np.full(len(flat_notes), 80, dtype=np.int32)
     predicted_stem_gains_db_list: list[np.ndarray] = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for win_start in tqdm(
             window_starts_seconds,
             desc="Predicting velocity",
@@ -658,6 +658,7 @@ def predict_velocity_for_stem_midis(
             if "stem_gain_db" in outputs:
                 stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
                 predicted_stem_gains_db_list.append(stem_gain_np)
+            del outputs
 
     for idx, record in enumerate(flat_notes):
         record.note.velocity = int(predicted_velocities[idx])
