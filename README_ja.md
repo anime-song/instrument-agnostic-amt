@@ -231,7 +231,7 @@ uv sync --locked --all-extras        # 学習用も含めてすべて
 ### 動作確認済みの環境
 
 - **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、regional 方式の `--compile` / `--compile-velocity`。公開チェックポイントを使った採譜パイプライン全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）は、事前に分離済みのステムを入力として MPS で実行済みです。ただし、ステム分離の工程まで含めたエンドツーエンド実行は MPS では**未実施**です。
-- **CUDA** — Colab の Tesla T4 向け回帰スクリプトを同梱していますが（後述）、実際の T4 上ではまだ実行していません。
+- **CUDA（Colab Tesla T4）** — Colab 無料枠の実機 Tesla T4 ランタイム（ロック済みの PyTorch 2.13.0 / CUDA 13.0 wheel）で検証済みです。`scripts/colab_t4_regression.py`（後述）により、テストスイート全体とオプトインの CUDA compile 回帰が完走しています。公開チェックポイントを使った採譜パイプライン全体も、事前分離済みステムを入力として T4 で実行済みです（「推論」の Tesla T4 実測例を参照）。
 
 ### テストの実行
 
@@ -267,7 +267,7 @@ python colab_t4_regression.py \
   --expected-commit FULL_40_CHARACTER_SHA
 ```
 
-このスクリプトはまだ実際の T4 上で完走させていないため、CUDA 13.0 / T4 の組み合わせは、テストが通るまでは未検証として扱ってください。
+このスクリプトは Colab 無料枠の Tesla T4（ロック済みの PyTorch 2.13.0 / CUDA 13.0 wheel）で完走済みで、テストスイート全体とオプトインの CUDA compile 回帰の両方がパスしています。
 
 ---
 
@@ -512,9 +512,9 @@ python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
 python infer.py --audio input_song.wav --device cpu
 ```
 
-**混合精度（`--amp`）** は明示的なオプトインで、暗黙に有効化されることはありません。CUDA と MPS の両方で利用できます。forward パスに autocast を適用するだけで、モデルの重み自体を half 精度へ変換する機能では**ありません**。`--amp-dtype` では `fp16` / `bf16` を選べます。省略した場合、CUDA では GPU が対応していれば bf16（非対応なら fp16）、MPS では fp16 が既定です（MPS でも `--amp-dtype bf16` を明示できます）。fp16 の推論時 autocast では、CNN ステム（`StemConv`）全体を常に FP32 island として実行します。公開チェックポイントでは、fp16 のままだと活性値が fp16 の範囲をあふれて出力が NaN に崩壊するためです。bf16・fp32・学習時の挙動は変わりません。また、ステム分離パイプラインと key-only バッチ処理では、AMP が適用されるのは AMT 採譜ステージだけです。velocity・instrument refinement・beat/chord/key は常に FP32 で実行されます。
+**混合精度（`--amp`）** は明示的なオプトインで、暗黙に有効化されることはありません。CUDA と MPS の両方で利用できます。forward パスに autocast を適用するだけで、モデルの重み自体を half 精度へ変換する機能では**ありません**。`--amp-dtype` では `fp16` / `bf16` を選べます。省略した場合、CUDA では GPU が bf16 にネイティブ対応していれば bf16（非対応なら fp16。たとえば Tesla T4 は fp16 になります）、MPS では fp16 が既定です（MPS でも `--amp-dtype bf16` を明示できます）。fp16 の推論時 autocast では、CNN ステム（`StemConv`）全体を常に FP32 island として実行します。公開チェックポイントでは、fp16 のままだと活性値が fp16 の範囲をあふれて出力が NaN に崩壊するためです。bf16・fp32・学習時の挙動は変わりません。また、ステム分離パイプラインと key-only バッチ処理では、AMP が適用されるのは AMT 採譜ステージだけです。velocity・instrument refinement・beat/chord/key は常に FP32 で実行されます。
 
-AMP は出力の変化を受け入れて明示的に選ぶトレードオフであり、どのデバイス・楽曲でも速くなるという保証もありません。計測した 1 曲では、FP32 実行の出力と比較した raw ノートの micro F1 が fp16 で約 99.8〜99.9%、bf16 で約 98% でした。これは同じパイプラインの FP32 出力との一致率であって、正解 MIDI に対する採譜精度では**ありません**。1 曲だけの値なので素材によっても変わります。採用する前に、手元の音源で速度と出力を確認してください。
+AMP は出力の変化を受け入れて明示的に選ぶトレードオフであり、どのデバイス・楽曲でも速くなるという保証もありません。`--amp` を付けない推論は、Attention も含めて forward パス全体が FP32 のまま実行され、暗黙に低精度へ下がることはありません。`--amp` を付けた場合、Tesla T4 で計測した 1 曲では、fp16 の出力は FP32 実行と raw ノートの micro F1 で約 99.9% 一致しました。これは同じパイプラインの FP32 出力との一致率であって、正解 MIDI に対する採譜精度では**ありません**。1 曲だけの値なので素材によっても変わります。bf16 については、現在のコードで計測した同等の数値はまだありません。採用する前に、手元の音源で速度と出力を確認してください。
 
 ```bash
 python infer.py --audio input_song.wav --device mps --amp                  # MPS で fp16 autocast
@@ -536,8 +536,28 @@ python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity  
 保証値ではなく 1 つの実測例です。202.8 秒のポップス楽曲 1 曲を事前に 6 ステムへ分離しておき、M4 Pro（macOS 15.3.1、PyTorch 2.13.0）でステムワークフロー全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）を実行しました。ステム分離・チェックポイントのダウンロード・import は計時に含めていません。
 
 - **新しいプロセスで 1 曲だけ処理（通常の CLI 利用）** — FP32 で `--compile --compile-velocity` を付けると 135.7 秒、以前の FP32 eager 単発実行は 154.5 秒でした（コンパイルは最初のウィンドウ処理中に走ります）。今回の単発の再測定では 2 回目のプロセスに改善を観測しなかったため、Inductor のディスクキャッシュによる短縮は前提にしないでください。
-- **モデルを常駐させた場合（バッチ処理・長時間セッションの定常状態）** — ウォームアップ 1 曲後の同一プロセス 3 回計測の中央値で、regional コンパイルと同精度 eager の比較は FP32 142.7 → 124.1 秒（−13%）、BF16 146.2 → 117.8 秒（−19%）、FP16 148.8 → 117.7 秒（−21%）でした。ウォームアップ後の再コンパイルは発生していません。FP16 と BF16 の regional はほぼ同速（差 0.1%）なので、AMP の dtype は速度ではなく出力品質で選んでください。
-- **出力の一致度**（同じパイプラインの FP32 eager 出力との比較で、正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ノート時刻の差は最大 0.26 ms でした。velocity の全値と chord/tempo/key の列は一致しています。FP16 は raw ノート micro F1 で約 99.9%、BF16 は約 98% の一致でした。BF16 の regional と eager の間では、raw ノート F1 が 99.7% だったことに加えて beat/chord/tempo/key のメタデータも変化し、Key 区間が 1 つ増えました。これらの差は条件内の反復ではバイト一致で再現しているため、条件による差であって実行ごとのノイズではありません。
+- **モデルを常駐させた場合（バッチ処理・長時間セッションの定常状態）** — ウォームアップ 1 曲後の同一プロセス 3 回計測の中央値で、FP32 の regional コンパイルは FP32 eager の 142.7 秒を 124.1 秒（−13%）に短縮しました。ウォームアップ後の再コンパイルは発生していません。
+- **出力の一致度**（同じパイプラインの FP32 eager 出力との比較で、正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ノート時刻の差は最大 0.26 ms でした。velocity の全値と chord/tempo/key の列は一致しています。
+
+> **Note**: 推論時の Attention 精度の変更（AMP なしの推論は完全に FP32 のままになり、fp16/bf16 の autocast は Attention の計算にも届くようになりました）以降、MPS の fp16/bf16 は再計測していないため、この例には MPS の AMP の数値を載せていません。上の FP32 の数値はこの変更の影響を受けません。現在のコードでの AMP の実測は、下の Tesla T4 の例を参照してください。
+
+#### 実測例: NVIDIA Tesla T4（Colab、CUDA）
+
+M4 の例と同じ楽曲・同じ計測範囲です。202.8 秒の楽曲を事前に 6 ステムへ分離しておき、Colab 無料枠の Tesla T4（PyTorch 2.13.0、CUDA 13.0 wheel）でステムワークフロー全体を計時しました（ステム分離・チェックポイントのダウンロード・セットアップは含みません）。前述のとおり、AMP は AMT ステージのみ、regional コンパイルは AMT と velocity モデルの Transformer ブロックのみが対象です。断りがない限り各条件 1 回の計測です。
+
+- **新しいプロセスで 1 曲だけ処理（通常の CLI 利用）** — 各条件とも新しいプロセスを空の Inductor キャッシュから開始しています。FP32 eager は 149.3 秒。`--amp`（T4 では fp16）を付けると 131.8 秒で約 12% 短縮でした。一方 `--compile --compile-velocity` を足すと、コンパイル時間が実行に含まれるため、単発 1 曲ではどちらの精度でも逆に遅くなりました（FP32 171.7 秒、fp16 159.1 秒）。1 曲だけのプロセスにコンパイルは不向きです。
+- **モデルを常駐させた場合（定常状態）** — fp16 では、regional コンパイルが fp16 eager よりエンドツーエンドで約 5% 速く（126.3 → 120.5 秒。いずれも各方式 2 プロセスの平均）、コンパイル対象の 2 ステージ（AMT + velocity）では約 9% 速くなりました（78.9 → 71.7 秒）。コンパイルされない FP32 ステージが残るぶん、全体の短縮率は薄まります。計測は各条件 2 プロセスを、実行順によるドリフトを抑えるため交互に起動し、各プロセスでウォームアップ 1 曲を捨て、毎回 GPU がアイドルかつ低温へ戻ってから開始しています。ウォームアップで 4 グラフがコンパイルされ、以降の再コンパイルはありません。損益分岐は控えめに見て同一プロセス約 6 曲で、それ未満なら fp16 eager の方が速いです。FP32 の定常状態では、T4 でのコンパイル効果は確認できませんでした（138.4 → 136.6 秒、約 1% でノイズの範囲内）。この結果からは T4 での FP32 `--compile` は推奨できません。
+- **メモリ** — サンプリングした GPU メモリのピークは FP32 で約 6.4〜6.8 GiB、fp16 で約 5.1 GiB（ステム分離は含みません）で、T4 の 15 GiB に十分収まります。regional コンパイル中は、コンパイラのサブプロセスによってホスト RAM が一時的に 1〜2 GiB ほど増えます。
+- **出力の一致度**（同じパイプラインの FP32 eager 出力との比較で、正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ギターの 1 ノートだけが 1 MIDI tick（0.26 ms）ずれました。velocity と beat/chord/tempo/key はすべて一致しています。fp16 は raw ノートの micro F1 が eager で 99.87%、regional で約 99.95% でした。対応が取れたノートのうち velocity が完全一致したのは約 99.7〜99.85% で、変化した値の差は最大 13（0〜127 スケール）です。コードの一致は約 99.1〜99.3% で、tempo・キー・拍子は一致しました。これらはこの 1 曲における FP32 出力との小さな差分であり、採譜精度が上がった・下がったという意味ではありません。同一プロセス内の反復はバイト一致で、交互起動の確認で別々にコンパイルした fp16 プロセス同士も完全に一致しました。ただし、それ以前の正式計測ではモデル常駐のウォームなプロセス 1 件が別の安定した出力を生成しており、別々にコンパイルしたプロセス間のバイト単位の再現性は保証できません。
+
+#### オプションの使い分け
+
+上記のパフォーマンス系オプションはすべてオプトインで、既定では無効のままです。迷ったら既定のまま実行してください。
+
+- **品質優先** — FP32 eager（追加フラグなし）。上記のような出力差分の注意が付かない構成です。
+- **CUDA で 1 曲だけ速くしたい** — `--amp` のみ追加（T4 では fp16）。計測した曲では約 12% 速くなりました。`--compile` は 1 曲だけのプロセスでは元が取れないので付けないでください。
+- **モデルを常駐させて 6 曲以上を処理** — `--amp --compile --compile-velocity` を追加。T4 では同一プロセス約 6 曲でコンパイル費用を回収し、以降は fp16 eager よりエンドツーエンドで約 5% 速くなりました。
+- **FP32 + `--compile`** — M4 の定常状態では有効（−13%）でしたが、T4 では明確な効果を確認できませんでした。デバイス依存と考えて、先に計測してください。
 
 ### Google Colab のステム分離ワークフロー
 
@@ -551,7 +571,7 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
-ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_VELOCITY`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。`AMP`、`COMPILE_MODEL`、`COMPILE_VELOCITY` はいずれも既定で無効で、Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。`COMPILE_MODEL` は AMT バックボーン内の Transformer ブロックを regional 方式でコンパイルし、独立した `COMPILE_VELOCITY` は velocity モデルの同じ領域をコンパイルします。`AMP` の混合精度が適用されるのは AMT ステージだけです。コンパイル対象の詳細と AMP の品質トレードオフは、上の「デバイス選択とパフォーマンスオプション」を参照してください。
+ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_VELOCITY`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。`AMP`、`COMPILE_MODEL`、`COMPILE_VELOCITY` はいずれも既定で無効で、Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。`COMPILE_MODEL` は AMT バックボーン内の Transformer ブロックを regional 方式でコンパイルし、独立した `COMPILE_VELOCITY` は velocity モデルの同じ領域をコンパイルします。`AMP` の混合精度が適用されるのは AMT ステージだけです。コンパイル対象の詳細と AMP の品質トレードオフは、上の「デバイス選択とパフォーマンスオプション」を参照してください。Colab 無料枠 GPU でのこれらのオプションの挙動は、上の Tesla T4 実測例が参考になります。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
 
@@ -613,7 +633,7 @@ python infer.py \
 | `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
 | `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda` / `mps` / `cpu` の明示も可 |
 | `--amp` | `false` | CUDA/MPS での混合精度（autocast）をオプトインで有効化 |
-| `--amp-dtype` | デバイス既定 | `fp16` / `bf16`。既定は CUDA では bf16（対応時）、MPS では fp16 |
+| `--amp-dtype` | デバイス既定 | `fp16` / `bf16`。既定は CUDA では bf16（ネイティブ対応時）、MPS では fp16 |
 | `--compile` | `false` | AMT バックボーン内 Transformer ブロックへの regional `torch.compile` をオプトインで有効化 |
 | `--compile-mode` | `default` | `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` も指定可 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |

@@ -230,7 +230,7 @@ uv sync --locked --all-extras        # everything, including training dependenci
 ### Verified environments
 
 - **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), and the regional `--compile` / `--compile-velocity` paths. The full transcription pipeline with the released checkpoints — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, and beat/chord/key — has been run on MPS starting from pre-separated stems. An end-to-end run that also includes the stem-separation step has **not** been executed on MPS yet.
-- **CUDA** — a regression suite for Colab Tesla T4 is included (see below), but it has not been executed on an actual T4 runtime yet.
+- **CUDA (Colab Tesla T4)** — verified on an actual free-tier Colab T4 runtime with the locked PyTorch 2.13.0 / CUDA 13.0 wheels: `scripts/colab_t4_regression.py` (see below) has run the full test suite plus the opt-in CUDA compile regression to completion. The full transcription pipeline with the released checkpoints has also been run on the T4 starting from pre-separated stems — see the Tesla T4 measured example in the Inference section.
 
 ### Running the tests
 
@@ -266,7 +266,7 @@ python colab_t4_regression.py \
   --expected-commit FULL_40_CHARACTER_SHA
 ```
 
-This script has not been run to completion on an actual T4 yet, so treat the CUDA 13.0 / T4 combination as unverified until it passes.
+This script has been run to completion on a free-tier Colab Tesla T4 with the locked PyTorch 2.13.0 / CUDA 13.0 wheels: the full test suite and the opt-in CUDA compile regression both passed.
 
 ---
 
@@ -516,9 +516,9 @@ python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
 python infer.py --audio input_song.wav --device cpu
 ```
 
-**Mixed precision (`--amp`)** is strictly opt-in — it is never enabled implicitly — and works on both CUDA and MPS. It applies autocast to the forward pass only; it does **not** convert the model weights to half precision. `--amp-dtype` selects `fp16` or `bf16`. When omitted, CUDA uses bf16 if the GPU supports it (fp16 otherwise), and MPS defaults to fp16 (`--amp-dtype bf16` is also available on MPS). Under fp16 inference autocast, the `StemConv` CNN stem always runs as an FP32 island: with the released checkpoints its activations overflow the fp16 range and the output collapses to NaN otherwise. bf16, fp32, and training behavior are unchanged. In the stem-separated pipeline and the key-only batch runner, AMP applies to the AMT transcription stage only — velocity, instrument refinement, and beat/chord/key always run in FP32.
+**Mixed precision (`--amp`)** is strictly opt-in — it is never enabled implicitly — and works on both CUDA and MPS. It applies autocast to the forward pass only; it does **not** convert the model weights to half precision. `--amp-dtype` selects `fp16` or `bf16`. When omitted, CUDA uses bf16 if the GPU supports it natively (fp16 otherwise — a Tesla T4, for example, gets fp16), and MPS defaults to fp16 (`--amp-dtype bf16` is also available on MPS). Under fp16 inference autocast, the `StemConv` CNN stem always runs as an FP32 island: with the released checkpoints its activations overflow the fp16 range and the output collapses to NaN otherwise. bf16, fp32, and training behavior are unchanged. In the stem-separated pipeline and the key-only batch runner, AMP applies to the AMT transcription stage only — velocity, instrument refinement, and beat/chord/key always run in FP32.
 
-AMP is a trade-off you opt into explicitly: it can change the output, and it is not guaranteed to be faster on every device or song. On one measured song, fp16 output agreed with the FP32 run at roughly 99.8–99.9% raw-note micro F1, bf16 at roughly 98% — these figures compare against the FP32 output of the same pipeline, **not** against ground-truth MIDI, and come from a single song. Measure speed and check the output on your own material before adopting it.
+AMP is a trade-off you opt into explicitly: it can change the output, and it is not guaranteed to be faster on every device or song. Without `--amp`, inference keeps the whole forward pass — attention included — in FP32; nothing is lowered to half precision implicitly. With `--amp`, on the one song measured on a Tesla T4, fp16 output agreed with the FP32 run at roughly 99.9% raw-note micro F1 — a comparison against the FP32 output of the same pipeline, **not** against ground-truth MIDI, and from a single song. No comparable figure has been measured for bf16 on the current code. Measure speed and check the output on your own material before adopting it.
 
 ```bash
 python infer.py --audio input_song.wav --device mps --amp                  # fp16 autocast on MPS
@@ -540,8 +540,28 @@ python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity  
 One data point, not a guarantee: a 202.8-second pop song, pre-separated into six stems in advance, on an M4 Pro (macOS 15.3.1, PyTorch 2.13.0). The timed run is the full stem workflow — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, beat/chord/key — excluding stem separation, checkpoint downloads, and imports.
 
 - **Fresh process, one song (typical CLI use)** — FP32 with `--compile --compile-velocity` took 135.7 s versus 154.5 s for an earlier FP32 eager run, with compilation happening during the first windows. A single repeat in a second fresh process showed no improvement in these runs, so don't assume a benefit from Inductor's on-disk cache.
-- **Model kept loaded (steady state for batch runs and long sessions)** — median of three same-process repeats after one warm-up song, regional compile versus same-precision eager: FP32 142.7 → 124.1 s (−13%), BF16 146.2 → 117.8 s (−19%), FP16 148.8 → 117.7 s (−21%). No recompilation occurred after warm-up. FP16 and BF16 regional were effectively tied (0.1% apart), so choose the AMP dtype by output quality, not speed.
-- **Output agreement** (versus the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%), with note timings equal to within a maximum difference of 0.26 ms; every velocity value and the chord/tempo/key sequences were identical. FP16 agreed at ~99.9% raw-note micro F1 and BF16 at ~98%. Between BF16 regional and BF16 eager, raw-note F1 was 99.7%, and the beat/chord/tempo/key metadata also changed, including an extra key segment; these differences reproduced byte-identically across repeats within each condition, so they are condition differences, not run-to-run noise.
+- **Model kept loaded (steady state for batch runs and long sessions)** — median of three same-process repeats after one warm-up song: FP32 regional compile brought 142.7 s down to 124.1 s (−13%) versus FP32 eager. No recompilation occurred after warm-up.
+- **Output agreement** (versus the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%), with note timings equal to within a maximum difference of 0.26 ms; every velocity value and the chord/tempo/key sequences were identical.
+
+> **Note**: MPS fp16/bf16 has not been re-measured since a change to inference attention precision (no-AMP inference now stays fully in FP32, and explicit fp16/bf16 autocast now reaches the attention math), so this example intentionally lists no MPS AMP figures. The FP32 figures above are unaffected by that change. For AMP measurements on the current code, see the Tesla T4 example below.
+
+#### Measured example: NVIDIA Tesla T4 (Colab, CUDA)
+
+The same song and workload as the M4 example — 202.8 seconds, six pre-separated stems, timing the full stem workflow while excluding stem separation, checkpoint downloads, and setup — on a free-tier Colab Tesla T4 (PyTorch 2.13.0, CUDA 13.0 wheels). As described above, AMP applies to the AMT stage only and regional compile covers the Transformer blocks of the AMT and velocity models only. Single runs per condition unless noted.
+
+- **Fresh process, one song (typical CLI use)** — each condition ran in a new process starting from an empty Inductor cache. FP32 eager took 149.3 s; adding `--amp` (fp16 on a T4) brought it to 131.8 s, about 12% faster. Adding `--compile --compile-velocity` made a fresh single-song run *slower* in both precisions (171.7 s FP32, 159.1 s fp16) because compilation happens inside the run — don't compile for a one-song process.
+- **Model kept loaded (steady state)** — with fp16, regional compile was about 5% faster end-to-end than fp16 eager (126.3 → 120.5 s, each the mean of two processes) and about 9% faster on the two compiled stages, AMT + velocity (78.9 → 71.7 s); the uncompiled FP32 stages dilute the end-to-end gain. Measured as two fresh processes per condition, interleaved to counterbalance run-order drift, each discarding one warm-up song and starting only after the GPU had returned to idle and cool. Warm-up compiled four graphs; no recompilation occurred afterwards. A conservative break-even is about six songs per process — below that, fp16 eager wins. FP32 steady state showed no clear compile benefit on the T4 (138.4 → 136.6 s, about 1% — within noise), so these measurements do not support FP32 `--compile` on this GPU.
+- **Memory** — sampled GPU memory peaked around 6.4–6.8 GiB in FP32 and about 5.1 GiB in fp16 (stem separation excluded), comfortably within the T4's 15 GiB; regional compile temporarily added roughly 1–2 GiB of host RAM for compiler subprocesses.
+- **Output agreement** (versus the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%); one guitar note moved by a single MIDI tick (0.26 ms), and velocities, beat, chord, tempo, and key were identical. fp16 agreed at 99.87% raw-note micro F1 eager and about 99.95% regional; about 99.7–99.85% of matched notes kept exactly equal velocities, with the few changed values differing by at most 13 on the 0–127 scale; chord agreement was about 99.1–99.3%, while tempo, key, and time signature matched. These are small parity differences on this one song, not evidence that transcription accuracy improved or degraded. Repeats within one process were byte-identical, and the independently compiled fp16 processes of the interleaved confirmation reproduced one another exactly; one earlier formal measurement in a warm, model-resident process, however, produced a different (equally stable) output, so byte-for-byte reproducibility across separately compiled fp16 processes is not established.
+
+#### Which options to use
+
+Every performance option above stays opt-in and off by default; when in doubt, run the defaults.
+
+- **Quality first** — FP32 eager (no extra flags). Its output carries none of the parity caveats above.
+- **Speed for a single song on CUDA** — add `--amp` only (fp16 on a T4). On the measured song this was about 12% faster; skip `--compile`, which does not pay for itself in a one-song process.
+- **Model-resident batches of about six songs or more** — add `--amp --compile --compile-velocity`. On the T4, compilation broke even after roughly six songs in one process and then ran about 5% faster end-to-end than fp16 eager.
+- **FP32 with `--compile`** — helped in steady state on the M4 (−13%) but showed no clear benefit on the T4; treat it as device-dependent and measure first.
 
 ### Stem-separated workflow in Google Colab
 
@@ -555,7 +575,7 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
-The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, `COMPILE_VELOCITY`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`. `AMP`, `COMPILE_MODEL`, and `COMPILE_VELOCITY` all default to off, and on Colab GPU runtimes `DEVICE = "auto"` selects CUDA. `COMPILE_MODEL` regionally compiles the Transformer blocks of the AMT backbone, the independent `COMPILE_VELOCITY` does the same for the velocity model, and `AMP` applies mixed precision to the AMT stage only — see "Device selection and performance options" above for what is compiled and for the AMP quality trade-off.
+The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, `COMPILE_VELOCITY`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`. `AMP`, `COMPILE_MODEL`, and `COMPILE_VELOCITY` all default to off, and on Colab GPU runtimes `DEVICE = "auto"` selects CUDA. `COMPILE_MODEL` regionally compiles the Transformer blocks of the AMT backbone, the independent `COMPILE_VELOCITY` does the same for the velocity model, and `AMP` applies mixed precision to the AMT stage only — see "Device selection and performance options" above for what is compiled and for the AMP quality trade-off, and the Tesla T4 measured example for how these options behaved on the Colab free-tier GPU.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
@@ -617,7 +637,7 @@ python infer.py \
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--device` | `auto` | Inference device. `auto` picks CUDA → MPS → CPU; `cuda` / `mps` / `cpu` can be set explicitly |
 | `--amp` | `false` | Opt-in mixed precision (autocast) on CUDA/MPS |
-| `--amp-dtype` | device default | `fp16` / `bf16`. Defaults to bf16 on CUDA (when supported) and fp16 on MPS |
+| `--amp-dtype` | device default | `fp16` / `bf16`. Defaults to bf16 on CUDA (when natively supported) and fp16 on MPS |
 | `--compile` | `false` | Opt-in regional `torch.compile` of the AMT backbone Transformer blocks |
 | `--compile-mode` | `default` | Also accepts `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
