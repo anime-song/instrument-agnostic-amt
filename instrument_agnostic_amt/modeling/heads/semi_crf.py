@@ -1030,7 +1030,7 @@ def _build_dense_sparse_candidates(
     end_index = torch.arange(length, device=device).unsqueeze(0)
     valid_mask = end_index > begin_index
 
-    score_by_begin = score.transpose(0, 1).contiguous()
+    score_by_begin = score.transpose(0, 1)
     score_by_begin = score_by_begin.masked_fill(
         ~valid_mask.unsqueeze(-1), float("-inf")
     )
