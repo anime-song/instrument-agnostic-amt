@@ -33,6 +33,11 @@ def is_amp_supported(device: torch.device | str) -> bool:
     return torch.device(device).type in {"cuda", "mps"}
 
 
+def cuda_supports_native_bfloat16() -> bool:
+    """CUDAデバイスがBF16をエミュレーションなしで実行できるか返す。"""
+    return torch.cuda.is_bf16_supported(including_emulation=False)
+
+
 def empty_device_cache(device: torch.device | str) -> None:
     """選択したアクセラレータの未使用キャッシュを解放する。"""
     device_type = torch.device(device).type
@@ -54,7 +59,7 @@ def resolve_amp_dtype(
         return torch.bfloat16
     if dtype_name is not None:
         raise ValueError(f"Unsupported AMP dtype: {dtype_name}")
-    if target_device.type == "cuda" and torch.cuda.is_bf16_supported():
+    if target_device.type == "cuda" and cuda_supports_native_bfloat16():
         return torch.bfloat16
     if target_device.type == "cpu":
         return torch.float32

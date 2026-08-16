@@ -69,11 +69,68 @@ def test_amp_is_available_for_cuda_and_mps_only() -> None:
 def test_amp_dtype_defaults_to_float16_when_bfloat16_support_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        lambda *, including_emulation=True: False,
+    )
 
     assert resolve_amp_dtype(torch.device("mps"), None) is torch.float16
     assert resolve_amp_dtype(torch.device("cuda"), None) is torch.float16
     assert resolve_amp_dtype(torch.device("mps"), "fp16") is torch.float16
+
+
+def test_amp_dtype_ignores_emulated_cuda_bfloat16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_modes: list[bool] = []
+
+    def fake_bfloat16_support(*, including_emulation: bool = True) -> bool:
+        checked_modes.append(including_emulation)
+        return including_emulation
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        fake_bfloat16_support,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), None) is torch.float16
+    assert checked_modes == [False]
+
+
+def test_amp_dtype_uses_native_cuda_bfloat16_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_modes: list[bool] = []
+
+    def fake_bfloat16_support(*, including_emulation: bool = True) -> bool:
+        checked_modes.append(including_emulation)
+        return True
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        fake_bfloat16_support,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), None) is torch.bfloat16
+    assert checked_modes == [False]
+
+
+def test_explicit_bfloat16_does_not_require_native_cuda_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_probe(*, including_emulation: bool = True) -> bool:
+        raise AssertionError("Explicit dtype must not probe CUDA capabilities")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        unexpected_probe,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), "bf16") is torch.bfloat16
 
 
 def test_core_inference_cli_defaults_to_auto_device_and_device_amp_dtype(

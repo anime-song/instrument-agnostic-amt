@@ -191,9 +191,10 @@ class MultiHeadAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, k)
 
-        q = q.to(self.lowp_dtype)
-        k = k.to(self.lowp_dtype)
-        v = v.to(self.lowp_dtype)
+        if self.training:
+            q = q.to(self.lowp_dtype)
+            k = k.to(self.lowp_dtype)
+            v = v.to(self.lowp_dtype)
 
         if attention_bias is not None:
             if attention_mask is not None or is_causal:
