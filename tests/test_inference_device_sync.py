@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -98,6 +99,31 @@ def _small_model() -> AudioSemiCRFTransformer:
     ).eval()
 
 
+class _PitchOnlyBackbone(torch.nn.Module):
+    def forward(
+        self,
+        waveform: torch.Tensor,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        pitch_features = torch.zeros(
+            int(waveform.shape[0]),
+            4,
+            88,
+            16,
+            device=waveform.device,
+        )
+        return SimpleNamespace(
+            band_features=torch.zeros(1, device=waveform.device),
+            global_features=None,
+            pitch_query_features=pitch_features,
+        )
+
+
+class _RejectingInstrumentClassifier(torch.nn.Module):
+    def forward(self, _features: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("未使用のframe instrument classifierが呼ばれました")
+
+
 class _NoCandidateModel:
     @staticmethod
     def supports_interval_boundaries() -> bool:
@@ -175,6 +201,10 @@ class _V1NoIntervalModel:
         return True
 
 
+class _V1IntervalModel(_V1NoIntervalModel):
+    _use_interval_instrument_head = True
+
+
 class _V1NoIntervalForward:
     def __call__(
         self,
@@ -222,6 +252,21 @@ class _LifetimeTrackingV1Forward(_V1NoIntervalForward):
             if isinstance(value, torch.Tensor)
         ]
         return outputs
+
+
+class _FrameInstrumentFlagForward(_V1NoIntervalForward):
+    def __init__(self) -> None:
+        self.include_frame_instrument_logits: list[object] = []
+
+    def __call__(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor | None]:
+        self.include_frame_instrument_logits.append(
+            kwargs.get("include_frame_instrument_logits")
+        )
+        return super().__call__(waveform, **kwargs)
 
 
 class _V1FrameInstrumentForward(_V1NoIntervalForward):
@@ -536,6 +581,20 @@ def test_frame_valid_mask_keeps_length_calculation_on_device(
     assert tolist_shapes == []
 
 
+def test_model_can_skip_v1_frame_instrument_logits() -> None:
+    model = _small_model()
+    model.backbone = _PitchOnlyBackbone()
+    model.head.instrument_classifier = _RejectingInstrumentClassifier()  # type: ignore[union-attr]
+
+    outputs = model(
+        torch.zeros(1, 2, 256),
+        include_aux_outputs=False,
+        include_frame_instrument_logits=False,
+    )
+
+    assert outputs["instrument_logits"] is None
+
+
 def test_frame_valid_mask_handles_none_and_rejects_non_vector_lengths() -> None:
     model = _small_model()
 
@@ -695,6 +754,62 @@ def test_v1_releases_previous_window_outputs_before_next_forward(
     assert notes == []
     assert stats["decoded_window_count"] == 2
     assert forward.alive_before_forward == [0, 0]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_include_frame_logits"),
+    [
+        (_V1IntervalModel(), False),
+        (_V1NoIntervalModel(), True),
+    ],
+)
+def test_v1_requests_frame_instrument_logits_only_for_checkpoint_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    model: object,
+    expected_include_frame_logits: bool,
+) -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v1",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        allowed_instrument_ids=(0,),
+    )
+
+    def no_intervals(
+        interval_query: torch.Tensor,
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[list[list[tuple[int, int]]]]:
+        return [
+            [[] for _ in range(88)]
+            for _ in range(int(interval_query.shape[0]))
+        ]
+
+    monkeypatch.setattr(v1_windowed, "decode_pitch_intervals", no_intervals)
+    forward = _FrameInstrumentFlagForward()
+
+    decode_v1_notes(
+        model,  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 200),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=forward,
+    )
+
+    assert forward.include_frame_instrument_logits == [
+        expected_include_frame_logits
+    ]
 
 
 def test_v1_decode_uses_sparse_decoder_when_requested(

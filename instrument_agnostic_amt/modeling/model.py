@@ -198,6 +198,7 @@ class AudioSemiCRFTransformer(nn.Module):
         valid_audio_frames: Optional[torch.Tensor] = None,
         include_amt: bool = True,
         include_aux_outputs: bool = True,
+        include_frame_instrument_logits: bool = True,
         **_: object,
     ) -> dict[str, torch.Tensor | None]:
         if not include_amt:
@@ -210,9 +211,14 @@ class AudioSemiCRFTransformer(nn.Module):
             valid_audio_frames=valid_audio_frames,
             device=waveform.device,
         )
-        outputs: dict[str, torch.Tensor | None] = self.head(
-            pitch_features, frame_valid_mask
-        )
+        if isinstance(self.head, V1SemiCRFHead):
+            outputs: dict[str, torch.Tensor | None] = self.head(
+                pitch_features,
+                frame_valid_mask,
+                include_frame_instrument_logits=include_frame_instrument_logits,
+            )
+        else:
+            outputs = self.head(pitch_features, frame_valid_mask)
         outputs.update(
             {
                 "band_features": (
