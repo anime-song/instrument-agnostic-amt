@@ -213,8 +213,8 @@ instrument_agnostic_amt/
 
 ```bash
 # Clone
-git clone https://github.com/ntamotsu/fork-instrument-agnostic-amt.git
-cd fork-instrument-agnostic-amt
+git clone https://github.com/anime-song/instrument-agnostic-amt.git
+cd instrument-agnostic-amt
 
 # Core dependencies for inference (exact versions from uv.lock)
 uv sync --locked
@@ -229,7 +229,7 @@ uv sync --locked --all-extras        # everything, including training dependenci
 
 ### Verified environments
 
-- **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), `--compile` of the core AMT forward, and `--compile-velocity` of the velocity forward (including its eager fallback for the trailing window). A full stem-separated end-to-end run with the released checkpoints has **not** been executed on MPS yet.
+- **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), and the regional `--compile` / `--compile-velocity` paths. The full transcription pipeline with the released checkpoints — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, and beat/chord/key — has been run on MPS starting from pre-separated stems. An end-to-end run that also includes the stem-separation step has **not** been executed on MPS yet.
 - **CUDA** — a regression suite for Colab Tesla T4 is included (see below), but it has not been executed on an actual T4 runtime yet.
 
 ### Running the tests
@@ -247,11 +247,23 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/t
 
 ### CUDA regression on Colab (Tesla T4)
 
-[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) reproduces the CUDA regression suite on a Colab GPU runtime: it clones the requested branch, installs the locked dependencies with `uv sync --locked --all-extras`, asserts that the runtime GPU is a Tesla T4, and runs the full test suite plus the CUDA compile regression. On a fresh T4 runtime:
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) reproduces the CUDA regression suite on a Colab GPU runtime: it clones the requested branch, verifies that the checked-out HEAD matches the required `--expected-commit` (a full 40-character SHA) before installing anything, installs the locked dependencies with `uv sync --locked --all-extras`, asserts that the runtime GPU is a Tesla T4, and runs the full test suite plus the CUDA compile regression. `--repo-url` defaults to the upstream repository, so a run is always tied to a known, pinned commit. On a fresh T4 runtime:
+
+```bash
+# Resolve and pin the commit you intend to test (full 40-character SHA)
+EXPECTED_COMMIT=$(git ls-remote https://github.com/anime-song/instrument-agnostic-amt.git refs/heads/main | cut -f1)
+curl -LO https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/main/scripts/colab_t4_regression.py
+python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
+```
+
+To verify a fork branch before it is merged, fetch the script from that branch and pass the fork explicitly via `--repo-url`, with `--expected-commit` set to the full 40-character SHA of the branch head under test:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
-python colab_t4_regression.py --branch codex/mps-inference
+python colab_t4_regression.py \
+  --repo-url https://github.com/ntamotsu/fork-instrument-agnostic-amt.git \
+  --branch codex/mps-inference \
+  --expected-commit FULL_40_CHARACTER_SHA
 ```
 
 This script has not been run to completion on an actual T4 yet, so treat the CUDA 13.0 / T4 combination as unverified until it passes.
@@ -450,7 +462,9 @@ The script uses the same per-stem model routing as the Colab notebook, merges
 the stem MIDIs, predicts note velocities, and runs `midi_frame_infer` before
 moving on to the next song. The batch runner accepts the same `--device`,
 `--amp`, `--amp-dtype`, `--compile`, and `--compile-mode` options as `infer.py`,
-plus `--compile-velocity` to also compile the velocity step.
+plus `--compile-velocity` to apply the same regional compilation to the
+velocity model. `--amp` affects only the AMT transcription stage; velocity,
+instrument refinement, and beat/chord/key always run in FP32.
 The current beat/chord checkpoint is selected by modification time from
 `beat_chord_checkpoints/midi_frame`; use `--beat-chord-checkpoint` to pin one.
 Final uncorrected files are written under `key_only_candidates/midis/`, separate
@@ -502,22 +516,32 @@ python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
 python infer.py --audio input_song.wav --device cpu
 ```
 
-**Mixed precision (`--amp`)** is strictly opt-in — it is never enabled implicitly — and works on both CUDA and MPS. It applies autocast to the forward pass only; it does **not** convert the model weights to half precision. `--amp-dtype` selects `fp16` or `bf16`. When omitted, CUDA uses bf16 if the GPU supports it (fp16 otherwise), and MPS defaults to fp16 (`--amp-dtype bf16` is also available on MPS).
+**Mixed precision (`--amp`)** is strictly opt-in — it is never enabled implicitly — and works on both CUDA and MPS. It applies autocast to the forward pass only; it does **not** convert the model weights to half precision. `--amp-dtype` selects `fp16` or `bf16`. When omitted, CUDA uses bf16 if the GPU supports it (fp16 otherwise), and MPS defaults to fp16 (`--amp-dtype bf16` is also available on MPS). Under fp16 inference autocast, the `StemConv` CNN stem always runs as an FP32 island: with the released checkpoints its activations overflow the fp16 range and the output collapses to NaN otherwise. bf16, fp32, and training behavior are unchanged. In the stem-separated pipeline and the key-only batch runner, AMP applies to the AMT transcription stage only — velocity, instrument refinement, and beat/chord/key always run in FP32.
+
+AMP is a trade-off you opt into explicitly: it can change the output, and it is not guaranteed to be faster on every device or song. On one measured song, fp16 output agreed with the FP32 run at roughly 99.8–99.9% raw-note micro F1, bf16 at roughly 98% — these figures compare against the FP32 output of the same pipeline, **not** against ground-truth MIDI, and come from a single song. Measure speed and check the output on your own material before adopting it.
 
 ```bash
 python infer.py --audio input_song.wav --device mps --amp                  # fp16 autocast on MPS
 python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
 ```
 
-**`torch.compile` (`--compile`)** is also opt-in and applies only to the core AMT forward pass — the instrument refinement and beat/chord models are not compiled yet. `--compile-mode` accepts `default`, `reduce-overhead`, `max-autotune`, and `max-autotune-no-cudagraphs`. The first processed window includes the compilation time, so short inputs may not benefit. On MPS, Inductor does not support the complex-valued CQT stage: warnings are printed and the run can end up slower than eager mode, so measure on your own audio before adopting it.
+**`torch.compile` (`--compile`)** is also opt-in and uses a *regional* strategy: only the time-axis and band-axis Transformer blocks inside the shared backbone (12 modules in the released models) are compiled, each via `nn.Module.compile()` with TorchInductor. The complex-valued CQT/STFT feature stage, the `StemConv` CNN stem, the prediction heads, Semi-CRF decoding, and MIDI processing stay eager, which keeps compilation quick and sidesteps Inductor's complex-op limitations on MPS. The instrument refinement and beat/chord models are not compiled. `--compile-mode` accepts `default`, `reduce-overhead`, `max-autotune`, and `max-autotune-no-cudagraphs`. The first processed window still includes the compilation time, so a fresh process transcribing one short song may not benefit; the payoff is largest when a loaded model keeps processing windows or songs. The six downloadable AMT checkpoints and the velocity model share the same Transformer shape, so compiled region code is reused rather than recompiled per checkpoint.
 
-**Velocity compilation (`--compile-velocity`)** is a separate opt-in, independent of `--compile`, available on the velocity CLI (`infer_velocity.py`) and the key-only batch runner; it shares `--compile-mode`. Only the velocity model forward is compiled — MIDI parsing and windowing stay eager — and only fixed-length full windows run compiled: the trailing partial window and songs shorter than one window automatically fall back to the retained eager model, so their output is identical to a plain eager run. (Variable-length windows hit a PyTorch 2.13 Inductor/Metal failure on MPS, and zero-padding would change the existing short-window results, so those windows are simply not compiled.) On full windows the compiled output matches eager within ~2e-5. The MPS caveats above apply here too: first-call compile cost and complex-op warnings mean a speedup is not guaranteed — measure first.
+**Velocity compilation (`--compile-velocity`)** is a separate opt-in, independent of `--compile`, available on the velocity CLI (`infer_velocity.py`), the key-only batch runner, and the Colab notebook; it shares `--compile-mode`. It compiles the same Transformer regions inside the velocity model's backbone — MIDI parsing, windowing, and the note-level velocity head stay eager. Because the variable per-window note count sits after the compiled regions, every window runs through the same compiled model: full windows, the trailing partial window, and songs shorter than one window alike. There is no eager fallback path, and in our measurements the trailing partial window triggered no additional graph compilation.
 
 ```bash
 python infer.py --audio input_song.wav --compile
 python infer.py --audio input_song.wav --compile --compile-mode max-autotune
 python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity   # velocity model
 ```
+
+#### Measured example: Apple Silicon (M4 Pro, MPS)
+
+One data point, not a guarantee: a 202.8-second pop song, pre-separated into six stems in advance, on an M4 Pro (macOS 15.3.1, PyTorch 2.13.0). The timed run is the full stem workflow — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, beat/chord/key — excluding stem separation, checkpoint downloads, and imports.
+
+- **Fresh process, one song (typical CLI use)** — FP32 with `--compile --compile-velocity` took 135.7 s versus 154.5 s for an earlier FP32 eager run, with compilation happening during the first windows. A single repeat in a second fresh process showed no improvement in these runs, so don't assume a benefit from Inductor's on-disk cache.
+- **Model kept loaded (steady state for batch runs and long sessions)** — median of three same-process repeats after one warm-up song, regional compile versus same-precision eager: FP32 142.7 → 124.1 s (−13%), BF16 146.2 → 117.8 s (−19%), FP16 148.8 → 117.7 s (−21%). No recompilation occurred after warm-up. FP16 and BF16 regional were effectively tied (0.1% apart), so choose the AMP dtype by output quality, not speed.
+- **Output agreement** (versus the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%), with note timings equal to within a maximum difference of 0.26 ms; every velocity value and the chord/tempo/key sequences were identical. FP16 agreed at ~99.9% raw-note micro F1 and BF16 at ~98%. Between BF16 regional and BF16 eager, raw-note F1 was 99.7%, and the beat/chord/tempo/key metadata also changed, including an extra key segment; these differences reproduced byte-identically across repeats within each condition, so they are condition differences, not run-to-run noise.
 
 ### Stem-separated workflow in Google Colab
 
@@ -531,7 +555,7 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
 
-The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, `COMPILE_VELOCITY`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`; `COMPILE_MODEL` compiles the core AMT forward, while the independent `COMPILE_VELOCITY` compiles the velocity forward. On Colab GPU runtimes, `DEVICE = "auto"` selects CUDA.
+The notebook also exposes `DEVICE`, `AMP`, `AMP_DTYPE`, `COMPILE_MODEL`, `COMPILE_VELOCITY`, and `COMPILE_MODE` parameters that are passed straight to `run_stem_separated_transcription`. `AMP`, `COMPILE_MODEL`, and `COMPILE_VELOCITY` all default to off, and on Colab GPU runtimes `DEVICE = "auto"` selects CUDA. `COMPILE_MODEL` regionally compiles the Transformer blocks of the AMT backbone, the independent `COMPILE_VELOCITY` does the same for the velocity model, and `AMP` applies mixed precision to the AMT stage only — see "Device selection and performance options" above for what is compiled and for the AMP quality trade-off.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
@@ -566,7 +590,7 @@ python infer_velocity.py \
   --output-midi output_velocity.mid
 ```
 
-If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. Opt-in `--compile-velocity` (sharing `--compile-mode`) compiles the velocity forward; see "Device selection and performance options" above for how full and trailing windows are handled. The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
+If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. Opt-in `--compile-velocity` (sharing `--compile-mode`) regionally compiles the Transformer blocks of the velocity model; every window, including the trailing partial one, runs through the same compiled model (see "Device selection and performance options" above). The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
 
 ### Additional options
 
@@ -594,7 +618,7 @@ python infer.py \
 | `--device` | `auto` | Inference device. `auto` picks CUDA → MPS → CPU; `cuda` / `mps` / `cpu` can be set explicitly |
 | `--amp` | `false` | Opt-in mixed precision (autocast) on CUDA/MPS |
 | `--amp-dtype` | device default | `fp16` / `bf16`. Defaults to bf16 on CUDA (when supported) and fp16 on MPS |
-| `--compile` | `false` | Opt-in `torch.compile` of the core AMT forward |
+| `--compile` | `false` | Opt-in regional `torch.compile` of the AMT backbone Transformer blocks |
 | `--compile-mode` | `default` | Also accepts `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |

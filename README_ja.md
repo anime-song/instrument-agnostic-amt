@@ -214,8 +214,8 @@ instrument_agnostic_amt/
 
 ```bash
 # クローン
-git clone https://github.com/ntamotsu/fork-instrument-agnostic-amt.git
-cd fork-instrument-agnostic-amt
+git clone https://github.com/anime-song/instrument-agnostic-amt.git
+cd instrument-agnostic-amt
 
 # 推論用のコア依存パッケージ（uv.lock のバージョンに固定）
 uv sync --locked
@@ -230,7 +230,7 @@ uv sync --locked --all-extras        # 学習用も含めてすべて
 
 ### 動作確認済みの環境
 
-- **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、コア forward の `--compile`、velocity forward の `--compile-velocity`（末尾窓の eager フォールバック含む）。ただし、公開チェックポイントを使ったステム分離のエンドツーエンド実行は MPS では**未実施**です。
+- **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、regional 方式の `--compile` / `--compile-velocity`。公開チェックポイントを使った採譜パイプライン全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）は、事前に分離済みのステムを入力として MPS で実行済みです。ただし、ステム分離の工程まで含めたエンドツーエンド実行は MPS では**未実施**です。
 - **CUDA** — Colab の Tesla T4 向け回帰スクリプトを同梱していますが（後述）、実際の T4 上ではまだ実行していません。
 
 ### テストの実行
@@ -248,11 +248,23 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/t
 
 ### Colab（Tesla T4）での CUDA 回帰テスト
 
-[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) は、Colab の GPU ランタイム上で CUDA 回帰テスト一式を再現します。指定ブランチをクローンし、`uv sync --locked --all-extras` でロック済み依存をインストールし、ランタイムの GPU が Tesla T4 であることを確認したうえで、テストスイート全体と CUDA compile 回帰を実行します。新しい T4 ランタイムで:
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) は、Colab の GPU ランタイム上で CUDA 回帰テスト一式を再現します。指定ブランチをクローンし、必須の `--expected-commit`（完全な 40 桁 commit SHA）とクローン直後の HEAD が一致することを検証してから（不一致なら依存関係のインストールへ進まず停止します）、`uv sync --locked --all-extras` でロック済み依存をインストールし、ランタイムの GPU が Tesla T4 であることを確認したうえで、テストスイート全体と CUDA compile 回帰を実行します。`--repo-url` の既定値は upstream リポジトリなので、実行結果は必ず既知のコミットに紐づきます。新しい T4 ランタイムで:
+
+```bash
+# テスト対象のコミットを完全な40桁SHAとして固定する
+EXPECTED_COMMIT=$(git ls-remote https://github.com/anime-song/instrument-agnostic-amt.git refs/heads/main | cut -f1)
+curl -LO https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/main/scripts/colab_t4_regression.py
+python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
+```
+
+マージ前のフォークブランチを検証する場合は、そのブランチからスクリプトを取得し、`--repo-url` でフォーク URL を明示したうえで、`--expected-commit` にテストしたいブランチ HEAD の完全な 40 桁 SHA を渡します:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
-python colab_t4_regression.py --branch codex/mps-inference
+python colab_t4_regression.py \
+  --repo-url https://github.com/ntamotsu/fork-instrument-agnostic-amt.git \
+  --branch codex/mps-inference \
+  --expected-commit FULL_40_CHARACTER_SHA
 ```
 
 このスクリプトはまだ実際の T4 上で完走させていないため、CUDA 13.0 / T4 の組み合わせは、テストが通るまでは未検証として扱ってください。
@@ -447,8 +459,10 @@ uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates im
 このバッチ処理は Colab ノートブックと同じステム別のモデル振り分けを使い、ステムMIDIの
 マージ、ノートvelocityの予測、`midi_frame_infer` の実行までを済ませてから次の曲へ
 進みます。`infer.py` と同じ `--device` / `--amp` / `--amp-dtype` / `--compile` /
-`--compile-mode` オプションに加えて、velocity ステップをコンパイルする
-`--compile-velocity` も指定できます。
+`--compile-mode` オプションに加えて、velocity モデルへ同じ regional コンパイルを
+適用する `--compile-velocity` も指定できます。`--amp` が適用されるのは AMT 採譜
+ステージだけで、velocity・instrument refinement・beat/chord/key は常に FP32 で
+実行されます。
 beat/chordチェックポイントは `beat_chord_checkpoints/midi_frame` から更新時刻で
 選択されます。固定したい場合は `--beat-chord-checkpoint` を指定してください。
 最終的な未修正ファイルは、教師データ用の `key_only_dataset/midis/` とは別に
@@ -498,22 +512,32 @@ python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
 python infer.py --audio input_song.wav --device cpu
 ```
 
-**混合精度（`--amp`）** は明示的なオプトインで、暗黙に有効化されることはありません。CUDA と MPS の両方で利用できます。forward パスに autocast を適用するだけで、モデルの重み自体を half 精度へ変換する機能では**ありません**。`--amp-dtype` では `fp16` / `bf16` を選べます。省略した場合、CUDA では GPU が対応していれば bf16（非対応なら fp16）、MPS では fp16 が既定です（MPS でも `--amp-dtype bf16` を明示できます）。
+**混合精度（`--amp`）** は明示的なオプトインで、暗黙に有効化されることはありません。CUDA と MPS の両方で利用できます。forward パスに autocast を適用するだけで、モデルの重み自体を half 精度へ変換する機能では**ありません**。`--amp-dtype` では `fp16` / `bf16` を選べます。省略した場合、CUDA では GPU が対応していれば bf16（非対応なら fp16）、MPS では fp16 が既定です（MPS でも `--amp-dtype bf16` を明示できます）。fp16 の推論時 autocast では、CNN ステム（`StemConv`）全体を常に FP32 island として実行します。公開チェックポイントでは、fp16 のままだと活性値が fp16 の範囲をあふれて出力が NaN に崩壊するためです。bf16・fp32・学習時の挙動は変わりません。また、ステム分離パイプラインと key-only バッチ処理では、AMP が適用されるのは AMT 採譜ステージだけです。velocity・instrument refinement・beat/chord/key は常に FP32 で実行されます。
+
+AMP は出力の変化を受け入れて明示的に選ぶトレードオフであり、どのデバイス・楽曲でも速くなるという保証もありません。計測した 1 曲では、FP32 実行の出力と比較した raw ノートの micro F1 が fp16 で約 99.8〜99.9%、bf16 で約 98% でした。これは同じパイプラインの FP32 出力との一致率であって、正解 MIDI に対する採譜精度では**ありません**。1 曲だけの値なので素材によっても変わります。採用する前に、手元の音源で速度と出力を確認してください。
 
 ```bash
 python infer.py --audio input_song.wav --device mps --amp                  # MPS で fp16 autocast
 python infer.py --audio input_song.wav --device mps --amp --amp-dtype bf16
 ```
 
-**`torch.compile`（`--compile`）** も明示的なオプトインで、コンパイル対象はコア AMT の forward パスのみです。instrument refinement、beat/chord の各モデルはまだコンパイルされません。`--compile-mode` には `default` / `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` を指定できます。最初のウィンドウ処理にはコンパイル時間が含まれるため、短い入力では効果が出ないことがあります。また MPS では、複素数を使う CQT 部分を Inductor がサポートしていないため警告が表示され、eager 実行より遅くなる場合があります。手元の音源で計測してから採用してください。
+**`torch.compile`（`--compile`）** も明示的なオプトインで、regional 方式を採用しています。コンパイルされるのは共有バックボーン内の time 軸 / band 軸 Transformer ブロック（公開モデルでは 12 モジュール）だけで、それぞれを TorchInductor の `nn.Module.compile()` でコンパイルします。複素数を扱う CQT/STFT の特徴抽出、CNN ステム（`StemConv`）、各予測ヘッド、Semi-CRF デコード、MIDI 処理は eager のままです。このためコンパイルが短時間で済み、MPS の Inductor が複素演算を扱えない問題にも当たりません。instrument refinement と beat/chord のモデルはコンパイルされません。`--compile-mode` には `default` / `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` を指定できます。最初のウィンドウ処理には引き続きコンパイル時間が含まれるため、新しいプロセスで短い 1 曲だけを処理する場合は効果が出ないことがあります。最も効くのは、ロード済みのモデルでウィンドウや曲を処理し続ける使い方です。ダウンロードできる 6 種類の AMT チェックポイントと velocity モデルは同じ Transformer 形状を共有しているため、コンパイル済みコードはチェックポイントごとに作り直されず再利用されます。
 
-**Velocity のコンパイル（`--compile-velocity`）** は `--compile` とは独立した別のオプトインで、velocity CLI（`infer_velocity.py`）と key-only バッチ処理で使えます（`--compile-mode` は共用）。コンパイルされるのは velocity モデルの forward だけで、MIDI 解析や窓分割は eager のままです。さらに、コンパイル済み forward を使うのは固定長のフル窓だけで、末尾の端数窓や 1 窓に満たない短い曲は、保持している eager モデルへ自動的にフォールバックします（そのため末尾の出力は通常の eager 実行と完全に一致します）。可変長の窓は PyTorch 2.13 の Inductor/Metal 制限により MPS でハードエラーになり、ゼロ padding は既存の短尺出力と同値にならないため、この振り分けにしています。フル窓での compiled と eager の差は最大 2e-5 程度です。MPS の注意点は上と同じで、初回コンパイルのコストと複素演算の警告があり、必ず速くなるとは限りません。まず計測してください。
+**Velocity のコンパイル（`--compile-velocity`）** は `--compile` とは独立した別のオプトインで、velocity CLI（`infer_velocity.py`）、key-only バッチ処理、Colab ノートブックで使えます（`--compile-mode` は共用）。コンパイル対象は velocity モデルのバックボーン内にある同じ Transformer 領域だけで、MIDI 解析、窓分割、ノート単位の velocity ヘッドは eager のままです。窓ごとに変わるノート数はコンパイル領域より後段にあるため、フル窓・末尾の端数窓・1 窓に満たない短い曲のすべてが同じコンパイル済みモデルを通ります。以前のような eager へのフォールバック経路はなく、実測でも末尾の端数窓による追加のグラフコンパイルは発生しませんでした。
 
 ```bash
 python infer.py --audio input_song.wav --compile
 python infer.py --audio input_song.wav --compile --compile-mode max-autotune
 python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity   # velocity モデル
 ```
+
+#### 実測例: Apple Silicon（M4 Pro、MPS）
+
+保証値ではなく 1 つの実測例です。202.8 秒のポップス楽曲 1 曲を事前に 6 ステムへ分離しておき、M4 Pro（macOS 15.3.1、PyTorch 2.13.0）でステムワークフロー全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）を実行しました。ステム分離・チェックポイントのダウンロード・import は計時に含めていません。
+
+- **新しいプロセスで 1 曲だけ処理（通常の CLI 利用）** — FP32 で `--compile --compile-velocity` を付けると 135.7 秒、以前の FP32 eager 単発実行は 154.5 秒でした（コンパイルは最初のウィンドウ処理中に走ります）。今回の単発の再測定では 2 回目のプロセスに改善を観測しなかったため、Inductor のディスクキャッシュによる短縮は前提にしないでください。
+- **モデルを常駐させた場合（バッチ処理・長時間セッションの定常状態）** — ウォームアップ 1 曲後の同一プロセス 3 回計測の中央値で、regional コンパイルと同精度 eager の比較は FP32 142.7 → 124.1 秒（−13%）、BF16 146.2 → 117.8 秒（−19%）、FP16 148.8 → 117.7 秒（−21%）でした。ウォームアップ後の再コンパイルは発生していません。FP16 と BF16 の regional はほぼ同速（差 0.1%）なので、AMP の dtype は速度ではなく出力品質で選んでください。
+- **出力の一致度**（同じパイプラインの FP32 eager 出力との比較で、正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ノート時刻の差は最大 0.26 ms でした。velocity の全値と chord/tempo/key の列は一致しています。FP16 は raw ノート micro F1 で約 99.9%、BF16 は約 98% の一致でした。BF16 の regional と eager の間では、raw ノート F1 が 99.7% だったことに加えて beat/chord/tempo/key のメタデータも変化し、Key 区間が 1 つ増えました。これらの差は条件内の反復ではバイト一致で再現しているため、条件による差であって実行ごとのノイズではありません。
 
 ### Google Colab のステム分離ワークフロー
 
@@ -527,7 +551,7 @@ Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipy
 
 この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
 
-ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_VELOCITY`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。`COMPILE_MODEL` はコア AMT forward を、独立した `COMPILE_VELOCITY` は velocity forward をコンパイルします。Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。
+ノートブックには `DEVICE`、`AMP`、`AMP_DTYPE`、`COMPILE_MODEL`、`COMPILE_VELOCITY`、`COMPILE_MODE` のパラメータもあり、そのまま `run_stem_separated_transcription` へ渡されます。`AMP`、`COMPILE_MODEL`、`COMPILE_VELOCITY` はいずれも既定で無効で、Colab の GPU ランタイムでは `DEVICE = "auto"` で CUDA が選択されます。`COMPILE_MODEL` は AMT バックボーン内の Transformer ブロックを regional 方式でコンパイルし、独立した `COMPILE_VELOCITY` は velocity モデルの同じ領域をコンパイルします。`AMP` の混合精度が適用されるのは AMT ステージだけです。コンパイル対象の詳細と AMP の品質トレードオフは、上の「デバイス選択とパフォーマンスオプション」を参照してください。
 
 ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
 
@@ -562,7 +586,7 @@ python infer_velocity.py \
   --output-midi output_velocity.mid
 ```
 
-`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。`--compile-velocity`（`--compile-mode` 共用）で velocity forward のコンパイルをオプトインできます。フル窓と末尾窓の扱いは上の「デバイス選択とパフォーマンスオプション」を参照してください。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。`--compile-velocity`（`--compile-mode` 共用）は、velocity モデル内の Transformer ブロックを regional 方式でコンパイルするオプトインです。末尾の端数窓を含むすべての窓が同じコンパイル済みモデルを通ります（詳細は上の「デバイス選択とパフォーマンスオプション」を参照）。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
 
 ### その他のオプション
 
@@ -590,7 +614,7 @@ python infer.py \
 | `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda` / `mps` / `cpu` の明示も可 |
 | `--amp` | `false` | CUDA/MPS での混合精度（autocast）をオプトインで有効化 |
 | `--amp-dtype` | デバイス既定 | `fp16` / `bf16`。既定は CUDA では bf16（対応時）、MPS では fp16 |
-| `--compile` | `false` | コア AMT forward への `torch.compile` をオプトインで有効化 |
+| `--compile` | `false` | AMT バックボーン内 Transformer ブロックへの regional `torch.compile` をオプトインで有効化 |
 | `--compile-mode` | `default` | `reduce-overhead` / `max-autotune` / `max-autotune-no-cudagraphs` も指定可 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
 | `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
