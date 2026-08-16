@@ -179,17 +179,17 @@ class AudioSemiCRFTransformer(nn.Module):
             return torch.ones(batch_size, num_frames, dtype=torch.bool, device=device)
         if valid_audio_frames.dim() != 1:
             raise ValueError("valid_audio_frames must be a 1D tensor")
-        lengths = torch.tensor(
-            [
-                compute_model_frames(
-                    int(frame_count), self.config.n_fft, self.config.hop_length
-                )
-                for frame_count in valid_audio_frames.tolist()
-            ],
-            device=device,
-            dtype=torch.long,
+        audio_lengths = valid_audio_frames.to(device=device, dtype=torch.long)
+        hop_length = int(self.config.hop_length)
+        complete_frames = torch.div(
+            audio_lengths,
+            hop_length,
+            rounding_mode="floor",
         )
-        return torch.arange(num_frames, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        has_partial_frame = torch.remainder(audio_lengths, hop_length).ne(0)
+        lengths = complete_frames + has_partial_frame.to(dtype=torch.long)
+        frame_indices = torch.arange(num_frames, device=device).unsqueeze(0)
+        return frame_indices < lengths.unsqueeze(1)
 
     def forward(
         self,

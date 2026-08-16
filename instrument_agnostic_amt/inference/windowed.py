@@ -119,30 +119,27 @@ def _select_pair_candidates(
         start = int(instrument_id) * NUM_PITCHES
         allowed[start : start + NUM_PITCHES] = True
     finite_mask = finite_mask & allowed
-    if not bool(torch.any(finite_mask).item()):
-        return []
-
-    candidate_ids: set[int] = set()
     threshold = float(settings.instrument_pair_gate_threshold)
-    threshold_mask = finite_mask & (scores >= threshold)
-    if bool(torch.any(threshold_mask).item()):
-        candidate_ids.update(
-            int(item) for item in threshold_mask.nonzero().flatten().tolist()
-        )
+    selected_mask = finite_mask & (scores >= threshold)
 
     topk = max(0, int(settings.instrument_pair_infer_topk))
     if topk > 0:
         masked_scores = scores.masked_fill(~finite_mask, float("-inf"))
-        finite_count = int(torch.isfinite(masked_scores).sum().item())
-        if finite_count > 0:
-            top_ids = torch.topk(masked_scores, k=min(topk, finite_count)).indices
-            candidate_ids.update(int(item) for item in top_ids.tolist())
+        top_ids = torch.topk(masked_scores, k=min(topk, int(scores.numel()))).indices
+        selected_mask.scatter_(0, top_ids, True)
+        selected_mask &= finite_mask
 
-    if not candidate_ids:
-        return []
+    score_rows = torch.stack(
+        (scores, selected_mask.to(dtype=scores.dtype)),
+        dim=-1,
+    ).detach().cpu().tolist()
     ranked = sorted(
-        candidate_ids,
-        key=lambda pair_id: (-float(scores[int(pair_id)].item()), int(pair_id)),
+        (
+            pair_id
+            for pair_id, (_, is_selected) in enumerate(score_rows)
+            if bool(is_selected)
+        ),
+        key=lambda pair_id: (-float(score_rows[int(pair_id)][0]), int(pair_id)),
     )
     max_pairs = int(settings.instrument_pair_max_pairs)
     if max_pairs > 0:
@@ -169,11 +166,11 @@ def _rank_instrument_candidates_by_pitch(
     if len(candidate_instrument_ids) == 1:
         return [candidate_instrument_ids for _ in range(NUM_PITCHES)]
 
-    scores = pair_gate_logits.detach().float().cpu()
+    score_rows = pair_gate_logits.detach().float().cpu().tolist()
     ranked_by_pitch: list[tuple[int, ...]] = []
     for pitch_index in range(NUM_PITCHES):
         score_values = {
-            instrument_index: float(scores[instrument_index, pitch_index].item())
+            instrument_index: float(score_rows[instrument_index][pitch_index])
             for instrument_index in candidate_instrument_ids
         }
         finite_ids = [
@@ -229,15 +226,20 @@ def _decode_flat_boundary_features(
     boundary_presence = presence_logits > 0.0
     offset_dist = torch.distributions.ContinuousBernoulli(logits=offset_logits)
     offset_values = torch.clamp((offset_dist.mean - 0.005) / 0.99, 0.0, 1.0)
+    decoded_rows = torch.cat(
+        (boundary_presence.to(dtype=offset_values.dtype), offset_values),
+        dim=-1,
+    ).detach().cpu().tolist()
 
     for row_index, entry in enumerate(entries):
         track_index, _, _, _ = entry
+        row = decoded_rows[row_index]
         flags[int(track_index)].append(
             (
-                bool(boundary_presence[row_index, 0].item()),
-                bool(boundary_presence[row_index, 1].item()),
-                float(offset_values[row_index, 0].item()),
-                float(offset_values[row_index, 1].item()),
+                bool(row[0]),
+                bool(row[1]),
+                float(row[2]),
+                float(row[3]),
             )
         )
     return flags
@@ -716,11 +718,14 @@ def decode_notes(
                 "Factorized V2 inference requires interval projections and pair gate logits"
             )
         valid_lengths = frame_valid_mask.to(dtype=torch.long).sum(dim=-1)
+        valid_length_values = tuple(
+            int(value) for value in valid_lengths.detach().cpu().tolist()
+        )
 
         for sample_index, (start_frame, valid_frames) in enumerate(
             zip(active_batch_starts, active_valid_audio_frames)
         ):
-            sample_valid_length = int(valid_lengths[sample_index].item())
+            sample_valid_length = valid_length_values[sample_index]
             if sample_valid_length <= 0:
                 continue
 
