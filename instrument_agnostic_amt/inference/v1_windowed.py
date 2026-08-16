@@ -306,7 +306,9 @@ def decode_v1_notes(
             and instrument_features is not None
         ):
             logits, entries = model.predict_interval_instruments(
-                instrument_features.float(), decoded_batch
+                instrument_features,
+                decoded_batch,
+                compute_dtype=torch.float32,
             )
             instrument_map = _decode_instrument_map(
                 logits,

@@ -135,12 +135,16 @@ class V1SemiCRFHead(nn.Module):
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         interval_features, entries = gather_interval_sequence_features(
-            features, interval_batch
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
         )
         if not entries:
-            return features.new_zeros(
+            return interval_features.new_zeros(
                 (0, self.interval_instrument_predictor.num_instrument_classes)
             ), []
         return self.interval_instrument_predictor(interval_features), entries

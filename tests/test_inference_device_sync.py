@@ -25,6 +25,9 @@ from instrument_agnostic_amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from instrument_agnostic_amt.modeling.heads.interval_boundaries import (
+    gather_interval_sequence_features,
+)
 from instrument_agnostic_amt.modeling.heads.semi_crf import (
     _build_dense_sparse_candidates,
     _select_sparse_candidates,
@@ -618,6 +621,53 @@ def test_sparse_candidates_do_not_copy_transposed_score() -> None:
     assert torch.equal(actual[0], reference[0])
     assert torch.equal(actual[1], reference[1])
     assert contiguous_count == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(),
+                reason="MPS is not available",
+            ),
+        ),
+    ],
+)
+def test_interval_sequence_casts_inside_prefix_sum(
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    torch.manual_seed(20260817)
+    features = torch.randn(1, 6, 2, 4).to(device=device, dtype=dtype)
+    intervals = [[[(0, 2), (2, 5)], [(1, 4)]]]
+    reference, reference_entries = gather_interval_sequence_features(
+        features.float(),
+        intervals,
+    )
+
+    actual, actual_entries = gather_interval_sequence_features(
+        features,
+        intervals,
+        compute_dtype=torch.float32,
+    )
+
+    assert actual_entries == reference_entries
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, reference)
+
+
+def test_interval_sequence_avoids_scalar_read_for_prefix_adjustment() -> None:
+    features = torch.randn(1, 6, 2, 4)
+    intervals = [[[(0, 2), (2, 5)], [(1, 4)]]]
+
+    with profile(activities=[ProfilerActivity.CPU]) as profiler:
+        gather_interval_sequence_features(features, intervals)
+
+    assert _local_scalar_read_count(profiler) == 0
 
 
 @pytest.mark.skipif(
