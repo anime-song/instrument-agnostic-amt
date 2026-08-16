@@ -138,9 +138,8 @@ class AudioFeatureExtractor(nn.Module):
     @staticmethod
     def _normalize_spec(spec: torch.Tensor) -> torch.Tensor:
         reduce_dims = tuple(range(1, spec.ndim))
-        mean = spec.mean(dim=reduce_dims, keepdim=True)
-        std = spec.std(dim=reduce_dims, keepdim=True).clamp_min(1e-8)
-        return (spec - mean) / std
+        std, mean = torch.std_mean(spec, dim=reduce_dims, keepdim=True)
+        return (spec - mean) / std.clamp_min(1e-8)
 
     def _apply_spec_augment(self, spec: torch.Tensor) -> torch.Tensor:
         if self.spec_augment is None or not self.training:
