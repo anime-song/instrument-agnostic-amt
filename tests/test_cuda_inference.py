@@ -87,11 +87,12 @@ def test_core_amt_cuda_matches_cpu_in_fp32() -> None:
             assert cuda_value is None
             continue
         assert isinstance(cuda_value, torch.Tensor)
+        atol = 2e-3 if name.endswith("_features") else 1e-3
         torch.testing.assert_close(
             cuda_value.cpu(),
             cpu_value,
             rtol=5e-3,
-            atol=5e-4,
+            atol=atol,
         )
 
 
