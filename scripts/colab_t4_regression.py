@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -12,8 +13,9 @@ from typing import Mapping, Sequence
 
 
 DEFAULT_REPOSITORY_URL = (
-    "https://github.com/ntamotsu/fork-instrument-agnostic-amt.git"
+    "https://github.com/anime-song/instrument-agnostic-amt.git"
 )
+FULL_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 def _run(
@@ -31,7 +33,38 @@ def _run(
     )
 
 
-def parse_args() -> argparse.Namespace:
+def _capture(command: Sequence[str], *, cwd: Path | None = None) -> str:
+    print(f"+ {shlex.join(command)}", flush=True)
+    completed = subprocess.run(
+        list(command),
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return completed.stdout.strip()
+
+
+def _full_commit_sha(value: str) -> str:
+    if FULL_COMMIT_SHA_PATTERN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "expected commit must be a full 40-character hexadecimal SHA"
+        )
+    return value.lower()
+
+
+def _verify_expected_commit(worktree: Path, expected_commit: str) -> str:
+    actual_commit = _capture(["git", "rev-parse", "HEAD"], cwd=worktree)
+    print(f"Checked out commit: {actual_commit}", flush=True)
+    if actual_commit.lower() != expected_commit.lower():
+        raise RuntimeError(
+            f"Checked out HEAD {actual_commit} does not match expected commit "
+            f"{expected_commit}"
+        )
+    return actual_commit
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the inference regression suite on a Colab Tesla T4."
     )
@@ -41,7 +74,13 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Remote branch to test (required to avoid testing main by mistake).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--expected-commit",
+        required=True,
+        type=_full_commit_sha,
+        help="Full 40-character commit SHA that the cloned HEAD must match.",
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -57,11 +96,12 @@ def main() -> None:
             "1",
             "--branch",
             str(args.branch),
+            "--",
             str(args.repo_url),
             str(worktree),
         ]
     )
-    _run(["git", "rev-parse", "HEAD"], cwd=worktree)
+    _verify_expected_commit(worktree, args.expected_commit)
     _run([sys.executable, "-m", "pip", "install", "--quiet", "uv==0.8.17"])
     _run(["uv", "sync", "--locked", "--all-extras"], cwd=worktree)
     _run(
