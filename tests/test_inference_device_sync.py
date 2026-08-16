@@ -8,7 +8,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from instrument_agnostic_amt.inference import v1_windowed
+from instrument_agnostic_amt.inference import v1_windowed, windowed
 from instrument_agnostic_amt.inference.v1_windowed import (
     _decode_boundary_map,
     _decode_instrument_map,
@@ -99,6 +99,30 @@ def _small_model() -> AudioSemiCRFTransformer:
     ).eval()
 
 
+def _small_v2_model() -> AudioSemiCRFTransformer:
+    return AudioSemiCRFTransformer(
+        SemiCRFModelConfig(
+            sample_rate=16_000,
+            hop_length=64,
+            n_fft=256,
+            cqt_fmin=250.0,
+            cqt_n_bins=12,
+            cqt_bins_per_octave=12,
+            cqt_filter_scale=0.5,
+            harmonics=(1.0,),
+            hidden_size=8,
+            base_ch=4,
+            encoder_num_layers=0,
+            encoder_num_heads=2,
+            dropout=0.0,
+            use_gradient_checkpoint=False,
+            semi_crf_version="v2",
+            semi_crf_head_dim=8,
+            num_instrument_classes=2,
+        )
+    ).eval()
+
+
 class _PitchOnlyBackbone(torch.nn.Module):
     def forward(
         self,
@@ -132,6 +156,34 @@ class _NoCandidateModel:
     @staticmethod
     def build_selected_pair_indices(*_args: object) -> object:
         raise AssertionError("no candidate pair should reach the decoder")
+
+
+class _V2BoundaryModel:
+    def __init__(self) -> None:
+        self.boundary_dtypes: list[tuple[torch.dtype, torch.dtype | None]] = []
+
+    @staticmethod
+    def supports_interval_boundaries() -> bool:
+        return True
+
+    @staticmethod
+    def build_selected_pair_indices(*_args: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            batch_indices=torch.tensor([0]),
+            instrument_indices=torch.tensor([0]),
+            pitch_indices=torch.tensor([0]),
+        )
+
+    def predict_flat_interval_boundaries(
+        self,
+        features: torch.Tensor,
+        _selected_pairs: object,
+        _interval_batch: object,
+        *,
+        compute_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[int, int, int, int]]]:
+        self.boundary_dtypes.append((features.dtype, compute_dtype))
+        return torch.zeros(0, 4, dtype=torch.float32), []
 
 
 class _NoCandidateForward:
@@ -189,6 +241,20 @@ class _LifetimeTrackingV2Forward(_NoCandidateForward):
         return outputs
 
 
+class _V2BoundaryForward(_NoCandidateForward):
+    def __call__(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        outputs = super().__call__(waveform, **kwargs)
+        outputs["interval_features"] = outputs["interval_features"].to(
+            dtype=torch.float16
+        )
+        outputs["pair_gate_logits"][:, 0, 0] = 2.0
+        return outputs
+
+
 class _V1NoIntervalModel:
     _use_interval_instrument_head = False
 
@@ -203,6 +269,29 @@ class _V1NoIntervalModel:
 
 class _V1IntervalModel(_V1NoIntervalModel):
     _use_interval_instrument_head = True
+
+
+class _V1BoundaryModel(_V1NoIntervalModel):
+    def __init__(self) -> None:
+        self.boundary_dtypes: list[tuple[torch.dtype, torch.dtype | None]] = []
+
+    @staticmethod
+    def supports_interval_boundaries() -> bool:
+        return True
+
+    @staticmethod
+    def supports_interval_instruments() -> bool:
+        return False
+
+    def predict_interval_boundaries(
+        self,
+        features: torch.Tensor,
+        _interval_batch: object,
+        *,
+        compute_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
+        self.boundary_dtypes.append((features.dtype, compute_dtype))
+        return torch.zeros(0, 4, dtype=torch.float32), []
 
 
 class _V1NoIntervalForward:
@@ -267,6 +356,24 @@ class _FrameInstrumentFlagForward(_V1NoIntervalForward):
             kwargs.get("include_frame_instrument_logits")
         )
         return super().__call__(waveform, **kwargs)
+
+
+class _V1BoundaryForward(_V1NoIntervalForward):
+    def __call__(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor | None]:
+        outputs = super().__call__(waveform, **kwargs)
+        outputs["interval_features"] = torch.zeros(
+            int(waveform.shape[0]),
+            20,
+            88,
+            1,
+            device=waveform.device,
+            dtype=torch.float16,
+        )
+        return outputs
 
 
 class _V1FrameInstrumentForward(_V1NoIntervalForward):
@@ -341,6 +448,83 @@ def test_v2_releases_previous_window_outputs_before_next_forward() -> None:
     assert notes == []
     assert stats["decoded_window_count"] == 2
     assert forward.alive_before_forward == [0, 0]
+
+
+def test_v2_boundary_gathers_before_converting_full_features_to_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v2",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        use_boundary_head=True,
+        allowed_instrument_ids=(0,),
+    )
+    monkeypatch.setattr(
+        windowed,
+        "decode_factorized_pair_intervals",
+        lambda *_args, **_kwargs: [[]],
+    )
+    model = _V2BoundaryModel()
+
+    decode_notes(
+        model,  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 200),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=_V2BoundaryForward(),
+    )
+
+    assert model.boundary_dtypes == [(torch.float16, torch.float32)]
+
+
+def test_boundary_endpoint_conversion_matches_full_fp32_conversion() -> None:
+    torch.manual_seed(7)
+    v1_model = _small_model()
+    v1_features = torch.randn(1, 5, 88, 16, dtype=torch.float16)
+    v1_intervals = [[[(0, 2)], *([[]] * 87)]]
+
+    v1_expected, v1_expected_entries = v1_model.predict_interval_boundaries(
+        v1_features.float(),
+        v1_intervals,
+    )
+    v1_actual, v1_actual_entries = v1_model.predict_interval_boundaries(
+        v1_features,
+        v1_intervals,
+        compute_dtype=torch.float32,
+    )
+
+    v2_model = _small_v2_model()
+    v2_features = torch.randn(1, 5, 88, 16, dtype=torch.float16)
+    selected_pairs = v2_model.build_selected_pair_indices([[0]])
+    v2_intervals = [[(0, 2)]]
+    v2_expected, v2_expected_entries = v2_model.predict_flat_interval_boundaries(
+        v2_features.float(),
+        selected_pairs,
+        v2_intervals,
+    )
+    v2_actual, v2_actual_entries = v2_model.predict_flat_interval_boundaries(
+        v2_features,
+        selected_pairs,
+        v2_intervals,
+        compute_dtype=torch.float32,
+    )
+
+    assert v1_actual_entries == v1_expected_entries
+    assert torch.equal(v1_actual, v1_expected)
+    assert v2_actual_entries == v2_expected_entries
+    assert torch.equal(v2_actual, v2_expected)
 
 
 def test_profiler_detects_deliberate_scalar_tensor_read() -> None:
@@ -810,6 +994,52 @@ def test_v1_requests_frame_instrument_logits_only_for_checkpoint_fallback(
     assert forward.include_frame_instrument_logits == [
         expected_include_frame_logits
     ]
+
+
+def test_v1_boundary_gathers_before_converting_full_features_to_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v1",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        use_boundary_head=True,
+        allowed_instrument_ids=(0,),
+    )
+
+    def no_intervals(
+        interval_query: torch.Tensor,
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[list[list[tuple[int, int]]]]:
+        return [
+            [[] for _ in range(88)]
+            for _ in range(int(interval_query.shape[0]))
+        ]
+
+    monkeypatch.setattr(v1_windowed, "decode_pitch_intervals", no_intervals)
+    model = _V1BoundaryModel()
+
+    decode_v1_notes(
+        model,  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 200),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=_V1BoundaryForward(),
+    )
+
+    assert model.boundary_dtypes == [(torch.float16, torch.float32)]
 
 
 def test_v1_decode_uses_sparse_decoder_when_requested(

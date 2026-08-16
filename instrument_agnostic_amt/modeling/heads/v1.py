@@ -117,11 +117,15 @@ class V1SemiCRFHead(nn.Module):
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         if self.interval_boundary_predictor is None:
             return features.new_zeros((0, 4)), []
         interval_features, entries = gather_interval_endpoint_features(
-            features, interval_batch
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
         )
         if not entries:
             return features.new_zeros((0, 4)), []
