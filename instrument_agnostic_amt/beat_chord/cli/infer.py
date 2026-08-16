@@ -253,13 +253,20 @@ def run_beat_chord_inference(
         raise ValueError("window_batch_size must be positive")
     pending_rolls: list[torch.Tensor] = []
     pending_start_frames: list[int] = []
+    omit_aux_outputs = isinstance(model, MidiFrameBeatChordModel)
 
     def flush_pending_windows() -> None:
         if not pending_rolls:
             return
         roll_batch = torch.stack(pending_rolls).to(device)
         with torch.inference_mode():
-            outputs = model(roll_batch, include_beat=True, include_chord=True)
+            model_kwargs: dict[str, object] = {
+                "include_beat": True,
+                "include_chord": True,
+            }
+            if omit_aux_outputs:
+                model_kwargs["include_aux_outputs"] = False
+            outputs = model(roll_batch, **model_kwargs)
             beat_probs = torch.sigmoid(outputs["beat_logits"]).cpu()
             downbeat_probs = torch.sigmoid(outputs["downbeat_logits"]).cpu()
             group_boundary_probs = torch.sigmoid(
