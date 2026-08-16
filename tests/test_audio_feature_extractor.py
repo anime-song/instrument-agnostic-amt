@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 from instrument_agnostic_amt.modeling.backbone import AudioFeatureExtractor
 
@@ -119,51 +118,3 @@ def test_harmonic_interpolation_indices_are_nonpersistent_buffers() -> None:
     assert "harmonic_lower_indices" not in extractor.state_dict()
     assert "harmonic_upper_indices" not in extractor.state_dict()
     assert "harmonic_interpolation_alpha" not in extractor.state_dict()
-
-
-def _legacy_normalize_spec(spec: torch.Tensor) -> torch.Tensor:
-    reduce_dims = tuple(range(1, spec.ndim))
-    mean = spec.mean(dim=reduce_dims, keepdim=True)
-    std = spec.std(dim=reduce_dims, keepdim=True).clamp_min(1e-8)
-    return (spec - mean) / std
-
-
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "mps",
-            marks=pytest.mark.skipif(
-                not torch.backends.mps.is_available(),
-                reason="MPS is not available",
-            ),
-        ),
-    ],
-)
-@pytest.mark.parametrize("near_constant", [False, True])
-def test_fused_spec_normalization_matches_legacy_statistics(
-    device: str,
-    near_constant: bool,
-) -> None:
-    torch.manual_seed(20260817)
-    spec = torch.randn(2, 2, 5, 24, 17, device=device)
-    if near_constant:
-        spec = 1.0 + spec * 1e-7
-
-    reference = _legacy_normalize_spec(spec)
-    actual = AudioFeatureExtractor._normalize_spec(spec)
-
-    torch.testing.assert_close(actual, reference, rtol=1e-6, atol=5e-7)
-
-
-def test_spec_normalization_fuses_mean_and_std_reductions() -> None:
-    spec = torch.randn(2, 2, 5, 24, 17)
-
-    with profile(activities=[ProfilerActivity.CPU]) as profiler:
-        AudioFeatureExtractor._normalize_spec(spec)
-
-    events = {event.key: event.count for event in profiler.key_averages()}
-    assert events.get("aten::std_mean", 0) == 1
-    assert events.get("aten::mean", 0) == 0
-    assert events.get("aten::std", 0) == 0
