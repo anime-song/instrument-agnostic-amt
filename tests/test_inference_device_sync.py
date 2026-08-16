@@ -515,6 +515,69 @@ def test_v1_decode_bulk_reads_valid_lengths_for_a_window_batch(
     assert _local_scalar_read_count(profiler) == 0
 
 
+def test_v1_decode_uses_sparse_decoder_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SemiCRFModelConfig(
+        sample_rate=1_000,
+        hop_length=10,
+        n_fft=128,
+        semi_crf_version="v1",
+        num_instrument_classes=2,
+    )
+    settings = _inference_settings(
+        window_ms=200,
+        stride_ms=200,
+        semi_crf_sparse_decode=True,
+        semi_crf_sparse_topk_per_start=5,
+        semi_crf_sparse_score_threshold=-0.25,
+        semi_crf_sparse_max_span_frames=7,
+        allowed_instrument_ids=(0,),
+    )
+    sparse_calls: list[dict[str, object]] = []
+
+    def reject_dense_decoder(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("sparse指定時にdense decoderを呼び出している")
+
+    def sparse_decoder(
+        interval_query: torch.Tensor,
+        *_args: object,
+        **kwargs: object,
+    ) -> list[list[list[tuple[int, int]]]]:
+        sparse_calls.append(kwargs)
+        return [
+            [[] for _ in range(88)]
+            for _ in range(int(interval_query.shape[0]))
+        ]
+
+    monkeypatch.setattr(v1_windowed, "decode_pitch_intervals", reject_dense_decoder)
+    monkeypatch.setattr(
+        v1_windowed,
+        "decode_pitch_intervals_sparse",
+        sparse_decoder,
+        raising=False,
+    )
+
+    notes, _ = decode_v1_notes(
+        _V1NoIntervalModel(),  # type: ignore[arg-type]
+        config,
+        torch.randn(2, 200),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=settings,
+        velocity=100,
+        forward_model=_V1NoIntervalForward(),
+    )
+
+    assert notes == []
+    assert len(sparse_calls) == 1
+    assert sparse_calls[0]["sparse_topk_per_start"] == 5
+    assert sparse_calls[0]["sparse_score_threshold"] == -0.25
+    assert sparse_calls[0]["sparse_max_span_frames"] == 7
+
+
 def test_v1_frame_instrument_fallback_bulk_reads_candidate_orders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

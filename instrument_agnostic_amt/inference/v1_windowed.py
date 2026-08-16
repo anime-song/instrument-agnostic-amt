@@ -8,7 +8,10 @@ from tqdm.auto import tqdm
 
 from ..runtime import is_amp_supported
 
-from ..modeling.heads.semi_crf import decode_pitch_intervals
+from ..modeling.heads.semi_crf import (
+    decode_pitch_intervals,
+    decode_pitch_intervals_sparse,
+)
 from ..modeling.model import (
     MIN_MIDI_PITCH,
     NUM_PITCHES,
@@ -239,7 +242,23 @@ def decode_v1_notes(
                     for track in range(track_count)
                 ]
             )
-        decoded_batch = decode_pitch_intervals(
+        decode_intervals = (
+            decode_pitch_intervals_sparse
+            if settings.semi_crf_sparse_decode
+            else decode_pitch_intervals
+        )
+        sparse_options = (
+            {
+                "sparse_topk_per_start": int(
+                    settings.semi_crf_sparse_topk_per_start
+                ),
+                "sparse_score_threshold": settings.semi_crf_sparse_score_threshold,
+                "sparse_max_span_frames": settings.semi_crf_sparse_max_span_frames,
+            }
+            if settings.semi_crf_sparse_decode
+            else {}
+        )
+        decoded_batch = decode_intervals(
             outputs["interval_query"],
             outputs["interval_key"],
             outputs["interval_diag"],
@@ -249,6 +268,7 @@ def decode_v1_notes(
             note_bias=settings.note_bias,
             track_batch_size=settings.track_batch_size,
             forced_start_pos=forced_start_positions,
+            **sparse_options,
         )
         batch_decoded_interval_count = sum(
             len(intervals) for sample in decoded_batch for intervals in sample
