@@ -83,6 +83,31 @@ class _NonCpuScalarReadCounter(TorchDispatchMode):
         return func(*args, **({} if kwargs is None else kwargs))  # type: ignore[operator]
 
 
+class _NonCpuToCpuCopyRecorder(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.numels: list[int] = []
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        call_kwargs = {} if kwargs is None else kwargs
+        if "_to_copy" in str(func) and args and isinstance(args[0], torch.Tensor):
+            source = args[0]
+            target_device = call_kwargs.get("device")
+            if (
+                source.device.type != "cpu"
+                and target_device is not None
+                and torch.device(target_device).type == "cpu"
+            ):
+                self.numels.append(int(source.numel()))
+        return func(*args, **call_kwargs)  # type: ignore[operator]
+
+
 def _small_model() -> AudioSemiCRFTransformer:
     return AudioSemiCRFTransformer(
         SemiCRFModelConfig(
@@ -548,6 +573,21 @@ def test_boundary_endpoint_conversion_matches_full_fp32_conversion() -> None:
     assert torch.equal(v2_actual, v2_expected)
 
 
+def test_v1_empty_boundary_logits_honor_compute_dtype() -> None:
+    model = _small_model()
+    features = torch.randn(1, 5, 88, 16, dtype=torch.float16)
+    empty_intervals = [[[] for _ in range(88)]]
+
+    logits, entries = model.predict_interval_boundaries(
+        features,
+        empty_intervals,
+        compute_dtype=torch.float32,
+    )
+
+    assert entries == []
+    assert logits.dtype == torch.float32
+
+
 def test_profiler_detects_deliberate_scalar_tensor_read() -> None:
     with profile(activities=[ProfilerActivity.CPU]) as profiler:
         torch.tensor(1.0).item()
@@ -667,7 +707,13 @@ def test_interval_sequence_avoids_scalar_read_for_prefix_adjustment() -> None:
     with profile(activities=[ProfilerActivity.CPU]) as profiler:
         gather_interval_sequence_features(features, intervals)
 
+    clone_count = sum(
+        event.count
+        for event in profiler.key_averages()
+        if event.key == "aten::clone"
+    )
     assert _local_scalar_read_count(profiler) == 0
+    assert clone_count == 0
 
 
 @pytest.mark.skipif(
@@ -690,14 +736,17 @@ def test_pair_candidate_topk_runs_on_mps_and_matches_cpu() -> None:
         settings=settings,
         instrument_filter_id=None,
     )
-    mps_selected = _select_pair_candidates(
-        logits.to("mps"),
-        settings=settings,
-        instrument_filter_id=None,
-    )
+    recorder = _NonCpuToCpuCopyRecorder()
+    with recorder:
+        mps_selected = _select_pair_candidates(
+            logits.to("mps"),
+            settings=settings,
+            instrument_filter_id=None,
+        )
 
     assert cpu_selected == [3, 5]
     assert mps_selected == cpu_selected
+    assert recorder.numels == [logits.numel()]
 
 
 def test_pair_candidate_selection_filters_nonfinite_topk_padding() -> None:

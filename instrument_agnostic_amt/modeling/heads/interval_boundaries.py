@@ -160,7 +160,7 @@ def gather_interval_sequence_features(
         batch_indices,
         end_indices,
         pitch_indices,
-    ].clone()
+    ]
     has_previous = begin_indices > 0
     interval_sum[has_previous] = (
         interval_sum[has_previous]

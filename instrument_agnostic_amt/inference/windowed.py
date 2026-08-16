@@ -129,17 +129,15 @@ def _select_pair_candidates(
         selected_mask.scatter_(0, top_ids, True)
         selected_mask &= finite_mask
 
-    score_rows = torch.stack(
-        (scores, selected_mask.to(dtype=scores.dtype)),
-        dim=-1,
-    ).detach().cpu().tolist()
+    selected_scores = scores.masked_fill(~selected_mask, float("-inf"))
+    score_values = selected_scores.detach().cpu().tolist()
     ranked = sorted(
         (
             pair_id
-            for pair_id, (_, is_selected) in enumerate(score_rows)
-            if bool(is_selected)
+            for pair_id, score in enumerate(score_values)
+            if math.isfinite(float(score))
         ),
-        key=lambda pair_id: (-float(score_rows[int(pair_id)][0]), int(pair_id)),
+        key=lambda pair_id: (-float(score_values[int(pair_id)]), int(pair_id)),
     )
     max_pairs = int(settings.instrument_pair_max_pairs)
     if max_pairs > 0:
