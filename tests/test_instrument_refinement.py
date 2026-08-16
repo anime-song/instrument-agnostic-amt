@@ -802,6 +802,8 @@ def test_temporal_smoothing_and_embedding_clustering() -> None:
 class _FakeRefinementModel:
     def __init__(self, config: InstrumentRefinementConfig) -> None:
         self.config = config
+        self.batch_sizes: list[int] = []
+        self.note_counts: list[list[int]] = []
 
     def to(self, _device: torch.device) -> "_FakeRefinementModel":
         return self
@@ -813,6 +815,10 @@ class _FakeRefinementModel:
         assert torch.all(kwargs["note_prior_class"] == -1)
         pitches = kwargs["note_pitch"]
         batch_size, note_count = pitches.shape
+        self.batch_sizes.append(int(batch_size))
+        self.note_counts.append(
+            kwargs["note_mask"].sum(dim=1).detach().cpu().tolist()
+        )
         device = pitches.device
         acoustic = get_instrument_class_id_by_name("acoustic_guitar")
         distorted = get_instrument_class_id_by_name("distorted_guitar")
@@ -866,6 +872,7 @@ def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
         embedding_size=8,
         use_gradient_checkpoint=False,
     )
+    model = _FakeRefinementModel(config)
     report = refine_midi_instruments(
         audio_path,
         midi_path,
@@ -873,21 +880,68 @@ def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
         stem_name="guitar",
         window_seconds=0.5,
         stride_seconds=0.25,
+        window_batch_size=2,
         cluster_distance=0.1,
         min_cluster_notes=1,
         disable_tqdm=True,
-        preloaded_model=_FakeRefinementModel(config),  # type: ignore[arg-type]
+        preloaded_model=model,  # type: ignore[arg-type]
         preloaded_config=config,
     )
 
     assert output_path.is_file()
     assert report["note_count"] == 2
     assert report["cluster_count"] == 2
+    assert model.batch_sizes == [2, 1]
     output = pretty_midi.PrettyMIDI(str(output_path))
     assert {instrument.name for instrument in output.instruments} == {
         "acoustic_guitar",
         "distorted_guitar",
     }
+
+
+def test_refinement_window_batch_pads_empty_note_windows_without_output_changes(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "single_note.wav"
+    midi_path = tmp_path / "single_note.mid"
+    _write_audio(audio_path, frequency=330.0)
+    _write_midi(midi_path, pitches=(60,))
+    config = InstrumentRefinementConfig(
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        embedding_size=8,
+        use_gradient_checkpoint=False,
+    )
+
+    def run(batch_size: int):
+        model = _FakeRefinementModel(config)
+        report = refine_midi_instruments(
+            audio_path,
+            midi_path,
+            stem_name="guitar",
+            window_seconds=0.5,
+            stride_seconds=0.5,
+            window_batch_size=batch_size,
+            mode="single",
+            disable_tqdm=True,
+            preloaded_model=model,  # type: ignore[arg-type]
+            preloaded_config=config,
+        )
+        return model, report
+
+    single_model, single_report = run(1)
+    batched_model, batched_report = run(2)
+
+    assert single_model.batch_sizes == [1, 1]
+    assert single_model.note_counts == [[1], [0]]
+    assert batched_model.batch_sizes == [2]
+    assert batched_model.note_counts == [[1, 0]]
+    assert batched_report == single_report
 
 
 def _class_dataset_units() -> dict[int, dict[str, tuple[int, ...]]]:

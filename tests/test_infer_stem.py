@@ -330,6 +330,7 @@ def test_refine_stem_instrument_midis_skips_excluded_stems_and_rewrites_labels(
         device="cpu",
         window_seconds=0.5,
         stride_seconds=0.25,
+        window_batch_size=2,
     )
 
     assert set(refined_paths) == {"other"}
