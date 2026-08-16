@@ -143,6 +143,20 @@ class _PitchOnlyBackbone(torch.nn.Module):
         )
 
 
+class _AuxFlagBackbone(_PitchOnlyBackbone):
+    def __init__(self) -> None:
+        super().__init__()
+        self.include_aux_outputs: list[object] = []
+
+    def forward(
+        self,
+        waveform: torch.Tensor,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        self.include_aux_outputs.append(kwargs.get("include_aux_outputs"))
+        return super().forward(waveform, **kwargs)
+
+
 class _RejectingInstrumentClassifier(torch.nn.Module):
     def forward(self, _features: torch.Tensor) -> torch.Tensor:
         raise AssertionError("未使用のframe instrument classifierが呼ばれました")
@@ -777,6 +791,35 @@ def test_model_can_skip_v1_frame_instrument_logits() -> None:
     )
 
     assert outputs["instrument_logits"] is None
+
+
+def test_model_propagates_aux_output_flag_to_backbone() -> None:
+    model = _small_model()
+    backbone = _AuxFlagBackbone()
+    model.backbone = backbone
+
+    model(torch.zeros(1, 2, 256), include_aux_outputs=False)
+
+    assert backbone.include_aux_outputs == [False]
+
+
+def test_backbone_skips_only_auxiliary_materialization() -> None:
+    backbone = _small_model().backbone
+    waveform = torch.zeros(1, 2, 1_024)
+
+    with torch.inference_mode():
+        full = backbone(waveform)
+        minimal = backbone(waveform, include_aux_outputs=False)
+
+    assert torch.equal(minimal.pitch_query_features, full.pitch_query_features)
+    assert full.band_features is not None
+    assert full.lowres_band_features is not None
+    assert full.lowres_pitch_query_features is not None
+    assert minimal.band_features is None
+    assert minimal.global_features is None
+    assert minimal.lowres_band_features is None
+    assert minimal.lowres_global_features is None
+    assert minimal.lowres_pitch_query_features is None
 
 
 def test_frame_valid_mask_handles_none_and_rejects_non_vector_lengths() -> None:

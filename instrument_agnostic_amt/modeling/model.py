@@ -203,7 +203,10 @@ class AudioSemiCRFTransformer(nn.Module):
     ) -> dict[str, torch.Tensor | None]:
         if not include_amt:
             raise ValueError("this model exposes only the AMT task")
-        backbone_output = self.backbone(waveform)
+        backbone_output = self.backbone(
+            waveform,
+            include_aux_outputs=include_aux_outputs,
+        )
         pitch_features = backbone_output.pitch_query_features
         frame_valid_mask = self._build_frame_valid_mask(
             batch_size=int(waveform.shape[0]),
