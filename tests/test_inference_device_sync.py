@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from instrument_agnostic_amt.inference import v1_windowed
 from instrument_agnostic_amt.inference.v1_windowed import (
@@ -21,6 +22,7 @@ from instrument_agnostic_amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from instrument_agnostic_amt.modeling.heads.semi_crf import viterbiBackward
 
 
 def _inference_settings(**overrides: object) -> InferenceSettings:
@@ -49,6 +51,26 @@ def _local_scalar_read_count(profiler: profile) -> int:
         for event in profiler.key_averages()
         if event.key == "aten::_local_scalar_dense"
     )
+
+
+class _NonCpuScalarReadCounter(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        if "_local_scalar_dense" in str(func):
+            self.count += sum(
+                int(isinstance(value, torch.Tensor) and value.device.type != "cpu")
+                for value in args
+            )
+        return func(*args, **({} if kwargs is None else kwargs))  # type: ignore[operator]
 
 
 def _small_model() -> AudioSemiCRFTransformer:
@@ -204,6 +226,41 @@ def test_profiler_detects_deliberate_scalar_tensor_read() -> None:
         torch.tensor(1.0).item()
 
     assert _local_scalar_read_count(profiler) == 1
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="MPS上のdevice scalar readを検査するテストです",
+)
+def test_dense_viterbi_reuses_cpu_diagonal_for_final_frame() -> None:
+    score = torch.zeros(4, 4, 3, device="mps")
+    score[-1, -1] = 1.0
+    noise_score = torch.zeros(3, 3, device="mps")
+    counter = _NonCpuScalarReadCounter()
+
+    with counter:
+        decoded = viterbiBackward(score, noise_score)
+
+    assert decoded == [[(3, 3)], [(3, 3)], [(3, 3)]]
+    assert counter.count == 0
+
+
+def test_dense_viterbi_does_not_materialize_transposed_score() -> None:
+    score = torch.zeros(5, 5, 2)
+    score[1, 0] = 2.0
+    score[4, 4] = 1.0
+    noise_score = torch.zeros(4, 2)
+
+    with profile(activities=[ProfilerActivity.CPU]) as profiler:
+        decoded = viterbiBackward(score, noise_score)
+
+    contiguous_count = sum(
+        event.count
+        for event in profiler.key_averages()
+        if event.key == "aten::contiguous"
+    )
+    assert decoded == [[(0, 1), (4, 4)], [(0, 1), (4, 4)]]
+    assert contiguous_count == 0
 
 
 @pytest.mark.skipif(

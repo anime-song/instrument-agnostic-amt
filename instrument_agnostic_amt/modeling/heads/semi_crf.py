@@ -68,12 +68,11 @@ def viterbiBackward(
     q = score.new_zeros(T, nBatch)
     ptr = []
 
-    scoreT = score.transpose(0, 1).contiguous()
     q[T - 1] = score[T - 1, T - 1, :] * (score[T - 1, T - 1, :] > 0)
 
     for offset in range(1, T):
         t = T - offset - 1
-        subScore = scoreT[t, t + 1 :, :]
+        subScore = score[t + 1 :, t, :]
 
         candidates = torch.cat(
             [
@@ -114,7 +113,7 @@ def viterbiBackward(
                 batchResult.append((pos, end))
                 pos = end
 
-        if score[T - 1, T - 1, batchIdx] > 0:
+        if bool(curDiag[T - 1]):
             batchResult.append((T - 1, T - 1))
 
         result.append(batchResult)
