@@ -39,6 +39,7 @@ from instrument_agnostic_amt.instrument_refinement.modeling.model import (
     InstrumentRefinementConfig,
     InstrumentRefinementModel,
 )
+from instrument_agnostic_amt.inference.audio import load_audio
 from instrument_agnostic_amt.instrument_refinement.training.collate import (
     collate_refinement_batch,
 )
@@ -897,6 +898,45 @@ def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
         "acoustic_guitar",
         "distorted_guitar",
     }
+
+
+def test_refinement_uses_preloaded_waveform_without_reloading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "guitar.wav"
+    midi_path = tmp_path / "guitar.mid"
+    _write_audio(audio_path, frequency=330.0)
+    _write_midi(midi_path, pitches=(60,))
+    config = InstrumentRefinementConfig(
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        embedding_size=8,
+        use_gradient_checkpoint=False,
+    )
+    waveform = load_audio(audio_path, target_sample_rate=config.sample_rate)
+    monkeypatch.setattr(
+        "instrument_agnostic_amt.instrument_refinement.inference.refine.load_audio",
+        lambda *_args, **_kwargs: pytest.fail("audio should not be reloaded"),
+    )
+
+    report = refine_midi_instruments(
+        audio_path,
+        midi_path,
+        stem_name="guitar",
+        mode="single",
+        disable_tqdm=True,
+        preloaded_model=_FakeRefinementModel(config),  # type: ignore[arg-type]
+        preloaded_config=config,
+        preloaded_waveform=waveform,
+    )
+
+    assert report["note_count"] == 1
 
 
 def test_refinement_window_batch_pads_empty_note_windows_without_output_changes(

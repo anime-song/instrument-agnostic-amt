@@ -498,6 +498,7 @@ def refine_midi_instruments(
     disable_tqdm: bool = False,
     preloaded_model: InstrumentRefinementModel | None = None,
     preloaded_config: InstrumentRefinementConfig | None = None,
+    preloaded_waveform: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """MIDI の楽器を、対応するステム音声から推論し直す。
 
@@ -513,6 +514,7 @@ def refine_midi_instruments(
         global_logit_weight: 曲全体の傾向をクラスタ判定に足す量。0 なら足さない。
         use_stem_mask: stem_name に基づく候補の絞り込みを行うか。
         preloaded_model/preloaded_config: 読み込み済みモデルを使い回す場合に両方渡す。
+        preloaded_waveform: config.sample_rateへresample済みのCPU float32ステレオ波形。
 
     Returns:
         予測結果とデバッグ情報を含む dict。output_json_path を渡すと同じ内容を保存する。
@@ -537,7 +539,16 @@ def refine_midi_instruments(
     )
 
     # 2. 音声と MIDI を読み、楽器の候補集合を決める。
-    waveform = load_audio(audio_file, target_sample_rate=config.sample_rate)
+    if preloaded_waveform is None:
+        waveform = load_audio(audio_file, target_sample_rate=config.sample_rate)
+    else:
+        waveform = preloaded_waveform
+        if waveform.device.type != "cpu":
+            raise ValueError("preloaded_waveform must be on CPU")
+        if waveform.dtype != torch.float32:
+            raise ValueError("preloaded_waveform must have dtype float32")
+        if waveform.ndim != 2 or int(waveform.shape[0]) != 2:
+            raise ValueError("preloaded_waveform must have shape [2, T]")
     notes = load_refinement_note_table(midi_file)
     allowed = _allowed_class_ids(stem_name, use_stem_mask=use_stem_mask)
 

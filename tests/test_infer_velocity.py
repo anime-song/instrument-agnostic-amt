@@ -177,6 +177,51 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
+def test_predict_velocity_uses_preloaded_waveforms_without_reloading(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    preloaded_waveforms = {
+        stem_name: torch.from_numpy(
+            velocity_infer._load_and_preprocess_audio(
+                audio_path,
+                target_sample_rate=22_050,
+            )
+        ).contiguous()
+        for stem_name, audio_path in mock_audio_stems.items()
+    }
+    waveform_copies = {
+        stem_name: waveform.clone()
+        for stem_name, waveform in preloaded_waveforms.items()
+    }
+    monkeypatch.setattr(
+        velocity_infer,
+        "_load_and_preprocess_audio",
+        lambda *_args, **_kwargs: pytest.fail("audio should not be reloaded"),
+    )
+    output_path = tmp_path / "preloaded_velocity.mid"
+
+    result = predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        preloaded_waveforms=preloaded_waveforms,
+    )
+
+    assert result == output_path
+    assert all(
+        torch.equal(preloaded_waveforms[name], waveform_copies[name])
+        for name in preloaded_waveforms
+    )
+
+
 def test_velocity_compile_uses_regional_forward_for_full_and_partial_windows(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
