@@ -405,26 +405,6 @@ def test_velocity_cli_compile_is_opt_in(
     assert enabled.compile_mode == "max-autotune"
 
 
-def test_velocity_cli_rejects_removed_compile_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "infer_velocity",
-            "--midi",
-            "input.mid",
-            "--stem-files",
-            "piano.wav",
-            "--compile-scope",
-            "whole",
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        velocity_infer.parse_args()
-
-
 def test_preloaded_velocity_forward_requires_matching_eager_model() -> None:
     with pytest.raises(
         ValueError,

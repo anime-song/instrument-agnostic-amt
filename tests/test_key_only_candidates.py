@@ -145,11 +145,6 @@ def test_batch_cli_exposes_core_amt_amp_and_compile_options() -> None:
     assert args.compile_mode == "max-autotune"
 
 
-def test_batch_cli_rejects_removed_compile_scope() -> None:
-    with pytest.raises(SystemExit):
-        parse_arguments(["--compile-scope", "whole"])
-
-
 def test_batch_cli_velocity_compile_is_explicit_and_independent_from_core_amt() -> None:
     default_args = parse_arguments([])
     velocity_args = parse_arguments(

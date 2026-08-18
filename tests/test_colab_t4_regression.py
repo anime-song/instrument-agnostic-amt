@@ -6,7 +6,8 @@ import pytest
 from scripts import colab_t4_regression
 
 
-EXPECTED_COMMIT = "0c254ecd7a393a4cc7499c28eced2d261a6c479d"
+# 大文字小文字を区別しない比較も検証できるよう、英字を含める。
+TEST_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
 def test_parse_args_requires_expected_commit() -> None:
@@ -20,14 +21,14 @@ def test_parse_args_uses_upstream_repository_by_default() -> None:
             "--branch",
             "topic",
             "--expected-commit",
-            EXPECTED_COMMIT,
+            TEST_COMMIT,
         ]
     )
 
     assert args.repo_url == (
         "https://github.com/anime-song/instrument-agnostic-amt.git"
     )
-    assert args.expected_commit == EXPECTED_COMMIT
+    assert args.expected_commit == TEST_COMMIT
 
 
 def test_parse_args_rejects_non_full_commit_sha() -> None:
@@ -37,7 +38,7 @@ def test_parse_args_rejects_non_full_commit_sha() -> None:
                 "--branch",
                 "topic",
                 "--expected-commit",
-                "0c254ec",
+                TEST_COMMIT[:7],
             ]
         )
 
@@ -48,14 +49,14 @@ def test_verify_expected_commit_accepts_exact_head(
     monkeypatch.setattr(
         colab_t4_regression,
         "_capture",
-        lambda *args, **kwargs: EXPECTED_COMMIT,
+        lambda *args, **kwargs: TEST_COMMIT,
     )
 
     actual = colab_t4_regression._verify_expected_commit(
-        Path("/tmp/repository"), EXPECTED_COMMIT.upper()
+        Path("/tmp/repository"), TEST_COMMIT.upper()
     )
 
-    assert actual == EXPECTED_COMMIT
+    assert actual == TEST_COMMIT
 
 
 def test_verify_expected_commit_rejects_different_head(
@@ -70,7 +71,7 @@ def test_verify_expected_commit_rejects_different_head(
 
     with pytest.raises(RuntimeError, match="does not match expected commit"):
         colab_t4_regression._verify_expected_commit(
-            Path("/tmp/repository"), EXPECTED_COMMIT
+            Path("/tmp/repository"), TEST_COMMIT
         )
 
 
@@ -84,7 +85,7 @@ def test_main_stops_before_dependency_install_when_commit_mismatches(
         lambda: argparse.Namespace(
             repo_url="https://example.invalid/repository.git",
             branch="topic",
-            expected_commit=EXPECTED_COMMIT,
+            expected_commit=TEST_COMMIT,
         ),
     )
     monkeypatch.setattr(

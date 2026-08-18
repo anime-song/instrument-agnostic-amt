@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import weakref
-from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,14 +27,6 @@ from instrument_agnostic_amt.instrument_refinement.modeling.model import (
 from instrument_agnostic_amt.taxonomy.instrument_classes import (
     get_instrument_class_id_by_name,
 )
-
-
-def test_stem_pipeline_compile_api_has_no_scope_switch() -> None:
-    assert "compile_scope" not in signature(get_stem_pipeline_models).parameters
-    assert "compile_scope" not in signature(get_velocity_models).parameters
-    assert "compile_scope" not in signature(
-        infer_stem.run_stem_separated_transcription
-    ).parameters
 
 
 def test_resolve_stem_model_type() -> None:

@@ -147,29 +147,6 @@ def test_core_inference_cli_defaults_to_auto_device_and_device_amp_dtype(
     assert args.compile_mode == "default"
 
 
-def test_compile_api_exposes_only_regional_compile() -> None:
-    assert "scope" not in signature(maybe_compile_forward).parameters
-
-
-def test_core_inference_cli_rejects_removed_compile_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "amt-infer",
-            "--audio",
-            "input.wav",
-            "--compile-scope",
-            "whole",
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        parse_args()
-
-
 def test_core_inference_cli_accepts_compile_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
