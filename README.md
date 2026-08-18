@@ -206,11 +206,11 @@ instrument_agnostic_amt/
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from the committed `uv.lock`
 - One of the following devices:
-  - NVIDIA GPU (12GB+ VRAM recommended; on Linux the lockfile installs CUDA 13.0 wheels)
+  - NVIDIA GPU (12GB+ VRAM recommended; on Linux and Windows the lockfile installs CUDA 13.0 wheels)
   - Apple Silicon Mac on macOS 14+ (MPS backend; PyTorch 2.13 has no wheels for Intel Macs)
   - CPU (works, but slow)
 
-> On Windows the lockfile currently resolves to CPU-only PyTorch wheels.
+> The Windows CUDA 13.0 wheel resolution is covered by the lockfile and configuration tests, but has not been run on a Windows CUDA host in this PR.
 
 ```bash
 # Clone
@@ -248,26 +248,48 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/t
 
 ### CUDA regression on Colab (Tesla T4)
 
-[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) reproduces the CUDA regression suite on a Colab GPU runtime: it clones the requested branch, verifies that the checked-out HEAD matches the required `--expected-commit` (a full 40-character SHA) before installing anything, installs the locked dependencies with `uv sync --locked --all-extras`, asserts that the runtime GPU is a Tesla T4, and runs the full test suite plus the CUDA compile regression. `--repo-url` defaults to the upstream repository, so a run is always tied to a known, pinned commit. On a fresh T4 runtime:
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) reproduces the CUDA regression suite inside a Colab Linux GPU runtime: it clones the requested branch, verifies that the checked-out HEAD matches the required `--expected-commit` (a full 40-character SHA) before installing anything, installs the locked dependencies with `uv sync --locked --all-extras`, asserts that the runtime GPU is a Tesla T4, and runs the full test suite plus the CUDA compile regression. It is not intended to run directly on a non-CUDA local machine. `--repo-url` defaults to the upstream repository, so a run is always tied to a known, pinned commit. The repository must be reachable over public HTTPS; do not put credentials in `--repo-url`, because executed commands are printed to the log.
+
+In the browser version of Colab, enable a T4 runtime and paste the following into one code cell. `%%bash` makes the cell run as a shell script, and the runner itself is downloaded from the same pinned commit that it tests:
 
 ```bash
+%%bash
+set -euo pipefail
 # Resolve and pin the commit you intend to test (full 40-character SHA)
 EXPECTED_COMMIT=$(git ls-remote https://github.com/anime-song/instrument-agnostic-amt.git refs/heads/main | cut -f1)
-curl -LO https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/main/scripts/colab_t4_regression.py
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
 ```
 
-To verify a fork branch before it is merged, fetch the script from that branch and pass the fork explicitly via `--repo-url`, with `--expected-commit` set to the full 40-character SHA of the branch head under test:
+To verify a public fork branch before it is merged, use the same one-cell pattern. Fetch the script from the pinned commit rather than from the moving branch name, and pass the fork explicitly via `--repo-url`:
 
 ```bash
+%%bash
+set -euo pipefail
 FORK_OWNER=YOUR_GITHUB_USER
 FORK_REPO=YOUR_FORK_REPO
 BRANCH=your-branch
 # Paste the 40-character SHA announced for review; do not derive it from the live branch head.
 EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
-curl -L -o colab_t4_regression.py \
-  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${BRANCH}/scripts/colab_t4_regression.py"
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py \
+  --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
+```
+
+The same runner can be launched from any local OS with the Colab CLI installed and OAuth-authenticated. `colab run` sends the script to a fresh T4 VM and releases the VM on success or failure:
+
+```bash
+FORK_OWNER=YOUR_GITHUB_USER
+FORK_REPO=YOUR_FORK_REPO
+BRANCH=your-branch
+EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
+curl -fL -o /tmp/colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
+colab run --gpu T4 --timeout 3600 /tmp/colab_t4_regression.py \
   --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
   --branch "$BRANCH" \
   --expected-commit "$EXPECTED_COMMIT"

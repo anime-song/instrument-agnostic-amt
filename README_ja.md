@@ -207,11 +207,11 @@ instrument_agnostic_amt/
 - [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
 - PyTorch 2.13.0 / torchaudio 2.11.0 — コミット済みの `uv.lock` から自動でインストールされます
 - 以下のいずれかのデバイス:
-  - NVIDIA GPU（VRAM 12GB 以上推奨。Linux ではロックファイルが CUDA 13.0 の wheel をインストールします）
+  - NVIDIA GPU（VRAM 12GB 以上推奨。Linux / Windows ではロックファイルが CUDA 13.0 の wheel をインストールします）
   - Apple Silicon Mac（macOS 14 以降、MPS バックエンド。PyTorch 2.13 は Intel Mac 向け wheel を提供していません）
   - CPU（動きますが遅いです）
 
-> Windows では、現在のロックファイルは CPU 版の PyTorch wheel に解決されます。
+> Windows 向け CUDA 13.0 wheel の解決はロックファイルと設定テストで確認していますが、この PR では Windows CUDA 実機での実行は未検証です。
 
 ```bash
 # クローン
@@ -249,26 +249,48 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py tests/t
 
 ### Colab（Tesla T4）での CUDA 回帰テスト
 
-[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) は、Colab の GPU ランタイム上で CUDA 回帰テスト一式を再現します。指定ブランチをクローンし、必須の `--expected-commit`（完全な 40 桁 commit SHA）とクローン直後の HEAD が一致することを検証してから（不一致なら依存関係のインストールへ進まず停止します）、`uv sync --locked --all-extras` でロック済み依存をインストールし、ランタイムの GPU が Tesla T4 であることを確認したうえで、テストスイート全体と CUDA compile 回帰を実行します。`--repo-url` の既定値は upstream リポジトリなので、実行結果は必ず既知のコミットに紐づきます。新しい T4 ランタイムで:
+[`scripts/colab_t4_regression.py`](scripts/colab_t4_regression.py) は、Colab の Linux GPU ランタイム内で CUDA 回帰テスト一式を再現します。指定ブランチをクローンし、必須の `--expected-commit`（完全な 40 桁 commit SHA）とクローン直後の HEAD が一致することを検証してから（不一致なら依存関係のインストールへ進まず停止します）、`uv sync --locked --all-extras` でロック済み依存をインストールし、ランタイムの GPU が Tesla T4 であることを確認したうえで、テストスイート全体と CUDA compile 回帰を実行します。CUDA のないローカルPC上で直接実行する用途ではありません。`--repo-url` の既定値は upstream リポジトリなので、実行結果は必ず既知のコミットに紐づきます。対象リポジトリは公開HTTPSで取得できる必要があります。実行コマンドはログに表示されるため、`--repo-url`へ認証情報を埋め込まないでください。
+
+ブラウザ版ColabではT4ランタイムを有効にし、次の内容を1つのコードセルへ貼り付けます。`%%bash`によりセル全体をシェルとして実行し、runner本体もテスト対象と同じ固定コミットから取得します:
 
 ```bash
+%%bash
+set -euo pipefail
 # テスト対象のコミットを完全な40桁SHAとして固定する
 EXPECTED_COMMIT=$(git ls-remote https://github.com/anime-song/instrument-agnostic-amt.git refs/heads/main | cut -f1)
-curl -LO https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/main/scripts/colab_t4_regression.py
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/anime-song/instrument-agnostic-amt/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
 ```
 
-マージ前のフォークブランチを検証する場合は、そのブランチからスクリプトを取得し、`--repo-url` でフォーク URL を明示したうえで、`--expected-commit` にテストしたいブランチ HEAD の完全な 40 桁 SHA を渡します:
+マージ前の公開フォークブランチを検証する場合も、同じ1セル形式を使います。移動するブランチ名ではなく固定コミットからスクリプトを取得し、`--repo-url`でフォークURLを明示します:
 
 ```bash
+%%bash
+set -euo pipefail
 FORK_OWNER=YOUR_GITHUB_USER
 FORK_REPO=YOUR_FORK_REPO
 BRANCH=your-branch
 # レビュー対象として告知された 40 桁 SHA を確認して貼り付けます（branch HEAD から自動取得しないでください）。
 EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
-curl -L -o colab_t4_regression.py \
-  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${BRANCH}/scripts/colab_t4_regression.py"
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py \
+  --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
+```
+
+Colab CLIをインストールしてOAuth認証済みであれば、ローカルOSを問わず同じrunnerを起動できます。`colab run`はスクリプトを新しいT4 VMへ送り、成功時・失敗時のどちらでもVMを解放します:
+
+```bash
+FORK_OWNER=YOUR_GITHUB_USER
+FORK_REPO=YOUR_FORK_REPO
+BRANCH=your-branch
+EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
+curl -fL -o /tmp/colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
+colab run --gpu T4 --timeout 3600 /tmp/colab_t4_regression.py \
   --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
   --branch "$BRANCH" \
   --expected-commit "$EXPECTED_COMMIT"
