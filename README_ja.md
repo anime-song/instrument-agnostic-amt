@@ -47,6 +47,7 @@
 
 | 日付 | 内容 |
 |---|---|
+| 2026-08-18 | ⚡ 依存管理を uv と PyTorch 2.13 へ移行し、MPS 推論とオプトインの AMP/regional compile を追加しました。あわせて推論パイプラインの device 同期・一時コピー・分離ステム音声の再読込を削減しました。同じ PyTorch 2.13 の FP32 eager 環境では、最適化後も生成された 13 個の MIDI 成果物がバイト単位で一致しています。 |
 | 2026-08-09 | 🎹 分離ステムを使って AMT のノートに楽器クラスを振り直す Instrument Refinement モデルを追加しました。音色の近いものを同じクラスにまとめるので、1 曲の中で楽器がころころ入れ替わることが減り、手作業で修正する際の一貫性が高くなります。学習に使っていない RWC-I ベンチマークでは全体の top-1 が 71.3% から 74.5% に向上しましたが、**楽器単体で見ると上がったものと下がったものがあります**。楽器ごとの増減と、どの楽器がどの楽器に間違われるかは [RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK_ja.md) を参照してください。 |
 | 2026-07-30 | ビート・コード・キーの推論モデルをパイプラインに追加しました。デフォルトでは無効になっています。 |
 | 2026-07-24 | 分離ステムからノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
@@ -260,11 +261,17 @@ python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
 マージ前のフォークブランチを検証する場合は、そのブランチからスクリプトを取得し、`--repo-url` でフォーク URL を明示したうえで、`--expected-commit` にテストしたいブランチ HEAD の完全な 40 桁 SHA を渡します:
 
 ```bash
-curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
+FORK_OWNER=YOUR_GITHUB_USER
+FORK_REPO=YOUR_FORK_REPO
+BRANCH=your-branch
+# レビュー対象として告知された 40 桁 SHA を確認して貼り付けます（branch HEAD から自動取得しないでください）。
+EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
+curl -L -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${BRANCH}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py \
-  --repo-url https://github.com/ntamotsu/fork-instrument-agnostic-amt.git \
-  --branch codex/mps-inference \
-  --expected-commit FULL_40_CHARACTER_SHA
+  --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
 ```
 
 このスクリプトは Colab 無料枠の Tesla T4（ロック済みの PyTorch 2.13.0 / CUDA 13.0 wheel）で完走済みで、テストスイート全体とオプトインの CUDA compile 回帰の両方がパスしています。
@@ -535,9 +542,9 @@ python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity  
 
 保証値ではなく 1 つの実測例です。202.8 秒のポップス楽曲 1 曲を事前に 6 ステムへ分離しておき、M4 Pro（macOS 15.3.1、PyTorch 2.13.0）でステムワークフロー全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）を実行しました。ステム分離・チェックポイントのダウンロード・import は計時に含めていません。
 
-- **新しいプロセスで 1 曲だけ処理（通常の CLI 利用）** — FP32 で `--compile --compile-velocity` を付けると 135.7 秒、以前の FP32 eager 単発実行は 154.5 秒でした（コンパイルは最初のウィンドウ処理中に走ります）。今回の単発の再測定では 2 回目のプロセスに改善を観測しなかったため、Inductor のディスクキャッシュによる短縮は前提にしないでください。
-- **モデルを常駐させた場合（バッチ処理・長時間セッションの定常状態）** — ウォームアップ 1 曲後の同一プロセス 3 回計測の中央値で、FP32 の regional コンパイルは FP32 eager の 142.7 秒を 124.1 秒（−13%）に短縮しました。ウォームアップ後の再コンパイルは発生していません。
-- **出力の一致度**（同じパイプラインの FP32 eager 出力との比較で、正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ノート時刻の差は最大 0.26 ms でした。velocity の全値と chord/tempo/key の列は一致しています。
+- **新しいプロセスで 1 曲だけ処理（通常の CLI 利用）** — 素の FP32 eager で全体 129.4 秒、AMT 6 ステージの合計は 62.8 秒でした。さらにその後の変更で、ステムワークフローは読み込み済みの波形を AMT・instrument refinement・velocity の段階間で再利用するようになり、WAV の再読込とリサンプルが 1 曲あたり約 2.4 秒減ります（上の 129.4 秒には含まれていません）。
+- **regional compile（`--compile --compile-velocity`）** — 現在のコードでは再計測していません。以前のリビジョン（2026-08、上記の eager 経路高速化より前）では、モデル常駐の定常状態で FP32 regional compile が当時の eager 比で約 13% 高速で、新しいプロセスでの 1 曲だけの実測も短縮しました。2 回目の新規プロセスでは Inductor のディスクキャッシュによる追加の短縮は確認できませんでした。デバイスとリビジョンに依存するため、有効化する前に実際のワークロードで計測してください。
+- **compile 出力の一致度**（以前のリビジョンでの測定で、同じパイプラインの FP32 eager 出力との比較。正解 MIDI に対する精度ではありません） — FP32 regional は raw ノート 9,052 個すべてが対応（micro F1 100%）し、ノート時刻の差は最大 0.26 ms、velocity の全値と chord/tempo/key の列は一致しました。
 
 > **Note**: 推論時の Attention 精度の変更（AMP なしの推論は完全に FP32 のままになり、fp16/bf16 の autocast は Attention の計算にも届くようになりました）以降、MPS の fp16/bf16 は再計測していないため、この例には MPS の AMP の数値を載せていません。上の FP32 の数値はこの変更の影響を受けません。現在のコードでの AMP の実測は、下の Tesla T4 の例を参照してください。
 
@@ -557,7 +564,7 @@ M4 の例と同じ楽曲・同じ計測範囲です。202.8 秒の楽曲を事�
 - **品質優先** — FP32 eager（追加フラグなし）。上記のような出力差分の注意が付かない構成です。
 - **CUDA で 1 曲だけ速くしたい** — `--amp` のみ追加（T4 では fp16）。計測した曲では約 12% 速くなりました。`--compile` は 1 曲だけのプロセスでは元が取れないので付けないでください。
 - **モデルを常駐させて 6 曲以上を処理** — `--amp --compile --compile-velocity` を追加。T4 では同一プロセス約 6 曲でコンパイル費用を回収し、以降は fp16 eager よりエンドツーエンドで約 5% 速くなりました。
-- **FP32 + `--compile`** — M4 の定常状態では有効（−13%）でしたが、T4 では明確な効果を確認できませんでした。デバイス依存と考えて、先に計測してください。
+- **FP32 + `--compile`** — 以前のリビジョンの M4 定常状態では有効（約 −13%）でしたが、eager 経路が速くなった後は再計測していません。T4 では明確な効果を確認できませんでした。デバイスとリビジョンに依存するため、先に計測してください。
 
 ### Google Colab のステム分離ワークフロー
 

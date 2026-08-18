@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-08-18 | ⚡ Moved dependency management to uv and PyTorch 2.13, added MPS inference and opt-in AMP/regional compile, and reduced device synchronization, temporary copies, and repeated stem-audio loading across the inference pipeline. In the same PyTorch 2.13 FP32 eager environment, all 13 generated MIDI artifacts remained byte-identical after the optimizations. |
 | 2026-08-09 | 🎹 Added the Instrument Refinement model, which re-assigns instrument classes to AMT notes using the separated stem audio. It pulls timbrally close sounds onto a single class, so the instrument stops flickering within a piece and manual clean-up gets easier. Overall top-1 on the held-out RWC-I benchmark improves from 71.3% to 74.5%, but **individual instruments both gain and lose** — see [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md) for the per-instrument breakdown and what each instrument is confused with. |
 | 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
 | 2026-07-24 | Added a dedicated velocity prediction model that estimates per-note dynamics from separated stem audio. The Colab stem-separated workflow now enables velocity prediction by default and automatically downloads the velocity checkpoint from Hugging Face. |
@@ -259,11 +260,17 @@ python colab_t4_regression.py --branch main --expected-commit "$EXPECTED_COMMIT"
 To verify a fork branch before it is merged, fetch the script from that branch and pass the fork explicitly via `--repo-url`, with `--expected-commit` set to the full 40-character SHA of the branch head under test:
 
 ```bash
-curl -LO https://raw.githubusercontent.com/ntamotsu/fork-instrument-agnostic-amt/codex/mps-inference/scripts/colab_t4_regression.py
+FORK_OWNER=YOUR_GITHUB_USER
+FORK_REPO=YOUR_FORK_REPO
+BRANCH=your-branch
+# Paste the 40-character SHA announced for review; do not derive it from the live branch head.
+EXPECTED_COMMIT=FULL_40_CHARACTER_SHA
+curl -L -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${FORK_OWNER}/${FORK_REPO}/${BRANCH}/scripts/colab_t4_regression.py"
 python colab_t4_regression.py \
-  --repo-url https://github.com/ntamotsu/fork-instrument-agnostic-amt.git \
-  --branch codex/mps-inference \
-  --expected-commit FULL_40_CHARACTER_SHA
+  --repo-url "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
 ```
 
 This script has been run to completion on a free-tier Colab Tesla T4 with the locked PyTorch 2.13.0 / CUDA 13.0 wheels: the full test suite and the opt-in CUDA compile regression both passed.
@@ -539,9 +546,9 @@ python infer_velocity.py --midi song.mid --stems-dir stems/ --compile-velocity  
 
 One data point, not a guarantee: a 202.8-second pop song, pre-separated into six stems in advance, on an M4 Pro (macOS 15.3.1, PyTorch 2.13.0). The timed run is the full stem workflow — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, beat/chord/key — excluding stem separation, checkpoint downloads, and imports.
 
-- **Fresh process, one song (typical CLI use)** — FP32 with `--compile --compile-velocity` took 135.7 s versus 154.5 s for an earlier FP32 eager run, with compilation happening during the first windows. A single repeat in a second fresh process showed no improvement in these runs, so don't assume a benefit from Inductor's on-disk cache.
-- **Model kept loaded (steady state for batch runs and long sessions)** — median of three same-process repeats after one warm-up song: FP32 regional compile brought 142.7 s down to 124.1 s (−13%) versus FP32 eager. No recompilation occurred after warm-up.
-- **Output agreement** (versus the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%), with note timings equal to within a maximum difference of 0.26 ms; every velocity value and the chord/tempo/key sequences were identical.
+- **Fresh process, one song (typical CLI use)** — plain FP32 eager took 129.4 s end-to-end, with the six AMT stages totalling 62.8 s. A later change also lets the stem workflow reuse each stem's decoded waveform across the AMT, instrument-refinement, and velocity stages, removing a further ~2.4 s of repeated WAV loading and resampling per song (not included in the 129.4 s above).
+- **Regional compile (`--compile --compile-velocity`)** — not yet re-measured on the current code. On an earlier revision of this workflow (2026-08, before the eager-path speedups above), FP32 regional compile was about 13% faster than that revision's eager baseline in the model-resident steady state and also shortened the measured fresh single-song run. A second fresh process showed no further benefit from the Inductor disk cache. Treat compile as device- and revision-dependent and benchmark your own workload before enabling it.
+- **Compile output agreement** (measured on that earlier revision, against the FP32 eager output of the same pipeline — not ground-truth accuracy) — FP32 regional matched all 9,052 raw notes (micro F1 100%), note timings agreed within 0.26 ms, and every velocity value and the chord/tempo/key sequences were identical.
 
 > **Note**: MPS fp16/bf16 has not been re-measured since a change to inference attention precision (no-AMP inference now stays fully in FP32, and explicit fp16/bf16 autocast now reaches the attention math), so this example intentionally lists no MPS AMP figures. The FP32 figures above are unaffected by that change. For AMP measurements on the current code, see the Tesla T4 example below.
 
@@ -561,7 +568,7 @@ Every performance option above stays opt-in and off by default; when in doubt, r
 - **Quality first** — FP32 eager (no extra flags). Its output carries none of the parity caveats above.
 - **Speed for a single song on CUDA** — add `--amp` only (fp16 on a T4). On the measured song this was about 12% faster; skip `--compile`, which does not pay for itself in a one-song process.
 - **Model-resident batches of about six songs or more** — add `--amp --compile --compile-velocity`. On the T4, compilation broke even after roughly six songs in one process and then ran about 5% faster end-to-end than fp16 eager.
-- **FP32 with `--compile`** — helped in steady state on the M4 (−13%) but showed no clear benefit on the T4; treat it as device-dependent and measure first.
+- **FP32 with `--compile`** — helped in steady state on the M4 (about −13%, on an earlier revision) but has not been re-measured since the eager path became faster, and showed no clear benefit on the T4. Treat it as device- and revision-dependent and measure first.
 
 ### Stem-separated workflow in Google Colab
 
