@@ -228,25 +228,6 @@ def decode_v1_notes(
         valid_length_values = tuple(
             int(value) for value in valid_lengths.detach().cpu().tolist()
         )
-        forced_start_positions: list[list[int]] = []
-        for batch_index, window_start in enumerate(active_starts):
-            valid_model_frames = valid_length_values[batch_index]
-            window_model_start = int(
-                round(float(window_start) / float(config.hop_length))
-            )
-            forced_start_positions.append(
-                [
-                    max(
-                        0,
-                        min(
-                            int(last_closed_global_model_frames[track])
-                            - window_model_start,
-                            valid_model_frames - 1,
-                        ),
-                    )
-                    for track in range(track_count)
-                ]
-            )
         decode_intervals = (
             decode_pitch_intervals_sparse
             if settings.semi_crf_sparse_decode
@@ -263,43 +244,88 @@ def decode_v1_notes(
             if settings.semi_crf_sparse_decode
             else {}
         )
-        decoded_batch = decode_intervals(
-            outputs["interval_query"],
-            outputs["interval_key"],
-            outputs["interval_diag"],
-            valid_lengths,
-            length_scaling=config.semi_crf_length_scaling,
-            length_penalty=config.semi_crf_length_penalty,
-            note_bias=settings.note_bias,
-            track_batch_size=settings.track_batch_size,
-            forced_start_pos=forced_start_positions,
-            **sparse_options,
-        )
+        interval_features = outputs.get("interval_features")
+        instrument_features = outputs.get("instrument_features")
+        frame_logits = outputs.get("instrument_logits")
+        decoded_batch: list[list[list[tuple[int, int]]]] = []
+        boundary_maps: list[
+            dict[tuple[int, int, int], tuple[bool, bool, float, float]]
+        ] = []
+
+        for batch_index, (window_start, valid_frames) in enumerate(
+            zip(active_starts, active_valid)
+        ):
+            valid_model_frames = valid_length_values[batch_index]
+            window_model_start = int(
+                round(float(window_start) / float(config.hop_length))
+            )
+            forced_start_positions = [
+                [
+                    max(
+                        0,
+                        min(
+                            int(last_closed_global_model_frames[track])
+                            - window_model_start,
+                            valid_model_frames - 1,
+                        ),
+                    )
+                    for track in range(track_count)
+                ]
+            ]
+            decoded_sample = decode_intervals(
+                outputs["interval_query"][batch_index : batch_index + 1],
+                outputs["interval_key"][batch_index : batch_index + 1],
+                outputs["interval_diag"][batch_index : batch_index + 1],
+                valid_lengths[batch_index : batch_index + 1],
+                length_scaling=config.semi_crf_length_scaling,
+                length_penalty=config.semi_crf_length_penalty,
+                note_bias=settings.note_bias,
+                track_batch_size=settings.track_batch_size,
+                forced_start_pos=forced_start_positions,
+                **sparse_options,
+            )
+            sample_decoded_interval_count = sum(
+                len(intervals) for intervals in decoded_sample[0]
+            )
+            decoded_intervals += sample_decoded_interval_count
+            decoded_batch.append(decoded_sample[0])
+
+            boundary_map = {}
+            if (
+                settings.use_boundary_head
+                and model.supports_interval_boundaries()
+                and interval_features is not None
+            ):
+                logits, entries = model.predict_interval_boundaries(
+                    interval_features[batch_index : batch_index + 1],
+                    decoded_sample,
+                    compute_dtype=torch.float32,
+                )
+                boundary_map = _decode_boundary_map(logits, entries)
+                boundary_count += len(entries)
+                for has_onset, has_offset, _, _ in boundary_map.values():
+                    boundary_no_onset += int(not has_onset)
+                    boundary_no_offset += int(not has_offset)
+            boundary_maps.append(boundary_map)
+
+            for track, intervals in enumerate(decoded_sample[0]):
+                for interval_index, (begin, end) in enumerate(intervals):
+                    key = (0, track, interval_index)
+                    boundary_flag = boundary_map.get(key)
+                    has_offset = (
+                        bool(boundary_flag[1])
+                        if boundary_flag is not None
+                        else int(end) < valid_model_frames - 1
+                    )
+                    if has_offset:
+                        last_closed_global_model_frames[track] = (
+                            window_model_start + int(end)
+                        )
+
         batch_decoded_interval_count = sum(
             len(intervals) for sample in decoded_batch for intervals in sample
         )
-        decoded_intervals += batch_decoded_interval_count
-
-        boundary_map = {}
-        interval_features = outputs.get("interval_features")
-        if (
-            settings.use_boundary_head
-            and model.supports_interval_boundaries()
-            and interval_features is not None
-        ):
-            logits, entries = model.predict_interval_boundaries(
-                interval_features,
-                decoded_batch,
-                compute_dtype=torch.float32,
-            )
-            boundary_map = _decode_boundary_map(logits, entries)
-            boundary_count += len(entries)
-            for has_onset, has_offset, _, _ in boundary_map.values():
-                boundary_no_onset += int(not has_onset)
-                boundary_no_offset += int(not has_offset)
-
         instrument_map = {}
-        instrument_features = outputs.get("instrument_features")
         if (
             model.supports_interval_instruments()
             and model._use_interval_instrument_head
@@ -317,7 +343,6 @@ def decode_v1_notes(
                 allowed_instrument_ids=candidate_instrument_ids,
             )
 
-        frame_logits = outputs.get("instrument_logits")
         fallback_instrument_map = (
             _decode_frame_instrument_map(
                 frame_logits,
@@ -337,33 +362,23 @@ def decode_v1_notes(
             zip(active_starts, active_valid)
         ):
             valid_model_frames = valid_length_values[batch_index]
+            boundary_map = boundary_maps[batch_index]
             for track, intervals in enumerate(decoded_batch[batch_index]):
                 pitch_index = track // int(config.num_pitch_slots)
                 slot_index = track % int(config.num_pitch_slots)
                 for interval_index, (begin, end) in enumerate(intervals):
-                    key = (batch_index, track, interval_index)
-                    boundary_flag = boundary_map.get(key)
-                    predicted = instrument_map.get(key)
+                    local_key = (0, track, interval_index)
+                    batch_key = (batch_index, track, interval_index)
+                    boundary_flag = boundary_map.get(local_key)
+                    predicted = instrument_map.get(batch_key)
                     if predicted is None:
-                        predicted = fallback_instrument_map.get(key)
+                        predicted = fallback_instrument_map.get(batch_key)
                     if predicted is None:
                         predicted = (
                             candidate_instrument_ids[0],
                             candidate_instrument_ids,
                         )
                     instrument, candidates = predicted
-                    has_offset = (
-                        bool(boundary_flag[1])
-                        if boundary_flag is not None
-                        else int(end) < valid_model_frames - 1
-                    )
-                    if has_offset:
-                        window_model_start = int(
-                            round(float(window_start) / float(config.hop_length))
-                        )
-                        last_closed_global_model_frames[track] = (
-                            window_model_start + int(end)
-                        )
                     pair_id = instrument * NUM_PITCHES + pitch_index
                     note = stitcher._build_interval_note(
                         pair_id=pair_id,
