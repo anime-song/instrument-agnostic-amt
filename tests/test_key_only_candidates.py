@@ -117,7 +117,7 @@ def test_checkpoint_auto_resolution_prefers_current_mtime(tmp_path: Path) -> Non
         ("bass", "bass_v2"),
         ("vocals", "vocal_harmony"),
         ("guitar", "guitar_v1_5"),
-        ("other", "other"),
+        ("other", "other_v1_5"),
         ("piano", "default"),
     ],
 )

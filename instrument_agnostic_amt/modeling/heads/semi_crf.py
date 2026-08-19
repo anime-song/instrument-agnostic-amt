@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
@@ -15,6 +17,19 @@ Refactor notes:
 Interval = Tuple[int, int]
 IntervalBatch = List[List[Interval]]
 PitchIntervalBatch = List[IntervalBatch]
+
+
+@dataclass(frozen=True)
+class _FactorizedTrackComponents:
+    """Pitch-shared and track-specific projections for one selected-pair chunk."""
+
+    unique_pitch_query: torch.Tensor
+    unique_pitch_key: torch.Tensor
+    source_inverse: torch.Tensor
+    begin_adjustment: torch.Tensor
+    end_adjustment: torch.Tensor
+    instrument_constant: torch.Tensor
+    track_diag: torch.Tensor
 
 
 @torch.jit.script
@@ -548,6 +563,312 @@ def _build_interval_score(
     return score
 
 
+def _validate_factorized_interval_inputs(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+) -> tuple[int, int, int, int, int]:
+    if pitch_query.shape != pitch_key.shape or pitch_query.dim() != 4:
+        raise ValueError(
+            "pitch_query and pitch_key must share shape [B, T, P, D]"
+        )
+    batch_size, time_steps, num_pitches, head_dim = pitch_query.shape
+    if pitch_diag.shape != (batch_size, time_steps, num_pitches):
+        raise ValueError("pitch_diag must have shape [B, T, P]")
+    if instrument_query.shape != instrument_key.shape or instrument_query.dim() != 2:
+        raise ValueError(
+            "instrument_query and instrument_key must share shape [I, D]"
+        )
+    num_instruments = int(instrument_query.shape[0])
+    if int(instrument_query.shape[1]) != int(head_dim):
+        raise ValueError("pitch and instrument projection dimensions must match")
+    if instrument_diag.shape != (num_instruments,):
+        raise ValueError("instrument_diag must have shape [I]")
+
+    track_count = int(pair_batch_indices.numel())
+    for name, indices in (
+        ("pair_batch_indices", pair_batch_indices),
+        ("pair_instrument_indices", pair_instrument_indices),
+        ("pair_pitch_indices", pair_pitch_indices),
+    ):
+        if indices.shape != (track_count,) or indices.dtype != torch.long:
+            raise ValueError(f"{name} must be a 1D torch.long tensor of length N")
+        if indices.device != pitch_query.device:
+            raise ValueError(f"{name} must be on the projection device")
+
+    projection_tensors = (
+        pitch_key,
+        pitch_diag,
+        instrument_query,
+        instrument_key,
+        instrument_diag,
+    )
+    if any(tensor.device != pitch_query.device for tensor in projection_tensors):
+        raise ValueError("all factorized projections must be on one device")
+    if track_count > 0:
+        if bool(
+            torch.any(
+                (pair_batch_indices < 0) | (pair_batch_indices >= batch_size)
+            ).item()
+        ):
+            raise ValueError("pair_batch_indices contains an invalid batch index")
+        if bool(
+            torch.any(
+                (pair_instrument_indices < 0)
+                | (pair_instrument_indices >= num_instruments)
+            ).item()
+        ):
+            raise ValueError(
+                "pair_instrument_indices contains an invalid instrument index"
+            )
+        if bool(
+            torch.any(
+                (pair_pitch_indices < 0) | (pair_pitch_indices >= num_pitches)
+            ).item()
+        ):
+            raise ValueError("pair_pitch_indices contains an invalid pitch index")
+    return (
+        int(batch_size),
+        int(time_steps),
+        int(num_pitches),
+        int(head_dim),
+        track_count,
+    )
+
+
+def _gather_factorized_track_components(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    *,
+    length: int,
+) -> _FactorizedTrackComponents:
+    """Gather one copy of each batch/pitch sequence and map selected tracks to it."""
+
+    num_pitches = int(pitch_query.shape[2])
+    source_ids = pair_batch_indices * num_pitches + pair_pitch_indices
+    unique_source_ids, source_inverse = torch.unique(
+        source_ids,
+        sorted=True,
+        return_inverse=True,
+    )
+    unique_batch_indices = torch.div(
+        unique_source_ids, num_pitches, rounding_mode="floor"
+    )
+    unique_pitch_indices = unique_source_ids.remainder(num_pitches)
+
+    # Advanced indexing produces [U, T, D].  Time is moved first because the
+    # Semi-CRF score convention is [end, begin, track].
+    unique_pitch_query = pitch_query[
+        unique_batch_indices, :length, unique_pitch_indices, :
+    ].transpose(0, 1).contiguous()
+    unique_pitch_key = pitch_key[
+        unique_batch_indices, :length, unique_pitch_indices, :
+    ].transpose(0, 1).contiguous()
+    unique_pitch_diag = pitch_diag[
+        unique_batch_indices, :length, unique_pitch_indices
+    ].transpose(0, 1)
+    unique_instrument_indices, instrument_inverse = torch.unique(
+        pair_instrument_indices,
+        sorted=True,
+        return_inverse=True,
+    )
+    unique_instrument_query = instrument_query.index_select(
+        0, unique_instrument_indices
+    )
+    unique_instrument_key = instrument_key.index_select(
+        0, unique_instrument_indices
+    )
+
+    # Cross terms have no T x T component.  Compute the small [T, U, J]
+    # pitch/instrument grid, then gather only the selected tracks.  In
+    # particular, no [T, selected-pair, D] tensor is materialized here.
+    begin_grid = torch.einsum(
+        "tud,jd->tuj", unique_pitch_query, unique_instrument_key
+    ).float()
+    end_grid = torch.einsum(
+        "jd,tud->tuj", unique_instrument_query, unique_pitch_key
+    ).float()
+    unique_instrument_constant = (
+        unique_instrument_query * unique_instrument_key
+    ).sum(dim=-1).float()
+    return _FactorizedTrackComponents(
+        unique_pitch_query=unique_pitch_query,
+        unique_pitch_key=unique_pitch_key,
+        source_inverse=source_inverse,
+        begin_adjustment=begin_grid[:, source_inverse, instrument_inverse],
+        end_adjustment=end_grid[:, source_inverse, instrument_inverse],
+        instrument_constant=unique_instrument_constant.index_select(
+            0, instrument_inverse
+        ),
+        track_diag=(
+            unique_pitch_diag.index_select(1, source_inverse)
+            + instrument_diag.index_select(0, unique_instrument_indices)
+            .index_select(0, instrument_inverse)
+            .unsqueeze(0)
+        ),
+    )
+
+
+def _build_factorized_interval_score(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    *,
+    length: int,
+    length_scaling: str,
+    length_penalty: float = 0.0,
+    note_bias: float = 0.0,
+    length_scale: Optional[torch.Tensor] = None,
+    length_penalty_matrix: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    track_count = int(pair_batch_indices.numel())
+    if track_count == 0:
+        return pitch_query.new_zeros(
+            (int(length), int(length), 0), dtype=torch.float32
+        )
+    # Projection is factorized before pair selection.  Recombine q/k only for
+    # this CRF chunk, then use one high-throughput batched dot product.  A
+    # literal four-term expansion saves multiplications for duplicate pitches,
+    # but in eager CUDA it must gather and repeatedly update the much larger
+    # [begin, end, pair] buffer; that is slower and uses more transient memory.
+    # This fused form never recreates the old [T, pair, model-D] input to the
+    # projection and remains algebraically identical:
+    #   (q_pitch + q_inst) dot (k_pitch + k_inst).
+    pair_query = (
+        pitch_query[
+            pair_batch_indices, : int(length), pair_pitch_indices, :
+        ].transpose(0, 1)
+        + instrument_query.index_select(0, pair_instrument_indices).unsqueeze(0)
+    )
+    pair_key = (
+        pitch_key[
+            pair_batch_indices, : int(length), pair_pitch_indices, :
+        ].transpose(0, 1)
+        + instrument_key.index_select(0, pair_instrument_indices).unsqueeze(0)
+    )
+    pair_diag = (
+        pitch_diag[
+            pair_batch_indices, : int(length), pair_pitch_indices
+        ].transpose(0, 1)
+        + instrument_diag.index_select(0, pair_instrument_indices).unsqueeze(0)
+    )
+    return _build_interval_score(
+        pair_query,
+        pair_key,
+        pair_diag,
+        length_scaling=length_scaling,
+        length_penalty=length_penalty,
+        note_bias=note_bias,
+        length_scale=length_scale,
+        length_penalty_matrix=length_penalty_matrix,
+    )
+
+
+def build_factorized_interval_score(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    *,
+    length_scaling: str = "none",
+    length_penalty: float = 0.0,
+    note_bias: float = 0.0,
+) -> torch.Tensor:
+    """Build exact V2 pair scores from separate pitch/instrument projections."""
+
+    _, time_steps, _, _, _ = _validate_factorized_interval_inputs(
+        pitch_query,
+        pitch_key,
+        pitch_diag,
+        instrument_query,
+        instrument_key,
+        instrument_diag,
+        pair_batch_indices,
+        pair_instrument_indices,
+        pair_pitch_indices,
+    )
+    return _build_factorized_interval_score(
+        pitch_query,
+        pitch_key,
+        pitch_diag,
+        instrument_query,
+        instrument_key,
+        instrument_diag,
+        pair_batch_indices,
+        pair_instrument_indices,
+        pair_pitch_indices,
+        length=time_steps,
+        length_scaling=length_scaling,
+        length_penalty=length_penalty,
+        note_bias=note_bias,
+    )
+
+
+def _factorized_track_lengths(
+    valid_lengths: torch.Tensor | List[int],
+    *,
+    batch_size: int,
+    pair_batch_indices: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    sample_lengths = (
+        valid_lengths.to(device=device, dtype=torch.long)
+        if isinstance(valid_lengths, torch.Tensor)
+        else torch.tensor(valid_lengths, device=device, dtype=torch.long)
+    )
+    if sample_lengths.shape != (int(batch_size),):
+        raise ValueError(
+            f"valid_lengths must have shape [{int(batch_size)}], "
+            f"got {tuple(sample_lengths.shape)}"
+        )
+    return sample_lengths.index_select(0, pair_batch_indices)
+
+
+def _factorized_forced_start_positions(
+    forced_start_pos: Optional[torch.Tensor | List[int]],
+    *,
+    track_count: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if forced_start_pos is None:
+        return None
+    positions = (
+        forced_start_pos.to(device=device, dtype=torch.long)
+        if isinstance(forced_start_pos, torch.Tensor)
+        else torch.tensor(forced_start_pos, device=device, dtype=torch.long)
+    )
+    if positions.shape != (int(track_count),):
+        raise ValueError(
+            f"forced_start_pos must have shape [{int(track_count)}], "
+            f"got {tuple(positions.shape)}"
+        )
+    return positions.clamp_min(0)
+
+
 def _sanitize_track_intervals(
     track_intervals: List[Interval],
     *,
@@ -787,6 +1108,141 @@ def _build_banded_sparse_candidates(
     )
 
 
+def _build_factorized_sparse_diag_score(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    *,
+    length: int,
+    length_scaling: str,
+    note_bias: float,
+) -> torch.Tensor:
+    if length_scaling not in {"linear", "sqrt", "none"}:
+        raise ValueError("length_scaling must be one of {'linear', 'sqrt', 'none'}")
+    components = _gather_factorized_track_components(
+        pitch_query,
+        pitch_key,
+        pitch_diag,
+        instrument_query,
+        instrument_key,
+        instrument_diag,
+        pair_batch_indices,
+        pair_instrument_indices,
+        pair_pitch_indices,
+        length=int(length),
+    )
+    diag_score = components.track_diag.float()
+    if length_scaling == "none":
+        pitch_diag_score = (
+            components.unique_pitch_query.float()
+            * components.unique_pitch_key.float()
+        ).sum(dim=-1)
+        diag_score = (
+            diag_score
+            + pitch_diag_score.index_select(1, components.source_inverse)
+            + components.begin_adjustment
+            + components.end_adjustment
+            + components.instrument_constant.unsqueeze(0)
+        )
+        if float(note_bias) != 0.0:
+            diag_score = diag_score + float(note_bias)
+    return diag_score
+
+
+def _build_factorized_banded_sparse_candidates(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    *,
+    length: int,
+    length_scaling: str,
+    length_penalty: float,
+    note_bias: float,
+    topk_per_start: int,
+    score_threshold: Optional[float],
+    max_span_frames: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if length_scaling not in {"linear", "sqrt", "none"}:
+        raise ValueError("length_scaling must be one of {'linear', 'sqrt', 'none'}")
+
+    components = _gather_factorized_track_components(
+        pitch_query,
+        pitch_key,
+        pitch_diag,
+        instrument_query,
+        instrument_key,
+        instrument_diag,
+        pair_batch_indices,
+        pair_instrument_indices,
+        pair_pitch_indices,
+        length=int(length),
+    )
+    track_count = int(pair_batch_indices.numel())
+    candidate_count = max(
+        1, min(max(1, int(max_span_frames)), max(1, int(length) - 1))
+    )
+    candidate_scores = pitch_query.new_full(
+        (int(length), candidate_count, track_count),
+        float("-inf"),
+        dtype=torch.float32,
+    )
+    begin_positions = torch.arange(
+        int(length), device=pitch_query.device, dtype=torch.long
+    )
+    candidate_ends = torch.empty(
+        int(length),
+        candidate_count,
+        device=pitch_query.device,
+        dtype=torch.long,
+    )
+    for span_index in range(candidate_count):
+        offset = span_index + 1
+        end_positions = begin_positions + offset
+        candidate_ends[:, span_index] = end_positions.clamp_max(
+            max(0, int(length) - 1)
+        )
+        valid_count = int(length) - offset
+        if valid_count <= 0:
+            continue
+
+        pitch_score = (
+            components.unique_pitch_query[:valid_count].float()
+            * components.unique_pitch_key[offset : offset + valid_count].float()
+        ).sum(dim=-1)
+        scores = pitch_score.index_select(1, components.source_inverse)
+        scores = scores + components.begin_adjustment[:valid_count]
+        scores = scores + components.end_adjustment[offset : offset + valid_count]
+        scores = scores + components.instrument_constant.unsqueeze(0)
+        if float(note_bias) != 0.0:
+            scores = scores + float(note_bias)
+        if length_scaling == "linear":
+            scores = scores * float(offset)
+        elif length_scaling == "sqrt":
+            scores = scores * (float(offset) ** 0.5)
+        if float(length_penalty) != 0.0:
+            scores = scores - float(offset) * float(length_penalty)
+        candidate_scores[:valid_count, span_index, :] = scores
+
+    return _select_sparse_candidates(
+        candidate_scores,
+        candidate_ends,
+        topk_per_start=topk_per_start,
+        score_threshold=score_threshold,
+    )
+
+
 def _viterbi_backward_sparse(
     candidate_ends: torch.Tensor,
     candidate_scores: torch.Tensor,
@@ -988,6 +1444,135 @@ def compute_flat_interval_loss(
 
     if total_tracks <= 0:
         return flat_query.sum() * 0.0, 0, 0
+    return total_loss_sum / float(total_tracks), total_tracks, total_intervals
+
+
+def compute_factorized_pair_interval_loss(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    interval_targets: IntervalBatch,
+    valid_lengths: torch.Tensor | List[int],
+    *,
+    length_scaling: str = "linear",
+    length_penalty: float = 0.0,
+    track_batch_size: int = 128,
+    false_negative_cost: float = 0.0,
+    false_positive_cost: float = 0.0,
+) -> tuple[torch.Tensor, int, int]:
+    """Compute V2 Semi-CRF NLL from additive pitch/instrument projections."""
+
+    batch_size, _, _, _, track_count = (
+        _validate_factorized_interval_inputs(
+            pitch_query,
+            pitch_key,
+            pitch_diag,
+            instrument_query,
+            instrument_key,
+            instrument_diag,
+            pair_batch_indices,
+            pair_instrument_indices,
+            pair_pitch_indices,
+        )
+    )
+    if len(interval_targets) != track_count:
+        raise ValueError(
+            f"interval_targets must contain {track_count} tracks, "
+            f"got {len(interval_targets)}"
+        )
+    flat_lengths = _factorized_track_lengths(
+        valid_lengths,
+        batch_size=batch_size,
+        pair_batch_indices=pair_batch_indices,
+        device=pitch_query.device,
+    )
+
+    total_loss_sum = pitch_query.new_zeros(())
+    total_tracks = 0
+    total_intervals = 0
+    chunk_size = max(1, int(track_batch_size))
+    length_scale_cache: dict[int, Optional[torch.Tensor]] = {}
+    length_penalty_cache: dict[int, Optional[torch.Tensor]] = {}
+
+    unique_lengths = sorted(
+        {int(length) for length in flat_lengths.tolist() if int(length) > 0}
+    )
+    for length in unique_lengths:
+        length_scale = length_scale_cache.get(length)
+        if length not in length_scale_cache:
+            length_scale = _build_length_scale(
+                length,
+                device=pitch_query.device,
+                dtype=torch.float32,
+                length_scaling=length_scaling,
+            )
+            length_scale_cache[length] = length_scale
+        length_penalty_matrix = length_penalty_cache.get(length)
+        if length not in length_penalty_cache:
+            length_penalty_matrix = _build_length_penalty(
+                length,
+                device=pitch_query.device,
+                dtype=torch.float32,
+                penalty=length_penalty,
+            )
+            length_penalty_cache[length] = length_penalty_matrix
+        track_indices = (flat_lengths == length).nonzero(as_tuple=False).flatten()
+        if int(track_indices.numel()) == 0:
+            continue
+        for chunk_indices in track_indices.split(chunk_size):
+            score = _build_factorized_interval_score(
+                pitch_query,
+                pitch_key,
+                pitch_diag,
+                instrument_query,
+                instrument_key,
+                instrument_diag,
+                pair_batch_indices.index_select(0, chunk_indices),
+                pair_instrument_indices.index_select(0, chunk_indices),
+                pair_pitch_indices.index_select(0, chunk_indices),
+                length=length,
+                length_scaling=length_scaling,
+                length_penalty=length_penalty,
+                length_scale=length_scale,
+                length_penalty_matrix=length_penalty_matrix,
+            )
+            chunk_targets = [
+                interval_targets[int(index)] for index in chunk_indices.tolist()
+            ]
+            chunk_targets = _sanitize_interval_batch(chunk_targets, length=length)
+            noise_score = _zero_noise_score(
+                length,
+                batch_size=int(chunk_indices.numel()),
+                device=score.device,
+            )
+            interval_cost = _build_interval_active_cost(
+                chunk_targets,
+                length=length,
+                device=score.device,
+                dtype=score.dtype,
+                false_negative_cost=false_negative_cost,
+                false_positive_cost=false_positive_cost,
+            )
+            if interval_cost is None:
+                semi_crf = NeuralSemiCRFInterval(score, noise_score)
+                chunk_loss = -semi_crf.logProb(chunk_targets)
+            else:
+                augmented_score = score + interval_cost
+                semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
+                gold_score = evalPath(chunk_targets, score, noise_score)
+                chunk_loss = semi_crf.computeLogZ() - gold_score
+            total_loss_sum = total_loss_sum + chunk_loss.sum()
+            total_tracks += int(chunk_indices.numel())
+            total_intervals += sum(len(track) for track in chunk_targets)
+
+    if total_tracks <= 0:
+        return (pitch_query.sum() + instrument_query.sum()) * 0.0, 0, 0
     return total_loss_sum / float(total_tracks), total_tracks, total_intervals
 
 
@@ -1425,3 +2010,307 @@ def decode_pitch_intervals(
         decoded_flat[batch_index * num_pitches : (batch_index + 1) * num_pitches]
         for batch_index in range(int(batch_size))
     ]
+
+
+@torch.no_grad()
+def decode_factorized_pair_intervals(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    valid_lengths: torch.Tensor | List[int],
+    *,
+    length_scaling: str = "linear",
+    length_penalty: float = 0.0,
+    note_bias: float = 0.0,
+    track_batch_size: int = 128,
+    forced_start_pos: Optional[torch.Tensor | List[int]] = None,
+) -> IntervalBatch:
+    """Decode independent selected V2 tracks from factorized projections."""
+
+    batch_size, _, _, _, track_count = (
+        _validate_factorized_interval_inputs(
+            pitch_query,
+            pitch_key,
+            pitch_diag,
+            instrument_query,
+            instrument_key,
+            instrument_diag,
+            pair_batch_indices,
+            pair_instrument_indices,
+            pair_pitch_indices,
+        )
+    )
+    flat_lengths = _factorized_track_lengths(
+        valid_lengths,
+        batch_size=batch_size,
+        pair_batch_indices=pair_batch_indices,
+        device=pitch_query.device,
+    )
+    flat_forced_start_pos = _factorized_forced_start_positions(
+        forced_start_pos,
+        track_count=track_count,
+        device=pitch_query.device,
+    )
+
+    decoded_flat: IntervalBatch = [[] for _ in range(track_count)]
+    chunk_size = max(1, int(track_batch_size))
+    length_scale_cache: dict[int, Optional[torch.Tensor]] = {}
+    length_penalty_cache: dict[int, Optional[torch.Tensor]] = {}
+    unique_lengths = sorted(
+        {int(length) for length in flat_lengths.tolist() if int(length) > 0}
+    )
+    for length in unique_lengths:
+        length_scale = length_scale_cache.get(length)
+        if length not in length_scale_cache:
+            length_scale = _build_length_scale(
+                length,
+                device=pitch_query.device,
+                dtype=torch.float32,
+                length_scaling=length_scaling,
+            )
+            length_scale_cache[length] = length_scale
+        length_penalty_matrix = length_penalty_cache.get(length)
+        if length not in length_penalty_cache:
+            length_penalty_matrix = _build_length_penalty(
+                length,
+                device=pitch_query.device,
+                dtype=torch.float32,
+                penalty=length_penalty,
+            )
+            length_penalty_cache[length] = length_penalty_matrix
+        track_indices = (flat_lengths == length).nonzero(as_tuple=False).flatten()
+        for chunk_indices in track_indices.split(chunk_size):
+            score = _build_factorized_interval_score(
+                pitch_query,
+                pitch_key,
+                pitch_diag,
+                instrument_query,
+                instrument_key,
+                instrument_diag,
+                pair_batch_indices.index_select(0, chunk_indices),
+                pair_instrument_indices.index_select(0, chunk_indices),
+                pair_pitch_indices.index_select(0, chunk_indices),
+                length=length,
+                length_scaling=length_scaling,
+                length_penalty=length_penalty,
+                note_bias=note_bias,
+                length_scale=length_scale,
+                length_penalty_matrix=length_penalty_matrix,
+            )
+            semi_crf = NeuralSemiCRFInterval(
+                score,
+                _zero_noise_score(
+                    length,
+                    batch_size=int(chunk_indices.numel()),
+                    device=score.device,
+                ),
+            )
+            chunk_forced_start_pos = (
+                torch.clamp(
+                    flat_forced_start_pos.index_select(0, chunk_indices),
+                    min=0,
+                    max=max(0, length - 1),
+                ).tolist()
+                if flat_forced_start_pos is not None
+                else None
+            )
+            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
+            for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
+                decoded_flat[int(flat_index)] = intervals
+    return decoded_flat
+
+
+@torch.no_grad()
+def decode_factorized_pair_intervals_sparse(
+    pitch_query: torch.Tensor,
+    pitch_key: torch.Tensor,
+    pitch_diag: torch.Tensor,
+    instrument_query: torch.Tensor,
+    instrument_key: torch.Tensor,
+    instrument_diag: torch.Tensor,
+    pair_batch_indices: torch.Tensor,
+    pair_instrument_indices: torch.Tensor,
+    pair_pitch_indices: torch.Tensor,
+    valid_lengths: torch.Tensor | List[int],
+    *,
+    length_scaling: str = "linear",
+    length_penalty: float = 0.0,
+    note_bias: float = 0.0,
+    track_batch_size: int = 128,
+    forced_start_pos: Optional[torch.Tensor | List[int]] = None,
+    sparse_topk_per_start: int = 16,
+    sparse_score_threshold: Optional[float] = None,
+    sparse_max_span_frames: Optional[int] = None,
+) -> IntervalBatch:
+    """Sparse V2 decode from separate pitch/instrument projections."""
+
+    if sparse_topk_per_start <= 0:
+        raise ValueError("sparse_topk_per_start must be positive")
+    if sparse_max_span_frames is not None and int(sparse_max_span_frames) <= 0:
+        raise ValueError("sparse_max_span_frames must be positive when set")
+    batch_size, _, num_pitches, _, track_count = (
+        _validate_factorized_interval_inputs(
+            pitch_query,
+            pitch_key,
+            pitch_diag,
+            instrument_query,
+            instrument_key,
+            instrument_diag,
+            pair_batch_indices,
+            pair_instrument_indices,
+            pair_pitch_indices,
+        )
+    )
+    flat_lengths = _factorized_track_lengths(
+        valid_lengths,
+        batch_size=batch_size,
+        pair_batch_indices=pair_batch_indices,
+        device=pitch_query.device,
+    )
+    flat_forced_start_pos = _factorized_forced_start_positions(
+        forced_start_pos,
+        track_count=track_count,
+        device=pitch_query.device,
+    )
+
+    decoded_flat: IntervalBatch = [[] for _ in range(track_count)]
+    chunk_size = max(1, int(track_batch_size))
+    length_scale_cache: dict[int, Optional[torch.Tensor]] = {}
+    length_penalty_cache: dict[int, Optional[torch.Tensor]] = {}
+    source_ids = pair_batch_indices * int(num_pitches) + pair_pitch_indices
+    max_span_frames = (
+        None if sparse_max_span_frames is None else int(sparse_max_span_frames)
+    )
+    unique_lengths = sorted(
+        {int(length) for length in flat_lengths.tolist() if int(length) > 0}
+    )
+    for length in unique_lengths:
+        length_scale = None
+        length_penalty_matrix = None
+        if max_span_frames is None:
+            length_scale = length_scale_cache.get(length)
+            if length not in length_scale_cache:
+                length_scale = _build_length_scale(
+                    length,
+                    device=pitch_query.device,
+                    dtype=torch.float32,
+                    length_scaling=length_scaling,
+                )
+                length_scale_cache[length] = length_scale
+            length_penalty_matrix = length_penalty_cache.get(length)
+            if length not in length_penalty_cache:
+                length_penalty_matrix = _build_length_penalty(
+                    length,
+                    device=pitch_query.device,
+                    dtype=torch.float32,
+                    penalty=length_penalty,
+                )
+                length_penalty_cache[length] = length_penalty_matrix
+
+        track_indices = (flat_lengths == length).nonzero(as_tuple=False).flatten()
+        if max_span_frames is not None:
+            # The banded sparse scorer evaluates the decomposed pitch term
+            # directly, so keep identical pitches together within each chunk.
+            track_indices = track_indices.index_select(
+                0,
+                torch.argsort(source_ids.index_select(0, track_indices)),
+            )
+        for chunk_indices in track_indices.split(chunk_size):
+            chunk_batch_indices = pair_batch_indices.index_select(0, chunk_indices)
+            chunk_instrument_indices = pair_instrument_indices.index_select(
+                0, chunk_indices
+            )
+            chunk_pitch_indices = pair_pitch_indices.index_select(0, chunk_indices)
+            if max_span_frames is None:
+                score = _build_factorized_interval_score(
+                    pitch_query,
+                    pitch_key,
+                    pitch_diag,
+                    instrument_query,
+                    instrument_key,
+                    instrument_diag,
+                    chunk_batch_indices,
+                    chunk_instrument_indices,
+                    chunk_pitch_indices,
+                    length=length,
+                    length_scaling=length_scaling,
+                    length_penalty=length_penalty,
+                    note_bias=note_bias,
+                    length_scale=length_scale,
+                    length_penalty_matrix=length_penalty_matrix,
+                )
+                candidate_ends, candidate_scores = _build_dense_sparse_candidates(
+                    score,
+                    topk_per_start=int(sparse_topk_per_start),
+                    score_threshold=sparse_score_threshold,
+                )
+                diag_score = (
+                    torch.diagonal(score, dim1=0, dim2=1)
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+            else:
+                candidate_ends, candidate_scores = (
+                    _build_factorized_banded_sparse_candidates(
+                        pitch_query,
+                        pitch_key,
+                        pitch_diag,
+                        instrument_query,
+                        instrument_key,
+                        instrument_diag,
+                        chunk_batch_indices,
+                        chunk_instrument_indices,
+                        chunk_pitch_indices,
+                        length=length,
+                        length_scaling=length_scaling,
+                        length_penalty=length_penalty,
+                        note_bias=note_bias,
+                        topk_per_start=int(sparse_topk_per_start),
+                        score_threshold=sparse_score_threshold,
+                        max_span_frames=max_span_frames,
+                    )
+                )
+                diag_score = _build_factorized_sparse_diag_score(
+                    pitch_query,
+                    pitch_key,
+                    pitch_diag,
+                    instrument_query,
+                    instrument_key,
+                    instrument_diag,
+                    chunk_batch_indices,
+                    chunk_instrument_indices,
+                    chunk_pitch_indices,
+                    length=length,
+                    length_scaling=length_scaling,
+                    note_bias=note_bias,
+                )
+
+            chunk_forced_start_pos = (
+                torch.clamp(
+                    flat_forced_start_pos.index_select(0, chunk_indices),
+                    min=0,
+                    max=max(0, length - 1),
+                ).tolist()
+                if flat_forced_start_pos is not None
+                else None
+            )
+            decoded_chunk = _viterbi_backward_sparse(
+                candidate_ends,
+                candidate_scores,
+                diag_score,
+                _zero_noise_score(
+                    length,
+                    batch_size=int(chunk_indices.numel()),
+                    device=diag_score.device,
+                ),
+                forcedStartPos=chunk_forced_start_pos,
+            )
+            for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
+                decoded_flat[int(flat_index)] = intervals
+    return decoded_flat

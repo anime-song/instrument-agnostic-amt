@@ -11,7 +11,7 @@ import torch.nn as nn
 from ..taxonomy.instrument_classes import NUM_INSTRUMENT_CLASSES
 from .backbone import AudioFeatureExtractor, V1Backbone
 from .heads.v1 import V1SemiCRFHead
-from .heads.v2 import V2OverlapSemiCRFHead
+from .heads.v2 import SelectedPairIndices, V2OverlapSemiCRFHead
 
 MIN_MIDI_PITCH = 21
 MAX_MIDI_PITCH = 108
@@ -252,32 +252,29 @@ class AudioSemiCRFTransformer(nn.Module):
             raise RuntimeError("predict_interval_instruments is a V1-head operation")
         return self.head.predict_interval_instruments(features, interval_batch)
 
-    def build_pair_interval_features(
+    def build_selected_pair_indices(
         self,
-        interval_features: torch.Tensor,
         selected_pair_ids: Sequence[Sequence[int] | torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> SelectedPairIndices:
         if not isinstance(self.head, V2OverlapSemiCRFHead):
-            raise RuntimeError("pair interval features require the V2 head")
-        return self.head.build_pair_interval_features(
-            interval_features, selected_pair_ids, num_pitches=NUM_PITCHES
+            raise RuntimeError("selected pair indices require the V2 head")
+        return self.head.build_selected_pair_indices(
+            selected_pair_ids, num_pitches=NUM_PITCHES
         )
-
-    def score_pair_interval_features(
-        self, features: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not isinstance(self.head, V2OverlapSemiCRFHead):
-            raise RuntimeError("pair interval scoring requires the V2 head")
-        return self.head.score_pair_interval_features(features)
 
     def predict_flat_interval_boundaries(
         self,
-        features: torch.Tensor,
+        interval_features: torch.Tensor,
+        selected_pairs: SelectedPairIndices,
         interval_batch: Sequence[Sequence[tuple[int, int]]],
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int]]]:
         if not isinstance(self.head, V2OverlapSemiCRFHead):
             raise RuntimeError("flat interval boundaries require the V2 head")
-        return self.head.predict_flat_interval_boundaries(features, interval_batch)
+        return self.head.predict_flat_interval_boundaries(
+            interval_features,
+            selected_pairs,
+            interval_batch,
+        )
 
     def load_state_dict(
         self,

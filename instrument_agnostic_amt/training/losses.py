@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from ..modeling.heads.interval_boundaries import PitchIntervalTargets
-from ..modeling.heads.semi_crf import compute_flat_interval_loss
+from ..modeling.heads.semi_crf import compute_factorized_pair_interval_loss
 from ..modeling.model import AudioSemiCRFTransformer, NUM_PITCHES
 from .v1_losses import compute_v1_losses
 
@@ -206,18 +206,31 @@ def _compute_v2_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     interval_features = outputs.get("interval_features")
     pair_gate_logits = outputs.get("pair_gate_logits")
+    pitch_interval_query = outputs.get("pitch_interval_query")
+    pitch_interval_key = outputs.get("pitch_interval_key")
+    pitch_interval_diag = outputs.get("pitch_interval_diag")
+    instrument_interval_query = outputs.get("instrument_interval_query")
+    instrument_interval_key = outputs.get("instrument_interval_key")
+    instrument_interval_diag = outputs.get("instrument_interval_diag")
     frame_valid_mask = outputs.get("frame_valid_mask")
     interval_targets = batch.get("interval_targets")
 
     if (
         interval_features is None
         or pair_gate_logits is None
+        or pitch_interval_query is None
+        or pitch_interval_key is None
+        or pitch_interval_diag is None
+        or instrument_interval_query is None
+        or instrument_interval_key is None
+        or instrument_interval_diag is None
         or interval_targets is None
         or frame_valid_mask is None
         or model is None
     ):
         raise ValueError(
-            "Filtered V2 training requires interval features, pair gate logits, targets, and model"
+            "Factorized V2 training requires interval projections, pair gate logits, "
+            "targets, and model"
         )
     if not isinstance(interval_targets, list):
         raise ValueError("interval_targets must be a list of PitchIntervalTargets")
@@ -285,29 +298,30 @@ def _compute_v2_losses(
         random_negatives=random_negatives,
         max_pairs=max_pairs,
     )
-    pair_features, pair_batch_indices, _ = model.build_pair_interval_features(
-        interval_features,
+    selected_pairs = model.build_selected_pair_indices(
         selected_pair_ids,
     )
-    flat_query, flat_key, flat_diag = model.score_pair_interval_features(pair_features)
-    flat_lengths = (
-        valid_lengths.index_select(0, pair_batch_indices)
-        if int(pair_batch_indices.numel()) > 0
-        else torch.zeros((0,), device=valid_lengths.device, dtype=torch.long)
-    )
-    semi_crf_loss, track_count, interval_count = compute_flat_interval_loss(
-        flat_query,
-        flat_key,
-        flat_diag,
-        flat_targets.intervals,
-        flat_lengths,
-        length_scaling=length_scaling,
-        length_penalty=length_penalty,
-        track_batch_size=128
-        if args is None
-        else int(getattr(args, "semi_crf_track_batch_size", 128)),
-        false_negative_cost=semi_crf_false_negative_cost,
-        false_positive_cost=semi_crf_false_positive_cost,
+    semi_crf_loss, track_count, interval_count = (
+        compute_factorized_pair_interval_loss(
+            pitch_interval_query,
+            pitch_interval_key,
+            pitch_interval_diag,
+            instrument_interval_query,
+            instrument_interval_key,
+            instrument_interval_diag,
+            selected_pairs.batch_indices,
+            selected_pairs.instrument_indices,
+            selected_pairs.pitch_indices,
+            flat_targets.intervals,
+            valid_lengths,
+            length_scaling=length_scaling,
+            length_penalty=length_penalty,
+            track_batch_size=128
+            if args is None
+            else int(getattr(args, "semi_crf_track_batch_size", 128)),
+            false_negative_cost=semi_crf_false_negative_cost,
+            false_positive_cost=semi_crf_false_positive_cost,
+        )
     )
 
     total_loss = (
@@ -324,7 +338,8 @@ def _compute_v2_losses(
 
     if model.supports_interval_boundaries():
         boundary_logits, entries = model.predict_flat_interval_boundaries(
-            pair_features,
+            interval_features,
+            selected_pairs,
             flat_targets.intervals,
         )
         if entries:
