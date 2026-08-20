@@ -120,7 +120,8 @@ def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
     )
     setup_header_source = "".join(setup_header["source"])
     assert "restart" in setup_header_source
-    assert "run the same cell once more" in setup_header_source
+    assert "continue directly to step 2" in setup_header_source
+    assert "Run all" in setup_header_source
 
     setup_cell = next(
         cell for cell in notebook["cells"] if cell["metadata"].get("id") == "setup-code"
@@ -142,9 +143,19 @@ def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
     assert "do_shutdown(restart=True)" in setup_source
     assert "uuid.uuid4().hex" in setup_source
     assert '"install_kernel_token": IAAMT_KERNEL_TOKEN' in setup_source
-    assert 'importlib.metadata.version("numpy")' in setup_source
-    assert "IAAMT_SETUP_READY = True" in setup_source
-    assert "import scipy.signal" in setup_source
+
+    upload_cell = next(
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("id") == "upload-code"
+    )
+    upload_source = "".join(upload_cell["source"])
+    assert 'importlib.metadata.version("numpy")' in upload_source
+    assert "IAAMT_SETUP_READY = True" in upload_source
+    assert "import scipy.signal" in upload_source
+    assert "os.chdir(PROJECT_DIR)" in upload_source
+    assert 'if not (PROJECT_DIR / "uv.lock").is_file()' in upload_source
+    assert "Path(uploaded_name).resolve()" in upload_source
 
     helper_cell = next(
         cell
@@ -153,7 +164,7 @@ def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
     )
     helper_source = "".join(helper_cell["source"])
     assert "IAAMT_SETUP_READY" in helper_source
-    assert "Run the setup cell again" in helper_source
+    assert "Run the audio upload cell" in helper_source
 
 
 def test_pytest_imports_project_modules_from_uv_environment() -> None:
