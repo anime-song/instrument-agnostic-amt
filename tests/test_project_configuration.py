@@ -113,6 +113,17 @@ def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
         (PROJECT_ROOT / "Colab_Inference.ipynb").read_text(encoding="utf-8")
     )
     assert all(isinstance(cell["source"], list) for cell in notebook["cells"])
+    description_cell = next(
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("id") == "description"
+    )
+    description_source = "".join(description_cell["source"])
+    assert "⚠️ **IMPORTANT" in description_source
+    assert "first `Run all` stops once by design" in description_source
+    assert "expected, not a failure" in description_source
+    assert "continue from **2. Prepare Audio**" in description_source
+
     setup_header = next(
         cell
         for cell in notebook["cells"]
