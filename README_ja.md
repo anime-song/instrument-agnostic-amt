@@ -230,6 +230,8 @@ uv sync --locked --all-extras        # 学習用も含めてすべて
 
 `uv sync` を実行すると `.venv/` が作られます。この README のコマンド例は、この環境を有効化した状態（`source .venv/bin/activate`）を想定しています。有効化しない場合は、各コマンドの先頭に `uv run` を付けてください（例: `uv run python infer.py --audio input_song.wav`）。
 
+リポジトリの `.python-version` は、Python 3.10〜3.14 の対応範囲を狭めるものではなく、開発環境の既定を Python 3.12 に揃えるための設定です。Python 3.12 が未導入の場合、Python の自動取得を無効にしているかオフラインでない限り、uv が管理する CPython 3.12 を自動で取得します。
+
 ### 動作確認済みの環境
 
 - **Apple Silicon（M4 Pro、macOS / MPS）** — スモークテスト済み: コア AMT の V1/V2 forward とデコード、CQT、velocity、instrument refinement、beat/chord、stem-splitter による分離、MPS の AMP（fp16/bf16）、regional 方式の `--compile` / `--compile-velocity`。公開チェックポイントを使った採譜パイプライン全体（AMT 6 チェックポイント、instrument refinement、MIDI マージ、velocity、beat/chord/key）は、事前に分離済みのステムを入力として MPS で実行済みです。ただし、ステム分離の工程まで含めたエンドツーエンド実行は MPS では**未実施**です。

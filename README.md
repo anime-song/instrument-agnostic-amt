@@ -229,6 +229,8 @@ uv sync --locked --all-extras        # everything, including training dependenci
 
 `uv sync` creates `.venv/`. The commands in this README assume that environment is active (`source .venv/bin/activate`); alternatively, prefix each command with `uv run`, e.g. `uv run python infer.py --audio input_song.wav`.
 
+The repository's `.python-version` selects Python 3.12 as the default development interpreter without narrowing the supported Python 3.10–3.14 range. If Python 3.12 is not already installed, uv downloads a managed CPython 3.12 automatically unless Python downloads are disabled or the machine is offline.
+
 ### Verified environments
 
 - **Apple Silicon (M4 Pro, macOS / MPS)** — smoke-tested: core AMT V1/V2 forward and decoding, CQT, velocity, instrument refinement, beat/chord, stem-splitter separation, MPS AMP (fp16/bf16), and the regional `--compile` / `--compile-velocity` paths. The full transcription pipeline with the released checkpoints — AMT across six checkpoints, instrument refinement, MIDI merge, velocity, and beat/chord/key — has been run on MPS starting from pre-separated stems. An end-to-end run that also includes the stem-separation step has **not** been executed on MPS yet.
