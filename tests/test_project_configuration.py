@@ -113,18 +113,47 @@ def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
         (PROJECT_ROOT / "Colab_Inference.ipynb").read_text(encoding="utf-8")
     )
     assert all(isinstance(cell["source"], list) for cell in notebook["cells"])
+    setup_header = next(
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("id") == "setup-header"
+    )
+    setup_header_source = "".join(setup_header["source"])
+    assert "restart" in setup_header_source
+    assert "run the same cell once more" in setup_header_source
+
     setup_cell = next(
         cell for cell in notebook["cells"] if cell["metadata"].get("id") == "setup-code"
     )
     setup_source = "".join(setup_cell["source"])
-    assert "--format pylock.toml" in setup_source
-    assert "--output-file pylock.colab.toml" in setup_source
-    assert "uv pip install --system" in setup_source
+    assert '"--format", "pylock.toml"' in setup_source
+    assert 'PYLOCK_PATH = Path("/content/pylock.' in setup_source
+    assert '"--output-file", str(PYLOCK_PATH)' in setup_source
+    assert '"uv", "pip", "install", "--system"' in setup_source
     assert "--require-hashes" in setup_source
-    assert setup_source.count("--preview-features pylock") == 2
-    assert "-r pylock.colab.toml" in setup_source
+    assert setup_source.count('"--preview-features", "pylock"') == 2
+    assert '"-r", str(PYLOCK_PATH)' in setup_source
     assert "--extra-index-url" not in setup_source
     assert "--index-strategy" not in setup_source
+
+    assert "subprocess.run" in setup_source
+    assert "check=True" in setup_source
+    assert ".iaamt-colab-setup.json" in setup_source
+    assert "do_shutdown(restart=True)" in setup_source
+    assert "uuid.uuid4().hex" in setup_source
+    assert '"install_kernel_token": IAAMT_KERNEL_TOKEN' in setup_source
+    assert 'importlib.metadata.version("numpy")' in setup_source
+    assert "IAAMT_SETUP_READY = True" in setup_source
+    assert "import scipy.signal" in setup_source
+
+    helper_cell = next(
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("id") == "stem-sep-helpers"
+    )
+    helper_source = "".join(helper_cell["source"])
+    assert "IAAMT_SETUP_READY" in helper_source
+    assert "Run the setup cell again" in helper_source
 
 
 def test_pytest_imports_project_modules_from_uv_environment() -> None:
