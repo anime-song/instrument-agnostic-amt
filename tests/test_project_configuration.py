@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 try:
@@ -104,9 +105,26 @@ def test_lock_contains_windows_cuda_wheels_for_supported_python_versions() -> No
             )
 
 
-def test_uv_files_are_the_dependency_source_of_truth() -> None:
+def test_uv_files_and_colab_setup_are_the_dependency_source_of_truth() -> None:
     assert (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8") == "3.12\n"
     assert not (PROJECT_ROOT / "requirements.txt").exists()
+
+    notebook = json.loads(
+        (PROJECT_ROOT / "Colab_Inference.ipynb").read_text(encoding="utf-8")
+    )
+    assert all(isinstance(cell["source"], list) for cell in notebook["cells"])
+    setup_cell = next(
+        cell for cell in notebook["cells"] if cell["metadata"].get("id") == "setup-code"
+    )
+    setup_source = "".join(setup_cell["source"])
+    assert "--format pylock.toml" in setup_source
+    assert "--output-file pylock.colab.toml" in setup_source
+    assert "uv pip install --system" in setup_source
+    assert "--require-hashes" in setup_source
+    assert setup_source.count("--preview-features pylock") == 2
+    assert "-r pylock.colab.toml" in setup_source
+    assert "--extra-index-url" not in setup_source
+    assert "--index-strategy" not in setup_source
 
 
 def test_pytest_imports_project_modules_from_uv_environment() -> None:
