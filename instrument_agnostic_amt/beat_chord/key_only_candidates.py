@@ -283,7 +283,7 @@ def resolve_stem_model_type(stem_name: str) -> str:
     if "guitar" in normalized:
         return "guitar_v1_5"
     if "other" in normalized:
-        return "other"
+        return "other_v1_5"
     return "default"
 
 

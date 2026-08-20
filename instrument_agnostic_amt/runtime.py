@@ -1,3 +1,5 @@
+"""推論のdevice、AMP、regional compile、tensor転送に関する共通処理。"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence

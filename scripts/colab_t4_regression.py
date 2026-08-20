@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Colab T4上で、指定ブランチの固定コミットに対するCUDA回帰テストを再現する。"""
+
 from __future__ import annotations
 
 import argparse
@@ -102,6 +104,7 @@ def main() -> None:
         ]
     )
     _verify_expected_commit(worktree, args.expected_commit)
+    # READMEの再現手順と同じuvで、lockfileの解決結果を固定する。
     _run([sys.executable, "-m", "pip", "install", "--quiet", "uv==0.8.17"])
     _run(["uv", "sync", "--locked", "--all-extras"], cwd=worktree)
     _run(
@@ -125,6 +128,7 @@ def main() -> None:
     )
     _run(["uv", "run", "pytest", "-q"], cwd=worktree)
 
+    # 通常はopt-inの実機compile回帰も、このT4検証では必ず実行する。
     compile_environment = dict(os.environ)
     compile_environment["RUN_ACCELERATOR_COMPILE_TEST"] = "1"
     _run(

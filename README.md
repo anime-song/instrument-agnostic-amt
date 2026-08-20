@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-08-19 | 🎻 Added other-instrument model v1.5 (`--type other_v1_5`). The Colab stem-separated workflow now uses it by default for `other` stems. On an in-house real-recording evaluation set, COnP improves from 0.7318 (`other`) to 0.7701 (`other_v1_5`). |
 | 2026-08-19 | ⚡ Moved dependency management to uv and PyTorch 2.13, added MPS inference and opt-in AMP/regional compile, and reduced device synchronization, temporary copies, and repeated stem-audio loading across the inference pipeline. Two changes deliberately alter output: CUDA inference no longer downcasts attention implicitly, so it now runs in full FP32 by default, and V1 window batching now propagates decode state in the same window order as sequential decoding, which changes the output of the stem workflow's default `--window-batch-size 4`. |
 | 2026-08-09 | 🎹 Added the Instrument Refinement model, which re-assigns instrument classes to AMT notes using the separated stem audio. It pulls timbrally close sounds onto a single class, so the instrument stops flickering within a piece and manual clean-up gets easier. Overall top-1 on the held-out RWC-I benchmark improves from 71.3% to 74.5%, but **individual instruments both gain and lose** — see [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md) for the per-instrument breakdown and what each instrument is confused with. |
 | 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
@@ -644,7 +645,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: original other-instrument model. `other_v1_5`: updated other-instrument model. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--device` | `auto` | Inference device. `auto` picks CUDA → MPS → CPU; `cuda` / `mps` / `cpu` can be set explicitly |

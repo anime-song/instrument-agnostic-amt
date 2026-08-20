@@ -51,6 +51,7 @@ MODEL_CHECKPOINT_FILENAMES = {
     "vocal_harmony": "best_model_vocal_harmony.pth",
     "drums": "best_model_drums.pth",
     "other": "best_model_other.pth",
+    "other_v1_5": "best_model_other_v1_5.pth",
 }
 
 
