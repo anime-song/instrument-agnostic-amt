@@ -234,6 +234,33 @@ interpreter without narrowing the supported Python 3.10–3.14 range. If Python
 3.12 is unavailable, uv downloads a managed CPython automatically unless Python
 downloads are disabled or the machine is offline.
 
+### Reproducible CUDA regression on a Colab T4
+
+On a Colab T4 runtime, the regression runner clones a named branch, verifies
+its full 40-character commit SHA before installing dependencies, installs the
+locked uv environment, checks that the GPU is a T4, then runs the full suite
+and the opt-in CUDA compile tests. Run this in one `%%bash` cell; change the
+owner, repository, and branch for a fork:
+
+```bash
+%%bash
+set -euo pipefail
+GITHUB_OWNER=anime-song
+GITHUB_REPOSITORY=instrument-agnostic-amt
+BRANCH=main
+REPO_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPOSITORY}.git"
+EXPECTED_COMMIT="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | cut -f1)"
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPOSITORY}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
+python colab_t4_regression.py \
+  --repo-url "$REPO_URL" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
+```
+
+If the branch moves between SHA resolution and clone, the runner stops before
+dependency installation instead of testing a different revision.
+
 ---
 
 ## Data Preparation

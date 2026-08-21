@@ -234,6 +234,32 @@ uv sync --locked --extra training    # 学習用依存パッケージ
 Python 3.12 へ揃えます。Python 3.12 が未導入の場合、Python の自動取得を
 無効化しているかオフラインでない限り、uv が管理する CPython を自動取得します。
 
+### Colab T4で再現可能なCUDA回帰テスト
+
+ColabのT4ランタイム上で、回帰runnerは指定ブランチをcloneし、依存関係を入れる前に
+完全な40桁commit SHAが一致することを確認します。その後、uvのlock済み環境を導入し、
+GPUがT4であることを検証してから、全テストとopt-inのCUDA compileテストを実行します。
+次を1つの`%%bash`セルで実行してください。forkではowner、repository、branchを変更します。
+
+```bash
+%%bash
+set -euo pipefail
+GITHUB_OWNER=anime-song
+GITHUB_REPOSITORY=instrument-agnostic-amt
+BRANCH=main
+REPO_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPOSITORY}.git"
+EXPECTED_COMMIT="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | cut -f1)"
+curl -fL -o colab_t4_regression.py \
+  "https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPOSITORY}/${EXPECTED_COMMIT}/scripts/colab_t4_regression.py"
+python colab_t4_regression.py \
+  --repo-url "$REPO_URL" \
+  --branch "$BRANCH" \
+  --expected-commit "$EXPECTED_COMMIT"
+```
+
+SHAの取得からcloneまでの間にブランチが移動した場合は、別revisionを誤って検証せず、
+依存関係のインストール前に停止します。
+
 ---
 
 ## データ準備
