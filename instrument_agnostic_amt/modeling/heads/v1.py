@@ -82,7 +82,9 @@ class V1SemiCRFHead(nn.Module):
         self,
         pitch_features: torch.Tensor,
         frame_valid_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+        *,
+        include_frame_instrument_logits: bool = True,
+    ) -> dict[str, torch.Tensor | None]:
         interval_features = self._expand_with_slots(
             self.interval_adapter(pitch_features)
         )
@@ -97,8 +99,10 @@ class V1SemiCRFHead(nn.Module):
             "interval_diag": interval_diag,
             "interval_features": interval_features,
             "instrument_features": instrument_features,
-            "instrument_logits": self.instrument_classifier(
-                pitch_instrument_features
+            "instrument_logits": (
+                self.instrument_classifier(pitch_instrument_features)
+                if include_frame_instrument_logits
+                else None
             ),
             "frame_valid_mask": frame_valid_mask,
         }
@@ -136,4 +140,3 @@ class V1SemiCRFHead(nn.Module):
                 (0, self.interval_instrument_predictor.num_instrument_classes)
             ), []
         return self.interval_instrument_predictor(interval_features), entries
-
