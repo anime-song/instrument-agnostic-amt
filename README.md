@@ -178,7 +178,8 @@ instrument_agnostic_amt/
 ├── instrument_merge.json       # Instrument taxonomy definition
 ├── gm_instrument_classes.json  # General MIDI metadata
 ├── dataset_config.yaml         # Multi-dataset weighted sampling config
-├── requirements.txt            # Dependencies
+├── pyproject.toml              # Project metadata and dependencies (uv)
+├── uv.lock                     # Locked dependency versions
 │
 ├── models/
 │   ├── model.py                # AudioSemiCRFTransformer (top-level model)
@@ -201,24 +202,36 @@ instrument_agnostic_amt/
 
 ### Requirements
 
-- Python 3.10+
-- CUDA GPU (12GB+ VRAM recommended)
+- Python 3.10 – 3.14
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from `uv.lock`
+- CUDA GPU (12GB+ VRAM recommended) or CPU
+
+> Linux and Windows resolve to the CUDA 13.0 wheels. macOS resolves to the
+> platform PyTorch wheels. Windows CUDA wheel resolution is covered by the
+> lockfile tests, but has not been run on a Windows CUDA host.
 
 ```bash
 # Clone
 git clone https://github.com/anime-song/instrument-agnostic-amt.git
 cd instrument-agnostic-amt
 
-# Virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# Core inference dependencies, using the exact versions in uv.lock
+uv sync --locked
 
-# Dependencies
-pip install -r requirements.txt
+# Optional workflows
+uv sync --locked --extra stem        # stem-separated inference
+uv sync --locked --extra evaluation  # evaluation scripts
+uv sync --locked --extra training    # training dependencies
 ```
 
-> `audiomentations` is needed for training augmentation. You can skip it if you only need inference.
+`uv sync` creates `.venv/`. Activate it with `source .venv/bin/activate`, or
+prefix commands with `uv run`, for example `uv run python infer.py --audio input.wav`.
+
+The repository's `.python-version` selects Python 3.12 as the default development
+interpreter without narrowing the supported Python 3.10–3.14 range. If Python
+3.12 is unavailable, uv downloads a managed CPython automatically unless Python
+downloads are disabled or the machine is offline.
 
 ---
 
