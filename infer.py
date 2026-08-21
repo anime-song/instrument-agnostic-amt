@@ -75,6 +75,7 @@ def run_inference(
     device,
     amp_enabled,
     amp_dtype,
+    forward_model=None,
     velocity=100,
     merge_gap_ms=None,
     merge_onset_ms=50.0,
@@ -106,6 +107,7 @@ def run_inference(
         amp_dtype=amp_dtype,
         settings=settings,
         velocity=velocity,
+        forward_model=forward_model,
     )
     return notes, stats, {}
 

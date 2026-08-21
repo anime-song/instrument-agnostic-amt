@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sys
+from inspect import signature
 
 import pytest
 import torch
 
-from instrument_agnostic_amt.cli.infer import parse_args
+from instrument_agnostic_amt import runtime
 from instrument_agnostic_amt.beat_chord.key_only_candidates import parse_arguments
+from instrument_agnostic_amt.cli.infer import parse_args, process_file
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     parse_args as parse_refinement_args,
 )
@@ -62,6 +64,39 @@ def test_core_inference_cli_accepts_explicit_mps(
     args = parse_args()
 
     assert (args.device, args.amp, args.amp_dtype) == ("mps", True, "fp16")
+
+
+def test_core_inference_cli_exposes_opt_in_compile_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["amt-infer", "--audio", "input.wav"])
+    defaults = parse_args()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "amt-infer",
+            "--audio",
+            "input.wav",
+            "--compile",
+            "--compile-mode",
+            "max-autotune",
+        ],
+    )
+    enabled = parse_args()
+
+    assert (
+        getattr(defaults, "compile", None),
+        getattr(defaults, "compile_mode", None),
+        getattr(enabled, "compile", None),
+        getattr(enabled, "compile_mode", None),
+    ) == (False, "default", True, "max-autotune")
+
+
+def test_process_file_keeps_forward_model_optional_for_existing_callers() -> None:
+    parameter = signature(process_file).parameters.get("forward_model")
+
+    assert parameter is not None and parameter.default is None
 
 
 def test_secondary_inference_clis_default_to_auto_device(
@@ -215,3 +250,56 @@ def test_empty_device_cache_supports_cuda_and_mps(
     empty_device_cache(torch.device("cpu"))
 
     assert calls == ["cuda", "mps"]
+
+
+class _RegionalCompileTarget(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.compile_calls: list[dict[str, object]] = []
+
+    def compile(self, **kwargs: object) -> None:
+        self.compile_calls.append(kwargs)
+
+
+class _RegionalCompileModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_extractor = _RegionalCompileTarget()
+        self.backbone = torch.nn.Module()
+        self.backbone.layers = torch.nn.ModuleList(
+            [
+                torch.nn.ModuleList(
+                    [_RegionalCompileTarget(), _RegionalCompileTarget()]
+                )
+            ]
+        )
+        self.head = _RegionalCompileTarget()
+
+
+def test_compile_is_opt_in_and_targets_only_shared_transformer_regions() -> None:
+    maybe_compile_forward = getattr(runtime, "maybe_compile_forward", None)
+    assert callable(maybe_compile_forward)
+    model = _RegionalCompileModel()
+    state_keys = tuple(model.state_dict())
+    targets = [module for pair in model.backbone.layers for module in pair]
+
+    assert maybe_compile_forward(model, enabled=False) is model
+    forward = maybe_compile_forward(model, enabled=True, mode="reduce-overhead")
+
+    assert forward is model
+    assert tuple(model.state_dict()) == state_keys
+    assert all(
+        target.compile_calls
+        == [
+            {
+                "backend": "inductor",
+                "mode": "reduce-overhead",
+                "fullgraph": False,
+                "dynamic": None,
+            }
+        ]
+        for target in targets
+    )
+    assert model.feature_extractor.compile_calls == []
+    assert model.head.compile_calls == []
