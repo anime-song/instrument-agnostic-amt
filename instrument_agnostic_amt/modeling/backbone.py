@@ -227,13 +227,25 @@ class StemConv(nn.Module):
             nn.GELU(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x) + self.freq_embed[:, :, :, : int(x.shape[-1])]
         x = self.conv2(x)
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
         return self.block4(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.training
+            and torch.is_autocast_enabled(x.device.type)
+            and torch.get_autocast_dtype(x.device.type) == torch.float16
+        ):
+            # FP16 AMP の推論時は、StemConv 全体を FP32 で実行して
+            # 畳み込みのオーバーフローを防ぐ。
+            with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                return self._forward_impl(x.float())
+        return self._forward_impl(x)
 
 
 class PitchQueryEmbedding(nn.Module):
