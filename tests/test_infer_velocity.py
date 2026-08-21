@@ -204,6 +204,68 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
+def test_predict_velocity_uses_preloaded_waveforms_without_reloading(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model, config = velocity_infer.load_velocity_model(
+        mock_velocity_checkpoint,
+        device="cpu",
+    )
+    preloaded_waveforms = {
+        stem_name: torch.from_numpy(
+            velocity_infer._load_and_preprocess_audio(
+                audio_path,
+                target_sample_rate=config.sample_rate,
+            )
+        ).contiguous()
+        for stem_name, audio_path in mock_audio_stems.items()
+    }
+    waveform_copies = {
+        stem_name: waveform.clone()
+        for stem_name, waveform in preloaded_waveforms.items()
+    }
+    eager_output_path = tmp_path / "eager_velocity.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=eager_output_path,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        preloaded_model=model,
+        preloaded_config=config,
+    )
+    monkeypatch.setattr(
+        velocity_infer,
+        "_load_and_preprocess_audio",
+        lambda *_args, **_kwargs: pytest.fail("audio should not be reloaded"),
+    )
+    output_path = tmp_path / "preloaded_velocity.mid"
+
+    result = predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        preloaded_model=model,
+        preloaded_config=config,
+        preloaded_waveforms=preloaded_waveforms,
+    )
+
+    assert result == output_path
+    assert output_path.read_bytes() == eager_output_path.read_bytes()
+    assert all(
+        torch.equal(preloaded_waveforms[name], waveform_copies[name])
+        for name in preloaded_waveforms
+    )
+
+
 def test_template_midi_preserves_note_structure_and_uses_stem_velocities(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
