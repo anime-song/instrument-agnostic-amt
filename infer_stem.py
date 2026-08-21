@@ -20,7 +20,11 @@ from infer_instrument_refinement import (
     ensure_refinement_checkpoint,
     refine_midi_instruments,
 )
-from infer_velocity import predict_velocity_for_stem_midis
+from infer_velocity import (
+    ensure_velocity_checkpoint,
+    load_velocity_model,
+    predict_velocity_for_stem_midis,
+)
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
 )
@@ -294,6 +298,46 @@ def get_stem_pipeline_models(
     }
 
 
+def get_velocity_models(
+    checkpoint_path: Path | str | None = None,
+    device_preference: torch.device | str | None = None,
+    *,
+    compile_velocity: bool = False,
+    compile_mode: str = "default",
+) -> tuple[object, object, object]:
+    """Velocityモデルとregional compile済みforwardを再利用する。"""
+    device = resolve_device(device_preference)
+    resolved_checkpoint = ensure_velocity_checkpoint(checkpoint_path)
+    compile_cache_key = (
+        ("compiled", str(compile_mode)) if compile_velocity else ("eager",)
+    )
+    cache_key = (
+        "velocity",
+        str(resolved_checkpoint.resolve()),
+        str(device),
+        *compile_cache_key,
+    )
+
+    cached = STEM_PIPELINE_CACHE.get(cache_key)
+    if cached is not None:
+        cached[0].to(device)
+        cached[0].eval()
+        return cached
+
+    model, config = load_velocity_model(
+        resolved_checkpoint,
+        device=device,
+    )
+    forward_model = maybe_compile_forward(
+        model,
+        enabled=bool(compile_velocity),
+        mode=str(compile_mode),
+    )
+    bundle = (model, forward_model, config)
+    STEM_PIPELINE_CACHE[cache_key] = bundle
+    return bundle
+
+
 def get_refinement_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
@@ -437,6 +481,7 @@ def run_stem_separated_transcription(
     amp: bool = False,
     amp_dtype: str | None = None,
     compile_model: bool = False,
+    compile_velocity: bool = False,
     compile_mode: str = "default",
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
@@ -622,6 +667,12 @@ def run_stem_separated_transcription(
                 if Path(midi_path).exists()
             }
             velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
+            velocity_model, velocity_forward, velocity_config = get_velocity_models(
+                checkpoint_path=velocity_checkpoint_path,
+                device_preference=device,
+                compile_velocity=compile_velocity,
+                compile_mode=compile_mode,
+            )
             predict_velocity_for_stem_midis(
                 stem_midis=stem_midis_map,
                 stem_audios=stems,
@@ -632,6 +683,11 @@ def run_stem_separated_transcription(
                 window_seconds=8.0,
                 max_melodic_instruments=max_midi_melodic_instruments,
                 disable_tqdm=True,
+                compile_velocity=compile_velocity,
+                compile_mode=compile_mode,
+                preloaded_model=velocity_model,
+                preloaded_config=velocity_config,
+                preloaded_forward=velocity_forward,
             )
             merged_midi_path = velocity_midi_path
             print("Updated merged MIDI with predicted velocities:", merged_midi_path)

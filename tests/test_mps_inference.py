@@ -17,6 +17,10 @@ from instrument_agnostic_amt.modeling.model import (
     SemiCRFModelConfig,
 )
 from instrument_agnostic_amt.runtime import maybe_compile_forward
+from instrument_agnostic_amt.velocity.modeling.model import (
+    VelocityModelConfig,
+    VelocityPredictionModel,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(),
@@ -85,6 +89,72 @@ def _small_amt_model() -> AudioSemiCRFTransformer:
         instrument_pair_gate_dim=8,
     )
     return AudioSemiCRFTransformer(config).eval()
+
+
+def _small_velocity_model(
+    device: torch.device | str = "cpu",
+) -> VelocityPredictionModel:
+    with torch.random.fork_rng():
+        torch.manual_seed(42)
+        model = VelocityPredictionModel(
+            VelocityModelConfig(
+                sample_rate=16_000,
+                hop_length=64,
+                cqt_fmin=250.0,
+                cqt_n_bins=12,
+                cqt_bins_per_octave=12,
+                cqt_filter_scale=0.5,
+                harmonics=(1.0,),
+                hidden_size=8,
+                base_ch=4,
+                encoder_num_layers=1,
+                encoder_num_heads=2,
+                dropout=0.0,
+                use_gradient_checkpoint=False,
+                pitch_min=21,
+                pitch_max=32,
+                note_hidden_size=8,
+                num_stem_classes=1,
+                local_frame_offsets=(0,),
+                predict_stem_gain=False,
+            )
+        ).eval()
+    return model.to(device)
+
+
+def _velocity_inputs(
+    note_count: int,
+    *,
+    device: torch.device | str,
+    sample_count: int,
+) -> dict[str, torch.Tensor]:
+    waveform = torch.linspace(-0.25, 0.25, steps=2 * sample_count).reshape(
+        1, 1, 2, sample_count
+    )
+    note_starts = torch.linspace(0.004, 0.030, steps=note_count).reshape(
+        1, note_count
+    )
+    return {
+        "audio": waveform.to(device),
+        "note_start_seconds": note_starts.to(device),
+        "note_end_seconds": (note_starts + 0.008).to(device),
+        "note_pitch": (
+            (torch.arange(note_count) % 12 + 21).reshape(1, note_count).to(device)
+        ),
+        "note_program": torch.zeros(
+            1, note_count, dtype=torch.long, device=device
+        ),
+        "note_is_drum": torch.zeros(
+            1, note_count, dtype=torch.bool, device=device
+        ),
+        "note_stem_index": torch.zeros(
+            1, note_count, dtype=torch.long, device=device
+        ),
+        "stem_class_id": torch.zeros(1, 1, dtype=torch.long, device=device),
+        "valid_audio_frames": torch.full(
+            (1, 1), sample_count, dtype=torch.long, device=device
+        ),
+    }
 
 
 def test_v1_windowed_amp_enables_mps_autocast(
@@ -228,3 +298,36 @@ def test_core_amt_compiled_forward_runs_on_mps() -> None:
             rtol=rtol,
             atol=atol,
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ACCELERATOR_COMPILE_TEST") != "1",
+    reason="accelerator compile regression is opt-in",
+)
+def test_velocity_compiled_forward_handles_varying_shapes_on_mps() -> None:
+    device = torch.device("mps")
+    model = _small_velocity_model(device)
+    eager_model = copy.deepcopy(model)
+    compiled_forward = maybe_compile_forward(model, enabled=True)
+
+    with torch.inference_mode():
+        for note_count, sample_count in ((1, 1_024), (2, 768), (3, 640)):
+            inputs = _velocity_inputs(
+                note_count,
+                device=device,
+                sample_count=sample_count,
+            )
+            eager_outputs = eager_model(**inputs)
+            compiled_outputs = compiled_forward(**inputs)
+
+            assert compiled_outputs.keys() == eager_outputs.keys()
+            for name, eager_value in eager_outputs.items():
+                compiled_value = compiled_outputs[name]
+                assert compiled_value.device.type == "mps"
+                assert torch.isfinite(compiled_value).all()
+                torch.testing.assert_close(
+                    compiled_value,
+                    eager_value,
+                    rtol=1e-4,
+                    atol=1e-5,
+                )

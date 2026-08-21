@@ -151,6 +151,86 @@ def test_stem_pipeline_compiles_and_caches_only_the_core_amt_forward(
     ]
 
 
+def test_velocity_pipeline_compile_is_independent_and_cached_by_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_velocity_models = getattr(infer_stem, "get_velocity_models", None)
+    assert callable(get_velocity_models)
+    checkpoint = tmp_path / "velocity.pth"
+    checkpoint.write_bytes(b"")
+    eager_model = torch.nn.Linear(2, 2)
+    compiled_forward = object()
+    load_calls: list[tuple[Path, torch.device]] = []
+    compile_calls: list[tuple[object, bool, str]] = []
+
+    monkeypatch.setattr(
+        infer_stem,
+        "ensure_velocity_checkpoint",
+        lambda _path: checkpoint,
+        raising=False,
+    )
+
+    def fake_load(
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object]:
+        load_calls.append((path, device))
+        return eager_model, object()
+
+    monkeypatch.setattr(
+        infer_stem,
+        "load_velocity_model",
+        fake_load,
+        raising=False,
+    )
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    monkeypatch.setattr(infer_stem, "maybe_compile_forward", fake_compile)
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    first = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+    )
+    second = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="reduce-overhead",
+    )
+    different_mode = get_velocity_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_velocity=True,
+        compile_mode="max-autotune",
+    )
+
+    assert first is second
+    assert different_mode is not first
+    assert first[0] is eager_model
+    assert first[1] is compiled_forward
+    assert load_calls == [
+        (checkpoint, torch.device("cpu")),
+        (checkpoint, torch.device("cpu")),
+    ]
+    assert compile_calls == [
+        (eager_model, True, "reduce-overhead"),
+        (eager_model, True, "max-autotune"),
+    ]
+
+
 def test_stem_workflow_exposes_device_and_amp_options() -> None:
     parameters = signature(run_stem_separated_transcription).parameters
 
@@ -161,10 +241,13 @@ def test_stem_workflow_exposes_device_and_amp_options() -> None:
         parameters.get("compile_model").default
         if parameters.get("compile_model")
         else None,
+        parameters.get("compile_velocity").default
+        if parameters.get("compile_velocity")
+        else None,
         parameters.get("compile_mode").default
         if parameters.get("compile_mode")
         else None,
-    ) == ("auto", False, None, False, "default")
+    ) == ("auto", False, None, False, False, "default")
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:
