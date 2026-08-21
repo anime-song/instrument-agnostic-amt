@@ -6,7 +6,10 @@ import torch
 from tqdm.auto import tqdm
 
 from ..runtime import is_amp_supported
-from ..modeling.heads.semi_crf import decode_pitch_intervals
+from ..modeling.heads.semi_crf import (
+    decode_pitch_intervals,
+    decode_pitch_intervals_sparse,
+)
 from ..modeling.model import (
     MIN_MIDI_PITCH,
     NUM_PITCHES,
@@ -175,6 +178,22 @@ def decode_v1_notes(
         decoded_batch: list[list[list[tuple[int, int]]]] = []
         boundary_map: dict[tuple[int, int, int], tuple[bool, bool, float, float]] = {}
         interval_features = outputs.get("interval_features")
+        decode_intervals = (
+            decode_pitch_intervals_sparse
+            if settings.semi_crf_sparse_decode
+            else decode_pitch_intervals
+        )
+        sparse_options = (
+            {
+                "sparse_topk_per_start": int(
+                    settings.semi_crf_sparse_topk_per_start
+                ),
+                "sparse_score_threshold": settings.semi_crf_sparse_score_threshold,
+                "sparse_max_span_frames": settings.semi_crf_sparse_max_span_frames,
+            }
+            if settings.semi_crf_sparse_decode
+            else {}
+        )
         # model forwardは窓バッチのまま、状態に依存する復号だけを窓順に進める。
         for batch_index, window_start in enumerate(active_starts):
             valid_model_frames = int(valid_lengths[batch_index].item())
@@ -194,7 +213,7 @@ def decode_v1_notes(
                     for track in range(track_count)
                 ]
             ]
-            decoded_sample = decode_pitch_intervals(
+            decoded_sample = decode_intervals(
                 outputs["interval_query"][batch_index : batch_index + 1],
                 outputs["interval_key"][batch_index : batch_index + 1],
                 outputs["interval_diag"][batch_index : batch_index + 1],
@@ -204,6 +223,7 @@ def decode_v1_notes(
                 note_bias=settings.note_bias,
                 track_batch_size=settings.track_batch_size,
                 forced_start_pos=forced_start_positions,
+                **sparse_options,
             )
             decoded_batch.append(decoded_sample[0])
             decoded_intervals += sum(len(intervals) for intervals in decoded_sample[0])

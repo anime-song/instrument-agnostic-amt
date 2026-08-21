@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
 import torch
 
+from instrument_agnostic_amt.inference import v1_windowed
 from instrument_agnostic_amt.inference.types import InferenceSettings, PredictedNote
 from instrument_agnostic_amt.inference.windowed import decode_notes
 from instrument_agnostic_amt.modeling.model import SemiCRFModelConfig
@@ -192,3 +196,55 @@ def test_v1_window_batch_applies_boundary_close_before_next_decode() -> None:
     assert sequential_stats["boundary_interval_count"] == 1
     assert sequential_model.batch_sizes == [1, 1]
     assert batched_model.batch_sizes == [2]
+
+
+def test_v1_decode_uses_sparse_decoder_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sparse_calls: list[dict[str, object]] = []
+
+    def reject_dense_decoder(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("sparse指定時にdense decoderを呼び出している")
+
+    def sparse_decoder(
+        interval_query: torch.Tensor,
+        *_args: object,
+        **kwargs: object,
+    ) -> list[list[list[tuple[int, int]]]]:
+        sparse_calls.append(kwargs)
+        return [
+            [[] for _ in range(88)]
+            for _ in range(int(interval_query.shape[0]))
+        ]
+
+    monkeypatch.setattr(v1_windowed, "decode_pitch_intervals", reject_dense_decoder)
+    monkeypatch.setattr(
+        v1_windowed,
+        "decode_pitch_intervals_sparse",
+        sparse_decoder,
+        raising=False,
+    )
+
+    notes, _ = decode_notes(
+        _WindowStateV1Model(),  # type: ignore[arg-type]
+        _config(),
+        torch.ones(2, 200),
+        instrument_filter_id=None,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        amp_dtype=torch.float32,
+        settings=replace(
+            _settings(window_batch_size=1),
+            semi_crf_sparse_decode=True,
+            semi_crf_sparse_topk_per_start=5,
+            semi_crf_sparse_score_threshold=-0.25,
+            semi_crf_sparse_max_span_frames=7,
+        ),
+        velocity=100,
+    )
+
+    assert notes == []
+    assert len(sparse_calls) == 1
+    assert sparse_calls[0]["sparse_topk_per_start"] == 5
+    assert sparse_calls[0]["sparse_score_threshold"] == -0.25
+    assert sparse_calls[0]["sparse_max_span_frames"] == 7
