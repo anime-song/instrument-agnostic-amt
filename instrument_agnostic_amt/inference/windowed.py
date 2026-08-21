@@ -8,6 +8,7 @@ from typing import Iterable
 import torch
 from tqdm.auto import tqdm
 
+from ..runtime import is_amp_supported
 from ..modeling.heads.semi_crf import (
     decode_factorized_pair_intervals,
     decode_factorized_pair_intervals_sparse,
@@ -679,7 +680,7 @@ def decode_notes(
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
-            enabled=bool(amp_enabled and device.type == "cuda"),
+            enabled=bool(amp_enabled and is_amp_supported(device)),
         ):
             outputs = model(
                 batch_waveform,

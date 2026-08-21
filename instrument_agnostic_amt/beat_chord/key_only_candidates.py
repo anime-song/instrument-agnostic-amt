@@ -14,6 +14,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
+from ..runtime import empty_device_cache, resolve_device
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_INPUT_DIR = Path("beat_chord_dataset/source_audio")
@@ -388,7 +390,7 @@ class StemTranscriptionRunner:
         force: bool,
         cleanup_stems: bool,
     ) -> None:
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.amt_checkpoint_dir = Path(amt_checkpoint_dir).resolve()
         self.separation_checkpoint = Path(separation_checkpoint).resolve()
         self.velocity_checkpoint = Path(velocity_checkpoint).resolve()
@@ -747,8 +749,8 @@ class StemTranscriptionRunner:
         return result_midi
 
     def park(self) -> None:
-        """Move cached audio models off CUDA before midi-frame inference."""
-        if self.device.type != "cuda":
+        """MIDI-frame推論の前に音声モデルをアクセラレータから退避する。"""
+        if self.device.type not in {"cuda", "mps"}:
             return
         if self._separation_bundle is not None:
             self._separation_bundle[1].to("cpu")
@@ -757,15 +759,14 @@ class StemTranscriptionRunner:
         if self._velocity_bundle is not None:
             self._velocity_bundle[0].to("cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_device_cache(self.device)
 
     def release(self) -> None:
         self._separation_bundle = None
         self._amt_bundles.clear()
         self._velocity_bundle = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_device_cache(self.device)
 
 
 def build_midi_frame_infer_command(
@@ -843,9 +844,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--recursive", action="store_true")
-    parser.add_argument(
-        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
-    )
+    parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--amt-checkpoint-dir",
         type=Path,

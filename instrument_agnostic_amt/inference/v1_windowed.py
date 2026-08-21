@@ -5,6 +5,7 @@ import math
 import torch
 from tqdm.auto import tqdm
 
+from ..runtime import is_amp_supported
 from ..modeling.heads.semi_crf import decode_pitch_intervals
 from ..modeling.model import (
     MIN_MIDI_PITCH,
@@ -162,7 +163,7 @@ def decode_v1_notes(
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
-            enabled=amp_enabled and device.type == "cuda",
+            enabled=amp_enabled and is_amp_supported(device),
         ):
             outputs = model(
                 batch, valid_audio_frames=valid_tensor, include_aux_outputs=False

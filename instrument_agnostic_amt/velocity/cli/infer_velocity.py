@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
 from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ...runtime import resolve_device
 
 
 HF_CHECKPOINT_BASE_URL = (
@@ -450,10 +451,7 @@ def predict_velocity_for_stem_midis(
     同じ基準でノートVelocityを唯一の可変音量表現にする。template_midi_pathを
     指定した場合は、そのMIDIのNote Onイベントへ予測値だけを書き戻す。
     """
-    if device is None:
-        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        target_device = torch.device(device)
+    target_device = resolve_device(device)
     if max_melodic_instruments < 0:
         raise ValueError("max_melodic_instruments must be nonnegative")
 
@@ -784,8 +782,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Device for inference (cuda or cpu)",
+        default="auto",
+        help="Device for inference (auto, cuda, mps, or cpu)",
     )
     parser.add_argument(
         "--window-seconds",

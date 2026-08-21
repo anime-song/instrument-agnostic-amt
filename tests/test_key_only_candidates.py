@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pretty_midi
 import pytest
+import torch
 
 from instrument_agnostic_amt.beat_chord import key_only_candidates as candidates
 from instrument_agnostic_amt.beat_chord.key_only_candidates import (
@@ -70,6 +71,30 @@ def _make_runner(*, predict_velocity: bool = True) -> StemTranscriptionRunner:
         force=False,
         cleanup_stems=False,
     )
+
+
+def test_batch_runner_auto_routes_to_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    runner = StemTranscriptionRunner(
+        device="auto",
+        amt_checkpoint_dir="checkpoints",
+        separation_checkpoint="checkpoints/stem_splitter.pt",
+        velocity_checkpoint="checkpoints/best_velocity_model.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=True,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+    )
+
+    assert runner.device.type == "mps"
 
 
 def test_discover_audio_files_filters_and_sorts(tmp_path: Path) -> None:

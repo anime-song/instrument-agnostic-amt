@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pretty_midi
+import pytest
 import soundfile as sf
 import torch
 
+import infer_stem
 from infer_stem import (
+    get_stem_pipeline_models,
     merge_midis_logic,
     refine_stem_instrument_midis,
     resolve_stem_model_type,
     resolve_stem_paths,
+    run_stem_separated_transcription,
 )
 from instrument_agnostic_amt.instrument_refinement.modeling.model import (
     InstrumentRefinementConfig,
@@ -28,6 +34,61 @@ def test_resolve_stem_model_type() -> None:
     assert resolve_stem_model_type("guitar_stem") == "guitar_v1_5"
     assert resolve_stem_model_type("other_stem") == "other_v1_5"
     assert resolve_stem_model_type("piano_stem") == "default"
+
+
+def test_stem_pipeline_auto_routes_models_to_mps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"")
+    loaded_devices: list[str] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+
+    def fake_load_separator(
+        _config: object,
+        *,
+        device: torch.device,
+    ) -> object:
+        loaded_devices.append(str(device))
+        return object()
+
+    def fake_load_amt(
+        _checkpoint: Path,
+        *,
+        device: torch.device,
+        **_kwargs: object,
+    ) -> tuple[object, object, object]:
+        loaded_devices.append(str(device))
+        return object(), SimpleNamespace(), object()
+
+    monkeypatch.setattr(infer_stem, "load_mss_model", fake_load_separator)
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_load_model_and_settings",
+        fake_load_amt,
+    )
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    bundle = get_stem_pipeline_models(checkpoint_path=checkpoint)
+
+    assert (str(bundle["device"]), loaded_devices) == ("mps", ["mps", "mps"])
+
+
+def test_stem_workflow_exposes_device_and_amp_options() -> None:
+    parameters = signature(run_stem_separated_transcription).parameters
+
+    assert (
+        parameters.get("device").default if parameters.get("device") else None,
+        parameters.get("amp").default if parameters.get("amp") else None,
+        parameters.get("amp_dtype").default if parameters.get("amp_dtype") else "missing",
+    ) == ("auto", False, None)
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:

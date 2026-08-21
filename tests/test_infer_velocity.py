@@ -20,6 +20,33 @@ from instrument_agnostic_amt.velocity.modeling.model import (
 )
 
 
+def test_velocity_auto_routes_model_to_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_devices: list[str] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    def stop_after_device_resolution(
+        _path: object,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object]:
+        loaded_devices.append(str(device))
+        raise RuntimeError("device captured")
+
+    monkeypatch.setattr(
+        velocity_infer,
+        "load_velocity_model",
+        stop_after_device_resolution,
+    )
+
+    with pytest.raises(RuntimeError, match="device captured"):
+        predict_velocity_for_stem_midis({}, {}, device=None)
+
+    assert loaded_devices == ["mps"]
+
+
 def _midi_note_structure(path: Path) -> list[tuple[int, str, int, str, int, int]]:
     midi = mido.MidiFile(str(path))
     structure: list[tuple[int, str, int, str, int, int]] = []

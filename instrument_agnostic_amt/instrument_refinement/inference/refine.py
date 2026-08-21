@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 
 from ...inference.audio import load_audio
 from ...inference.instruments import resolve_stem_instrument_class_ids
+from ...runtime import resolve_device
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -430,7 +431,7 @@ def refine_midi_instruments(
     midi_file = Path(midi_path).resolve()
     if not audio_file.is_file() or not midi_file.is_file():
         raise FileNotFoundError("audio and MIDI paths must both exist")
-    target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    target_device = resolve_device(device)
 
     # 1. モデルを用意する。ステムごとに呼ばれる用途では読み込み済みモデルを受け取る。
     model, config = _resolve_model(

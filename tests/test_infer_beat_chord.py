@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
 import pretty_midi
+import pytest
 import torch
 
+from instrument_agnostic_amt.beat_chord.cli import infer as beat_chord_infer
 from infer_beat_chord import (
     DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME,
     ensure_beat_chord_checkpoint,
@@ -22,6 +26,54 @@ def test_ensure_beat_chord_checkpoint_resolves_existing(tmp_path: Path) -> None:
 
     resolved = ensure_beat_chord_checkpoint(checkpoint_path)
     assert resolved == checkpoint_path.resolve()
+
+
+def test_beat_chord_auto_routes_model_to_mps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_midi = tmp_path / "input.mid"
+    input_midi.write_bytes(b"midi")
+    loaded_devices: list[str] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "ensure_beat_chord_checkpoint",
+        lambda _path: tmp_path / "checkpoint.pth",
+    )
+
+    def fake_load(
+        _path: Path,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object, dict[str, object]]:
+        loaded_devices.append(str(device))
+        return object(), object(), {"checkpoint": {}}
+
+    monkeypatch.setattr(beat_chord_infer, "load_beat_chord_model", fake_load)
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "run_beat_chord_inference",
+        lambda **_kwargs: SimpleNamespace(
+            beat_times=[],
+            meter_segments=[],
+            chord_segments=[],
+            key_segments=[],
+            duration_seconds=0.0,
+            hop_length=1,
+            sample_rate=1,
+        ),
+    )
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "export_tempo_mapped_midi",
+        lambda **_kwargs: None,
+    )
+
+    predict_beat_chord_for_midi(input_midi, device=None)
+
+    assert loaded_devices == ["mps"]
 
 
 def test_predict_beat_chord_for_midi(tmp_path: Path) -> None:

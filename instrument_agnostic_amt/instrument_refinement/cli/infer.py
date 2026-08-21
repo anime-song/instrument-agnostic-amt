@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=Path, default=None)
     # ステム名を渡すと楽器候補が絞られる。分からない場合は省略（全クラスが候補）。
     parser.add_argument("--stem-name", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--window-seconds", type=float, default=8.0)
     parser.add_argument("--stride-seconds", type=float, default=4.0)
     # cluster: 音色ごとに楽器を分ける / single: ステム全体を 1 楽器とみなす。

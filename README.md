@@ -469,6 +469,24 @@ python infer.py --audio input_song.wav
 
 > **Note**: If `--checkpoint` is not provided, the model will be automatically downloaded from Hugging Face.
 
+### Device selection
+
+`--device` defaults to `auto` and selects the first available backend in the
+order **CUDA → MPS → CPU**. You can also pin a backend explicitly; requesting
+an unavailable accelerator raises an error instead of silently falling back.
+
+```bash
+python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+MPS requires an Apple Silicon Mac with a PyTorch MPS backend. If PyTorch reports
+that an operation is unsupported on MPS, retry with `--device cpu`. Small
+floating-point differences between CPU, CUDA, and MPS results are expected.
+Mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
+and can be changed with `--amp-dtype`.
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -523,6 +541,7 @@ python infer.py \
   --checkpoint checkpoints/checkpoint_epoch_100.pth \
   --audio input_song.wav \
   --output-midi output.mid \
+  --device auto \
   --amp \
   --window-ms 8000 \
   --stride-ms 4000 \
@@ -539,7 +558,9 @@ python infer.py \
 | `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
-| `--amp` | `false` | Enable mixed precision inference |
+| `--device` | `auto` | Inference device. `auto` selects CUDA → MPS → CPU; `cuda`, `mps`, or `cpu` can be set explicitly |
+| `--amp` | `false` | Enable mixed precision inference on CUDA or MPS |
+| `--amp-dtype` | device default | `fp16` or `bf16`; defaults to bf16 on supported CUDA devices and fp16 on MPS |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
 | `--window-batch-size` | `1` | Windows to process at once |

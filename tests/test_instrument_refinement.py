@@ -14,6 +14,7 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 
+from instrument_agnostic_amt.instrument_refinement.inference import refine as refine_module
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     DEFAULT_REFINEMENT_CHECKPOINT_FILENAME,
     ensure_refinement_checkpoint,
@@ -847,6 +848,34 @@ def test_ensure_refinement_checkpoint_prefers_local_files(tmp_path: Path, monkey
     default_path.write_bytes(b"")
     assert ensure_refinement_checkpoint(None) == default_path.resolve()
     assert ensure_refinement_checkpoint("DEFAULT") == default_path.resolve()
+
+
+def test_refinement_auto_routes_model_to_mps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "audio.wav"
+    midi_path = tmp_path / "input.mid"
+    audio_path.write_bytes(b"audio")
+    midi_path.write_bytes(b"midi")
+    loaded_devices: list[str] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    def stop_after_device_resolution(
+        *_args: object,
+        device: torch.device,
+        **_kwargs: object,
+    ) -> tuple[object, object]:
+        loaded_devices.append(str(device))
+        raise RuntimeError("device captured")
+
+    monkeypatch.setattr(refine_module, "_resolve_model", stop_after_device_resolution)
+
+    with pytest.raises(RuntimeError, match="device captured"):
+        refine_midi_instruments(audio_path, midi_path, device=None)
+
+    assert loaded_devices == ["mps"]
 
 
 def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
