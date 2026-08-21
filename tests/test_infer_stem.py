@@ -119,6 +119,7 @@ class _FakeRefinementModel:
 
     def __init__(self, config: InstrumentRefinementConfig) -> None:
         self.config = config
+        self.batch_sizes: list[int] = []
 
     def to(self, _device: torch.device) -> "_FakeRefinementModel":
         return self
@@ -131,6 +132,7 @@ class _FakeRefinementModel:
     ) -> dict[str, torch.Tensor]:
         pitches = kwargs["note_pitch"]
         batch_size, note_count = pitches.shape
+        self.batch_sizes.append(int(batch_size))
         device = pitches.device
         acoustic_guitar = get_instrument_class_id_by_name("acoustic_guitar")
         note_logits = torch.zeros(
@@ -209,18 +211,21 @@ def test_refine_stem_instrument_midis_skips_excluded_stems_and_rewrites_labels(
         embedding_size=8,
         use_gradient_checkpoint=False,
     )
+    model = _FakeRefinementModel(config)
     refined_paths = refine_stem_instrument_midis(
         stem_midis=stem_midis,
         stem_audios=stem_audios,
         output_dir=tmp_path / "refined",
-        refinement_model=_FakeRefinementModel(config),
+        refinement_model=model,
         refinement_config=config,
         device="cpu",
         window_seconds=0.5,
         stride_seconds=0.25,
+        window_batch_size=2,
     )
 
     assert set(refined_paths) == {"other"}
+    assert model.batch_sizes == [2, 1]
     refined_midi = pretty_midi.PrettyMIDI(str(refined_paths["other"]))
     assert [instrument.name for instrument in refined_midi.instruments] == [
         "acoustic_guitar"
