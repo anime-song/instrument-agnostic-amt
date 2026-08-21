@@ -253,3 +253,32 @@ def test_pytest_imports_project_modules_from_uv_environment() -> None:
     configuration = _load_configuration()
 
     assert configuration["tool"]["pytest"]["ini_options"]["pythonpath"] == ["."]
+
+
+def test_colab_exposes_accelerator_and_compile_options() -> None:
+    notebook = json.loads(
+        (PROJECT_ROOT / "Colab_Inference.ipynb").read_text(encoding="utf-8")
+    )
+    run_cell = next(
+        cell
+        for cell in notebook["cells"]
+        if cell["metadata"].get("id") == "stem-sep-run"
+    )
+    run_source = "".join(run_cell["source"])
+
+    for option_name in (
+        "DEVICE",
+        "AMP",
+        "AMP_DTYPE",
+        "COMPILE_MODEL",
+        "COMPILE_VELOCITY",
+        "COMPILE_MODE",
+    ):
+        assert f"{option_name} =" in run_source
+
+    assert "device=DEVICE" in run_source
+    assert "amp=AMP" in run_source
+    assert 'amp_dtype=None if AMP_DTYPE == "default" else AMP_DTYPE' in run_source
+    assert "compile_model=COMPILE_MODEL" in run_source
+    assert "compile_velocity=COMPILE_VELOCITY" in run_source
+    assert "compile_mode=COMPILE_MODE" in run_source
