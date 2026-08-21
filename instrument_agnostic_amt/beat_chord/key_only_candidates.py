@@ -14,7 +14,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
-from ..runtime import empty_device_cache, resolve_device
+from ..runtime import (
+    empty_device_cache,
+    is_amp_supported,
+    resolve_amp_dtype,
+    resolve_device,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -389,6 +394,8 @@ class StemTranscriptionRunner:
         strict_velocity: bool,
         force: bool,
         cleanup_stems: bool,
+        amp: bool = False,
+        amp_dtype: str | None = None,
     ) -> None:
         self.device = resolve_device(device)
         self.amt_checkpoint_dir = Path(amt_checkpoint_dir).resolve()
@@ -402,6 +409,8 @@ class StemTranscriptionRunner:
         self.strict_velocity = bool(strict_velocity)
         self.force = bool(force)
         self.cleanup_stems = bool(cleanup_stems)
+        self.amp_enabled = bool(amp and is_amp_supported(self.device))
+        self.amp_dtype = resolve_amp_dtype(self.device, amp_dtype)
         self._separation_bundle: tuple[Any, Any, torch.dtype] | None = None
         self._amt_bundles: dict[str, tuple[Any, Any, Any]] = {}
         self._velocity_bundle: tuple[Any, Any] | None = None
@@ -565,8 +574,8 @@ class StemTranscriptionRunner:
             model_config=config,
             settings=settings,
             device=self.device,
-            amp_enabled=False,
-            amp_dtype=(torch.float16 if self.device.type == "cuda" else torch.float32),
+            amp_enabled=self.amp_enabled,
+            amp_dtype=self.amp_dtype,
             velocity=100,
             merge_gap_ms=None,
             merge_onset_ms=self.merge_onset_ms,
@@ -845,6 +854,8 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp-dtype", choices=("fp16", "bf16"), default=None)
     parser.add_argument(
         "--amt-checkpoint-dir",
         type=Path,
@@ -970,6 +981,8 @@ def run_batch(args: argparse.Namespace) -> list[CandidateResult]:
         strict_velocity=args.strict_velocity,
         force=args.force,
         cleanup_stems=args.cleanup_stems,
+        amp=args.amp,
+        amp_dtype=args.amp_dtype,
     )
 
     repository_root = Path(__file__).resolve().parents[2]
