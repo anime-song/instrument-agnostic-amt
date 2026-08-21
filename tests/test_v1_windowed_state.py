@@ -86,7 +86,10 @@ class _WindowStateBoundaryV1Model(_WindowStateV1Model):
     def predict_interval_boundaries(
         features: torch.Tensor,
         interval_batch: list[list[list[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
+        _ = compute_dtype
         entries: list[tuple[int, int, int, int, int]] = []
         for batch_index, sample in enumerate(interval_batch):
             for track, intervals in enumerate(sample):

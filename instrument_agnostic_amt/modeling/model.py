@@ -238,19 +238,31 @@ class AudioSemiCRFTransformer(nn.Module):
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         if not isinstance(self.head, V1SemiCRFHead):
             raise RuntimeError("predict_interval_boundaries is a V1-head operation")
-        return self.head.predict_interval_boundaries(features, interval_batch)
+        return self.head.predict_interval_boundaries(
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
+        )
 
     def predict_interval_instruments(
         self,
         features: torch.Tensor,
         interval_batch: Sequence[Sequence[Sequence[tuple[int, int]]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int, int]]]:
         if not isinstance(self.head, V1SemiCRFHead):
             raise RuntimeError("predict_interval_instruments is a V1-head operation")
-        return self.head.predict_interval_instruments(features, interval_batch)
+        return self.head.predict_interval_instruments(
+            features,
+            interval_batch,
+            compute_dtype=compute_dtype,
+        )
 
     def build_selected_pair_indices(
         self,

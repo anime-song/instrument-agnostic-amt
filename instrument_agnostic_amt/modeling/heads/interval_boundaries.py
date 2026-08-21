@@ -54,6 +54,8 @@ def flatten_interval_entries(
 def gather_interval_endpoint_features(
     frame_features: torch.Tensor,
     intervals_batch: Sequence[Sequence[Sequence[Interval]]],
+    *,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, list[FlattenedIntervalEntry]]:
     if frame_features.dim() != 4:
         raise ValueError("frame_features must have shape [B, T, P, D]")
@@ -61,7 +63,11 @@ def gather_interval_endpoint_features(
     entries = flatten_interval_entries(intervals_batch)
     feature_dim = int(frame_features.shape[-1])
     if not entries:
-        return frame_features.new_zeros((0, feature_dim * 3)), []
+        return torch.zeros(
+            (0, feature_dim * 3),
+            device=frame_features.device,
+            dtype=frame_features.dtype if compute_dtype is None else compute_dtype,
+        ), []
 
     device = frame_features.device
     batch_indices = torch.tensor(
@@ -87,6 +93,9 @@ def gather_interval_endpoint_features(
 
     begin_features = frame_features[batch_indices, begin_indices, pitch_indices]
     end_features = frame_features[batch_indices, end_indices, pitch_indices]
+    if compute_dtype is not None:
+        begin_features = begin_features.to(dtype=compute_dtype)
+        end_features = end_features.to(dtype=compute_dtype)
     stacked_features = torch.cat(
         [
             begin_features,
@@ -101,6 +110,8 @@ def gather_interval_endpoint_features(
 def gather_interval_sequence_features(
     frame_features: torch.Tensor,
     intervals_batch: Sequence[Sequence[Sequence[Interval]]],
+    *,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, list[FlattenedIntervalEntry]]:
     """Gather endpoint and pooled features for each interval entry."""
 
@@ -110,7 +121,11 @@ def gather_interval_sequence_features(
     entries = flatten_interval_entries(intervals_batch)
     feature_dim = int(frame_features.shape[-1])
     if not entries:
-        return frame_features.new_zeros((0, feature_dim * 4 + 1)), []
+        return torch.zeros(
+            (0, feature_dim * 4 + 1),
+            device=frame_features.device,
+            dtype=frame_features.dtype if compute_dtype is None else compute_dtype,
+        ), []
 
     device = frame_features.device
     batch_indices = torch.tensor(
@@ -136,20 +151,21 @@ def gather_interval_sequence_features(
 
     begin_features = frame_features[batch_indices, begin_indices, pitch_indices]
     end_features = frame_features[batch_indices, end_indices, pitch_indices]
+    if compute_dtype is not None:
+        begin_features = begin_features.to(dtype=compute_dtype)
+        end_features = end_features.to(dtype=compute_dtype)
 
-    prefix_sum = frame_features.cumsum(dim=1)
+    prefix_sum = frame_features.cumsum(dim=1, dtype=compute_dtype)
     interval_sum = prefix_sum[batch_indices, end_indices, pitch_indices]
     has_previous = begin_indices > 0
-    if bool(torch.any(has_previous).item()):
-        interval_sum = interval_sum.clone()
-        interval_sum[has_previous] = (
-            interval_sum[has_previous]
-            - prefix_sum[
-                batch_indices[has_previous],
-                begin_indices[has_previous] - 1,
-                pitch_indices[has_previous],
-            ]
-        )
+    interval_sum[has_previous] = (
+        interval_sum[has_previous]
+        - prefix_sum[
+            batch_indices[has_previous],
+            begin_indices[has_previous] - 1,
+            pitch_indices[has_previous],
+        ]
+    )
 
     interval_lengths = (end_indices - begin_indices + 1).clamp_min(1)
     mean_features = interval_sum / interval_lengths.unsqueeze(-1).to(
