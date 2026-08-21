@@ -616,6 +616,7 @@ def run_stem_separated_transcription(
                 output_midi_path=beat_chord_midi_path,
                 checkpoint_path=beat_chord_checkpoint_path,
                 device=device,
+                window_batch_size=window_batch_size,
             )
             merged_midi_path = beat_chord_midi_path
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
