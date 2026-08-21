@@ -206,10 +206,11 @@ instrument_agnostic_amt/
 - Python 3.10 〜 3.14
 - [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
 - PyTorch 2.13.0 / torchaudio 2.11.0 — `uv.lock` から自動でインストールされます
-- CUDA 対応 GPU（VRAM 12GB 以上推奨）または CPU
+- NVIDIA GPU（VRAM 12GB 以上推奨）、Apple Silicon Mac、または CPU
 
-> Linux / Windows では CUDA 13.0 wheel、macOS ではプラットフォーム向けの
-> PyTorch wheel を解決します。Windows CUDA wheel の解決はロックファイルの
+> Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
+> プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
+> 向けwheelを提供していません。Windows CUDA wheel の解決はロックファイルの
 > テストで確認していますが、Windows CUDA 実機では未検証です。
 
 ```bash

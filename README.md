@@ -205,11 +205,12 @@ instrument_agnostic_amt/
 - Python 3.10 – 3.14
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - PyTorch 2.13.0 / torchaudio 2.11.0 — installed automatically from `uv.lock`
-- CUDA GPU (12GB+ VRAM recommended) or CPU
+- NVIDIA GPU (12GB+ VRAM recommended), Apple Silicon Mac, or CPU
 
-> Linux and Windows resolve to the CUDA 13.0 wheels. macOS resolves to the
-> platform PyTorch wheels. Windows CUDA wheel resolution is covered by the
-> lockfile tests, but has not been run on a Windows CUDA host.
+> Linux and Windows resolve to the CUDA 13.0 wheels. Apple Silicon macOS
+> resolves to the platform PyTorch wheels; PyTorch 2.13 does not provide Intel
+> macOS wheels. Windows CUDA wheel resolution is covered by the lockfile tests,
+> but has not been run on a Windows CUDA host.
 
 ```bash
 # Clone
