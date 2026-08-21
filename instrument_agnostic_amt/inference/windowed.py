@@ -796,9 +796,10 @@ def decode_notes(
             if use_boundary_head:
                 boundary_logits, boundary_entries = (
                     model.predict_flat_interval_boundaries(
-                        interval_features[sample_index : sample_index + 1].float(),
+                        interval_features[sample_index : sample_index + 1],
                         selected_pairs,
                         decoded_intervals,
+                        compute_dtype=torch.float32,
                     )
                 )
                 boundary_interval_count += len(boundary_entries)
