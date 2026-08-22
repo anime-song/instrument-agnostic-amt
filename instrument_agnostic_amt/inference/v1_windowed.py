@@ -171,13 +171,16 @@ def decode_v1_notes(
         if valid_mask is None:
             raise ValueError("V1 inference requires frame_valid_mask")
         valid_lengths = valid_mask.long().sum(dim=-1)
-        forced_start_positions: list[list[int]] = []
+        decoded_batch: list[list[list[tuple[int, int]]]] = []
+        boundary_map: dict[tuple[int, int, int], tuple[bool, bool, float, float]] = {}
+        interval_features = outputs.get("interval_features")
+        # model forwardは窓バッチのまま、状態に依存する復号だけを窓順に進める。
         for batch_index, window_start in enumerate(active_starts):
             valid_model_frames = int(valid_lengths[batch_index].item())
             window_model_start = int(
                 round(float(window_start) / float(config.hop_length))
             )
-            forced_start_positions.append(
+            forced_start_positions = [
                 [
                     max(
                         0,
@@ -189,37 +192,56 @@ def decode_v1_notes(
                     )
                     for track in range(track_count)
                 ]
+            ]
+            decoded_sample = decode_pitch_intervals(
+                outputs["interval_query"][batch_index : batch_index + 1],
+                outputs["interval_key"][batch_index : batch_index + 1],
+                outputs["interval_diag"][batch_index : batch_index + 1],
+                valid_lengths[batch_index : batch_index + 1],
+                length_scaling=config.semi_crf_length_scaling,
+                length_penalty=config.semi_crf_length_penalty,
+                note_bias=settings.note_bias,
+                track_batch_size=settings.track_batch_size,
+                forced_start_pos=forced_start_positions,
             )
-        decoded_batch = decode_pitch_intervals(
-            outputs["interval_query"],
-            outputs["interval_key"],
-            outputs["interval_diag"],
-            valid_lengths,
-            length_scaling=config.semi_crf_length_scaling,
-            length_penalty=config.semi_crf_length_penalty,
-            note_bias=settings.note_bias,
-            track_batch_size=settings.track_batch_size,
-            forced_start_pos=forced_start_positions,
-        )
-        decoded_intervals += sum(
-            len(intervals) for sample in decoded_batch for intervals in sample
-        )
+            decoded_batch.append(decoded_sample[0])
+            decoded_intervals += sum(len(intervals) for intervals in decoded_sample[0])
 
-        boundary_map = {}
-        interval_features = outputs.get("interval_features")
-        if (
-            settings.use_boundary_head
-            and model.supports_interval_boundaries()
-            and interval_features is not None
-        ):
-            logits, entries = model.predict_interval_boundaries(
-                interval_features.float(), decoded_batch
-            )
-            boundary_map = _decode_boundary_map(logits, entries)
-            boundary_count += len(entries)
-            for has_onset, has_offset, _, _ in boundary_map.values():
-                boundary_no_onset += int(not has_onset)
-                boundary_no_offset += int(not has_offset)
+            local_boundary_map = {}
+            if (
+                settings.use_boundary_head
+                and model.supports_interval_boundaries()
+                and interval_features is not None
+            ):
+                logits, entries = model.predict_interval_boundaries(
+                    interval_features[batch_index : batch_index + 1].float(),
+                    decoded_sample,
+                )
+                local_boundary_map = _decode_boundary_map(logits, entries)
+                boundary_count += len(entries)
+                for (
+                    _,
+                    track,
+                    interval_index,
+                ), boundary_flag in local_boundary_map.items():
+                    batch_key = (batch_index, track, interval_index)
+                    boundary_map[batch_key] = boundary_flag
+                    has_onset, has_offset, _, _ = boundary_flag
+                    boundary_no_onset += int(not has_onset)
+                    boundary_no_offset += int(not has_offset)
+
+            for track, intervals in enumerate(decoded_sample[0]):
+                for interval_index, (_, end) in enumerate(intervals):
+                    boundary_flag = local_boundary_map.get((0, track, interval_index))
+                    has_offset = (
+                        bool(boundary_flag[1])
+                        if boundary_flag is not None
+                        else int(end) < valid_model_frames - 1
+                    )
+                    if has_offset:
+                        last_closed_global_model_frames[track] = (
+                            window_model_start + int(end)
+                        )
 
         instrument_map = {}
         instrument_features = outputs.get("instrument_features")
@@ -267,18 +289,6 @@ def decode_v1_notes(
                             candidate_instrument_ids,
                         )
                     instrument, candidates = predicted
-                    has_offset = (
-                        bool(boundary_flag[1])
-                        if boundary_flag is not None
-                        else int(end) < valid_model_frames - 1
-                    )
-                    if has_offset:
-                        window_model_start = int(
-                            round(float(window_start) / float(config.hop_length))
-                        )
-                        last_closed_global_model_frames[track] = (
-                            window_model_start + int(end)
-                        )
                     pair_id = instrument * NUM_PITCHES + pitch_index
                     note = stitcher._build_interval_note(
                         pair_id=pair_id,
