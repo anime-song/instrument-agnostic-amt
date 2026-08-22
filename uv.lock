@@ -2458,7 +2458,7 @@ wheels = [
 
 [[package]]
 name = "stem-splitter"
-version = "0.0.5"
+version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
@@ -2473,9 +2473,9 @@ dependencies = [
     { name = "torchcodec" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/15/ca/3f5d730e297c4ee7fe3906e5836039e6a447d951458094918d8558a807e1/stem_splitter-0.0.5.tar.gz", hash = "sha256:a043d29a18497e92b6b727f55bdc309b4cd5d9fae132e9889584909beb6b46fd", size = 14899, upload-time = "2026-02-22T13:06:04.657Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/bd/31c0f2834b83f86bd910d53fac7772a6ae620e4c6fccaed5985000165d62/stem_splitter-0.0.6.tar.gz", hash = "sha256:afb50844bd77e8c411038551147e82d7c959be535d0a7601c0b9c0df2cbf292f", size = 18109, upload-time = "2026-08-21T12:50:52.241Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/d6/8e31f683dfc69d56ae0a63d4e9e5386efde6ca140fc487281f95d6988989/stem_splitter-0.0.5-py3-none-any.whl", hash = "sha256:fe56e5d243dffcde942a84dd265e5ad21ffebba7beb8435040620c1b61b181f5", size = 16077, upload-time = "2026-02-22T13:06:03.483Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/e3/da8ebfab1b621750a4cb437e67e5f685f486a00bc22f6377de5c8f3a074e/stem_splitter-0.0.6-py3-none-any.whl", hash = "sha256:4ad5670dad11055228e467e25607bc0aa8512c5e8a995fd2c16335168013dc2b", size = 17912, upload-time = "2026-08-21T12:50:51.245Z" },
 ]
 
 [[package]]

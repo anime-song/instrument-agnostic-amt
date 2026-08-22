@@ -210,8 +210,7 @@ instrument_agnostic_amt/
 
 > Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
 > プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
-> 向けwheelを提供していません。Windows CUDA wheel の解決はロックファイルの
-> テストで確認していますが、Windows CUDA 実機では未検証です。
+> 向けwheelを提供していません。
 
 ```bash
 # クローン
