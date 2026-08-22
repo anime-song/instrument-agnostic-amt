@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10向け
+    import tomli as tomllib
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_configuration() -> dict[str, object]:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as file:
+        return tomllib.load(file)
+
+
+def _load_lock() -> dict[str, object]:
+    with (PROJECT_ROOT / "uv.lock").open("rb") as file:
+        return tomllib.load(file)
+
+
+def test_project_pins_supported_pytorch_versions() -> None:
+    project = _load_configuration()["project"]
+
+    assert project["requires-python"] == ">=3.10,<3.15"
+    assert "torch==2.13.0" in project["dependencies"]
+    assert "torchaudio==2.11.0" in project["dependencies"]
+
+
+def test_project_groups_dependencies_by_workflow() -> None:
+    configuration = _load_configuration()
+
+    assert set(configuration["project"]["dependencies"]) == {
+        "einops",
+        "dlchordx",
+        "mido",
+        "numpy",
+        "pretty-midi",
+        "pyyaml",
+        "scipy",
+        "soundfile",
+        "torch==2.13.0",
+        "torchaudio==2.11.0",
+        "tqdm",
+    }
+    assert configuration["project"]["optional-dependencies"] == {
+        "evaluation": ["mir-eval"],
+        "stem": ["chord-romanizer", "librosa", "stem-splitter"],
+        "training": [
+            "audiomentations",
+            "pedalboard",
+            "tensorboard",
+            "torch-optimizer",
+            "wandb",
+        ],
+    }
+    assert configuration["dependency-groups"] == {
+        "dev": ["pytest", "tomli; python_version < '3.11'"]
+    }
+
+
+def test_uv_uses_cuda_index_on_supported_desktop_platforms() -> None:
+    configuration = _load_configuration()
+    cuda_platform_marker = "sys_platform == 'linux' or sys_platform == 'win32'"
+
+    assert configuration["tool"]["uv"]["package"] is False
+    assert configuration["tool"]["uv"]["sources"] == {
+        "torch": [
+            {"index": "pytorch-cu130", "marker": cuda_platform_marker}
+        ],
+        "torchaudio": [
+            {"index": "pytorch-cu130", "marker": cuda_platform_marker}
+        ],
+    }
+    assert configuration["tool"]["uv"]["index"] == [
+        {
+            "name": "pytorch-cu130",
+            "url": "https://download.pytorch.org/whl/cu130",
+            "explicit": True,
+        }
+    ]
+
+
+def test_lock_contains_windows_cuda_wheels_for_supported_python_versions() -> None:
+    packages = _load_lock()["package"]
+    expected_versions = {
+        "torch": "2.13.0+cu130",
+        "torchaudio": "2.11.0+cu130",
+    }
+
+    for package_name, package_version in expected_versions.items():
+        package = next(
+            item
+            for item in packages
+            if item["name"] == package_name and item["version"] == package_version
+        )
+        wheel_urls = [wheel["url"] for wheel in package["wheels"]]
+        for python_tag in ("cp310", "cp311", "cp312", "cp313", "cp314"):
+            assert any(
+                f"-{python_tag}-{python_tag}-win_amd64.whl" in url
+                for url in wheel_urls
+            )
+
+
+def test_uv_files_are_the_dependency_source_of_truth() -> None:
+    assert (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8") == "3.12\n"
+    assert not (PROJECT_ROOT / "requirements.txt").exists()
+
+    for readme_name in ("README.md", "README_ja.md"):
+        readme = (PROJECT_ROOT / readme_name).read_text(encoding="utf-8")
+        assert "uv sync --locked" in readme
+        assert "pip install -r requirements.txt" not in readme
+
+
+def test_pytest_imports_project_modules_from_uv_environment() -> None:
+    configuration = _load_configuration()
+
+    assert configuration["tool"]["pytest"]["ini_options"]["pythonpath"] == ["."]
