@@ -34,6 +34,7 @@ from ..decoding.legacy_grid import (
 )
 from ..midi_roll import MidiFrameLoader, MidiFrameLoaderConfig
 from ..tempo_map_export import MeterSegmentSpec, export_tempo_mapped_midi
+from ...runtime import resolve_device
 
 
 HF_CHECKPOINT_BASE_URL = (
@@ -478,10 +479,7 @@ def predict_beat_chord_for_midi(
     else:
         output_midi_file = Path(output_midi_path).resolve()
 
-    if device is None:
-        device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device_obj = torch.device(device)
+    device_obj = resolve_device(device)
 
     resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
     model, model_config, metadata = load_beat_chord_model(
@@ -1198,7 +1196,7 @@ def main() -> None:
     parser.add_argument("--grid_octave_jump_penalty", type=float, default=2.0)
     parser.add_argument("--grid_min_bpm", type=float, default=30.0)
     parser.add_argument("--grid_max_bpm", type=float, default=300.0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--chord_boundary_threshold", type=float, default=0.5)
     parser.add_argument("--chord_boundary_min_distance_frames", type=int, default=5)
     parser.add_argument("--key_boundary_threshold", type=float, default=0.5)
@@ -1227,7 +1225,7 @@ def main() -> None:
     if args.grid_min_bpm <= 0.0 or args.grid_max_bpm <= args.grid_min_bpm: raise ValueError("grid BPM range must be positive and increasing")
     if args.beat_mapped_ticks_per_beat <= 0: raise ValueError("--beat_mapped_ticks_per_beat must be positive")
 
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     print(f"使用デバイス: {device}")
 
     print(f"チェックポイントをロード中: {args.checkpoint}")

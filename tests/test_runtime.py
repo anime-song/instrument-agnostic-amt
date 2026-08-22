@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import sys
+
+import pytest
+import torch
+
+from instrument_agnostic_amt.cli.infer import parse_args
+from instrument_agnostic_amt.beat_chord.key_only_candidates import parse_arguments
+from instrument_agnostic_amt.instrument_refinement.cli.infer import (
+    parse_args as parse_refinement_args,
+)
+from instrument_agnostic_amt.runtime import (
+    empty_device_cache,
+    is_amp_supported,
+    resolve_amp_dtype,
+    resolve_device,
+)
+from instrument_agnostic_amt.velocity.cli.infer_velocity import (
+    parse_args as parse_velocity_args,
+)
+
+
+def _set_available_devices(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cuda: bool,
+    mps: bool,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+
+
+def test_core_inference_cli_defaults_to_auto_device_and_device_amp_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["amt-infer", "--audio", "input.wav"])
+
+    args = parse_args()
+
+    assert (args.device, args.amp_dtype) == ("auto", None)
+
+
+def test_core_inference_cli_accepts_explicit_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "amt-infer",
+            "--audio",
+            "input.wav",
+            "--device",
+            "mps",
+            "--amp",
+            "--amp-dtype",
+            "fp16",
+        ],
+    )
+
+    args = parse_args()
+
+    assert (args.device, args.amp, args.amp_dtype) == ("mps", True, "fp16")
+
+
+def test_secondary_inference_clis_default_to_auto_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["refine-instruments", "--audio", "input.wav", "--midi", "input.mid"],
+    )
+    refinement_args = parse_refinement_args()
+    monkeypatch.setattr(sys, "argv", ["infer-velocity", "--midi", "input.mid"])
+    velocity_args = parse_velocity_args()
+    batch_args = parse_arguments([])
+
+    assert (
+        refinement_args.device,
+        velocity_args.device,
+        batch_args.device,
+    ) == ("auto", "auto", "auto")
+
+
+@pytest.mark.parametrize(
+    ("cuda_available", "mps_available", "expected_type"),
+    [
+        (True, True, "cuda"),
+        (False, True, "mps"),
+        (False, False, "cpu"),
+    ],
+)
+def test_resolve_device_auto_prioritizes_cuda_then_mps_then_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_available: bool,
+    mps_available: bool,
+    expected_type: str,
+) -> None:
+    _set_available_devices(
+        monkeypatch,
+        cuda=cuda_available,
+        mps=mps_available,
+    )
+
+    assert resolve_device("auto").type == expected_type
+
+
+@pytest.mark.parametrize("device_name", ["cuda", "mps"])
+def test_resolve_device_rejects_an_unavailable_accelerator(
+    monkeypatch: pytest.MonkeyPatch,
+    device_name: str,
+) -> None:
+    _set_available_devices(monkeypatch, cuda=False, mps=False)
+
+    with pytest.raises(RuntimeError, match=device_name.upper()):
+        resolve_device(device_name)
+
+
+def test_resolve_device_accepts_available_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_available_devices(monkeypatch, cuda=False, mps=True)
+
+    assert resolve_device("mps") == torch.device("mps")
+
+
+def test_amp_is_available_for_cuda_and_mps_only() -> None:
+    assert (
+        is_amp_supported(torch.device("cuda")),
+        is_amp_supported(torch.device("mps")),
+        is_amp_supported(torch.device("cpu")),
+    ) == (True, True, False)
+
+
+def test_amp_dtype_uses_device_safe_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        lambda *, including_emulation=True: False,
+    )
+
+    assert (
+        resolve_amp_dtype(torch.device("cuda"), None),
+        resolve_amp_dtype(torch.device("mps"), None),
+        resolve_amp_dtype(torch.device("cpu"), None),
+    ) == (torch.float16, torch.float16, torch.float32)
+
+
+def test_amp_dtype_ignores_emulated_cuda_bfloat16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_modes: list[bool] = []
+
+    def fake_bfloat16_support(*, including_emulation: bool = True) -> bool:
+        checked_modes.append(including_emulation)
+        return including_emulation
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        fake_bfloat16_support,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), None) is torch.float16
+    assert checked_modes == [False]
+
+
+def test_amp_dtype_uses_native_cuda_bfloat16_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_modes: list[bool] = []
+
+    def fake_bfloat16_support(*, including_emulation: bool = True) -> bool:
+        checked_modes.append(including_emulation)
+        return True
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        fake_bfloat16_support,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), None) is torch.bfloat16
+    assert checked_modes == [False]
+
+
+def test_explicit_bfloat16_does_not_probe_cuda_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_probe(*, including_emulation: bool = True) -> bool:
+        raise AssertionError("Explicit dtype must not probe CUDA capabilities")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        unexpected_probe,
+    )
+
+    assert resolve_amp_dtype(torch.device("cuda"), "bf16") is torch.bfloat16
+
+
+def test_empty_device_cache_supports_cuda_and_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append("mps"))
+
+    empty_device_cache(torch.device("cuda"))
+    empty_device_cache(torch.device("mps"))
+    empty_device_cache(torch.device("cpu"))
+
+    assert calls == ["cuda", "mps"]

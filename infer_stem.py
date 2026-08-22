@@ -27,6 +27,11 @@ from instrument_agnostic_amt.instrument_refinement.data.labels import (
 from instrument_agnostic_amt.instrument_refinement.modeling.checkpoints import (
     load_refinement_model,
 )
+from instrument_agnostic_amt.runtime import (
+    is_amp_supported,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from instrument_agnostic_amt.taxonomy.instrument_classes import INSTRUMENT_CLASSES
 
 # セッション中にモデルを使い回して、再実行時の待ち時間を減らす。
@@ -221,17 +226,14 @@ def get_stem_pipeline_models(
     model_type: str = "default",
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
-    if device_preference is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device_preference)
+    device = resolve_device(device_preference)
 
     resolved_checkpoint = infer._ensure_checkpoint(
         None if checkpoint_path in (None, "", "DEFAULT") else Path(checkpoint_path),
         model_type=model_type,
     )
-    amt_cache_key = ("amt", str(resolved_checkpoint.resolve()), device.type)
-    sep_cache_key = ("sep", device.type)
+    amt_cache_key = ("amt", str(resolved_checkpoint.resolve()), str(device))
+    sep_cache_key = ("sep", str(device))
 
     if sep_cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading Separation model on {device} ...")
@@ -273,13 +275,10 @@ def get_refinement_models(
     device_preference: torch.device | str | None = None,
 ) -> dict[str, object]:
     """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
-    if device_preference is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device_preference)
+    device = resolve_device(device_preference)
 
     resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
-    cache_key = ("refine", str(resolved_checkpoint), device.type)
+    cache_key = ("refine", str(resolved_checkpoint), str(device))
 
     if cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading Instrument Refinement model on {device} ...")
@@ -410,14 +409,23 @@ def run_stem_separated_transcription(
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
     merge_onset_ms: float = 20.0,
+    device: torch.device | str | None = "auto",
+    amp: bool = False,
+    amp_dtype: str | None = None,
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
     audio_file = Path(audio_path)
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
 
-    bundle = get_stem_pipeline_models(checkpoint_path=checkpoint_path, model_type="default")
+    bundle = get_stem_pipeline_models(
+        checkpoint_path=checkpoint_path,
+        device_preference=device,
+        model_type="default",
+    )
     device = bundle["device"]
+    amt_amp_enabled = bool(amp and is_amp_supported(device))
+    amt_amp_dtype = resolve_amp_dtype(device, amp_dtype)
     sep_config = bundle["sep_config"]
     sep_model = bundle["sep_model"]
     sep_dtype = bundle["sep_dtype"]
@@ -428,6 +436,7 @@ def run_stem_separated_transcription(
         if model_type_key not in amt_bundles:
             amt_bundles[model_type_key] = get_stem_pipeline_models(
                 checkpoint_path=checkpoint_path,
+                device_preference=device,
                 model_type=model_type_key,
             )
         return amt_bundles[model_type_key]
@@ -507,8 +516,8 @@ def run_stem_separated_transcription(
             model_config=current_amt_config,
             settings=current_amt_settings,
             device=device,
-            amp_enabled=False,
-            amp_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            amp_enabled=amt_amp_enabled,
+            amp_dtype=amt_amp_dtype,
             velocity=100,
             merge_gap_ms=None,
             merge_onset_ms=merge_onset_ms,

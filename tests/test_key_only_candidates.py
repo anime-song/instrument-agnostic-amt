@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pretty_midi
 import pytest
+import torch
 
 from instrument_agnostic_amt.beat_chord import key_only_candidates as candidates
 from instrument_agnostic_amt.beat_chord.key_only_candidates import (
@@ -72,6 +74,30 @@ def _make_runner(*, predict_velocity: bool = True) -> StemTranscriptionRunner:
     )
 
 
+def test_batch_runner_auto_routes_to_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    runner = StemTranscriptionRunner(
+        device="auto",
+        amt_checkpoint_dir="checkpoints",
+        separation_checkpoint="checkpoints/stem_splitter.pt",
+        velocity_checkpoint="checkpoints/best_velocity_model.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=True,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+    )
+
+    assert runner.device.type == "mps"
+
+
 def test_discover_audio_files_filters_and_sorts(tmp_path: Path) -> None:
     _touch(tmp_path / "b.mp3")
     _touch(tmp_path / "A.wav")
@@ -123,6 +149,142 @@ def test_checkpoint_auto_resolution_prefers_current_mtime(tmp_path: Path) -> Non
 )
 def test_stem_model_types_match_colab(stem_name: str, expected: str) -> None:
     assert resolve_stem_model_type(stem_name) == expected
+
+
+def test_batch_cli_exposes_core_amt_amp_options() -> None:
+    defaults = parse_arguments([])
+    enabled = parse_arguments(["--amp", "--amp-dtype", "bf16"])
+
+    assert (defaults.amp, defaults.amp_dtype) == (False, None)
+    assert (enabled.amp, enabled.amp_dtype) == (True, "bf16")
+
+
+def test_run_batch_routes_amp_options_to_stem_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_options: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            runner_options.update(kwargs)
+
+        @staticmethod
+        def release() -> None:
+            pass
+
+    monkeypatch.setattr(candidates, "_validate_arguments", lambda _args: None)
+    monkeypatch.setattr(candidates, "discover_audio_files", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        candidates,
+        "resolve_beat_chord_checkpoint",
+        lambda *_args, **_kwargs: tmp_path / "beat_chord.pth",
+    )
+    monkeypatch.setattr(candidates, "StemTranscriptionRunner", FakeRunner)
+    args = parse_arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--amp",
+            "--amp-dtype",
+            "bf16",
+        ]
+    )
+
+    results = run_batch(args)
+
+    assert results == []
+    assert (runner_options.get("amp"), runner_options.get("amp_dtype")) == (
+        True,
+        "bf16",
+    )
+
+
+def test_batch_runner_routes_amp_to_core_amt_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infer as amt_infer
+
+    inference_calls: list[dict[str, object]] = []
+
+    class Waveform:
+        def to(self, _device: torch.device) -> Waveform:
+            return self
+
+    class Midi:
+        @staticmethod
+        def write(path: str) -> None:
+            Path(path).write_bytes(b"midi")
+
+    monkeypatch.setattr(candidates, "resolve_device", lambda _value: torch.device("mps"))
+    monkeypatch.setattr(
+        amt_infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: tmp_path / "checkpoint.pth",
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (
+            object(),
+            SimpleNamespace(num_instrument_classes=2, sample_rate=1_000),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "resolve_stem_instrument_class_ids",
+        lambda _stem_name: (0,),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "filter_supported_instrument_class_ids",
+        lambda values, **_kwargs: values,
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_audio",
+        lambda *_args, **_kwargs: (Waveform(), 1_000, 2),
+    )
+
+    def fake_run_inference(**kwargs: object) -> tuple[list[object], dict, dict]:
+        inference_calls.append(kwargs)
+        return [], {}, {}
+
+    monkeypatch.setattr(amt_infer, "run_inference", fake_run_inference)
+    monkeypatch.setattr(amt_infer, "_build_midi", lambda *_args, **_kwargs: Midi())
+    monkeypatch.setattr(
+        candidates,
+        "is_valid_midi_file",
+        lambda path: Path(path).is_file(),
+    )
+    runner = StemTranscriptionRunner(
+        device="mps",
+        amt_checkpoint_dir=tmp_path,
+        separation_checkpoint=tmp_path / "separation.pth",
+        velocity_checkpoint=tmp_path / "velocity.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=False,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+        amp=True,
+        amp_dtype="bf16",
+    )
+
+    runner._transcribe_stem(
+        stem_name="piano",
+        stem_path=tmp_path / "piano.wav",
+        output_midi=tmp_path / "piano.mid",
+    )
+
+    assert len(inference_calls) == 1
+    assert inference_calls[0]["amp_enabled"] is True
+    assert inference_calls[0]["amp_dtype"] is torch.bfloat16
 
 
 def test_merge_stem_midis_limits_instruments_and_long_notes(
