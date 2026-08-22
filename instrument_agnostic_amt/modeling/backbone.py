@@ -394,7 +394,7 @@ class V1Backbone(nn.Module):
             x = x.reshape(batch_size * time_steps, token_count, token_dim)
             x = _checkpoint(band_transformer, x, enabled=use_checkpoint)
             x = x.reshape(batch_size, time_steps, token_count, token_dim)
-            x = einops.rearrange(x, "b t k d -> (b k) t d")
+            x = einops.rearrange(x, "b t k d -> (b k) t d").contiguous()
             x = _checkpoint(time_transformer, x, enabled=use_checkpoint)
             x = einops.rearrange(x, "(b k) t d -> b t k d", k=token_count)
         x = self.final_norm(x)

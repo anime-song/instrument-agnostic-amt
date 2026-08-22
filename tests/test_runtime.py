@@ -296,7 +296,7 @@ def test_compile_is_opt_in_and_targets_only_shared_transformer_regions() -> None
                 "backend": "inductor",
                 "mode": "reduce-overhead",
                 "fullgraph": False,
-                "dynamic": None,
+                "dynamic": True,
             }
         ]
         for target in targets

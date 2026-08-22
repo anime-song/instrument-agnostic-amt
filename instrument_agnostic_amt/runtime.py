@@ -87,6 +87,6 @@ def maybe_compile_forward(
             backend="inductor",
             mode=mode,
             fullgraph=False,
-            dynamic=None,
+            dynamic=True,
         )
     return model

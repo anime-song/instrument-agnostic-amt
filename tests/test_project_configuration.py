@@ -44,6 +44,7 @@ def test_project_groups_dependencies_by_workflow() -> None:
         "torch==2.13.0",
         "torchaudio==2.11.0",
         "tqdm",
+        "triton-windows>=3.7.1.post27,<3.8; sys_platform == 'win32'",
     }
     assert configuration["project"]["optional-dependencies"] == {
         "evaluation": ["mir-eval"],
@@ -102,6 +103,33 @@ def test_lock_contains_windows_cuda_wheels_for_supported_python_versions() -> No
                 f"-{python_tag}-{python_tag}-win_amd64.whl" in url
                 for url in wheel_urls
             )
+
+
+def test_lock_contains_windows_triton_wheels_for_supported_python_versions() -> None:
+    packages = _load_lock()["package"]
+    project_package = next(
+        package for package in packages if package["name"] == "instrument-agnostic-amt"
+    )
+    triton_dependencies = [
+        dependency
+        for dependency in project_package["dependencies"]
+        if dependency["name"] == "triton-windows"
+    ]
+
+    assert triton_dependencies == [
+        {"name": "triton-windows", "marker": "sys_platform == 'win32'"}
+    ]
+    triton_package = next(
+        package for package in packages if package["name"] == "triton-windows"
+    )
+
+    assert triton_package["version"] == "3.7.1.post27"
+    wheel_urls = [wheel["url"] for wheel in triton_package["wheels"]]
+    for python_tag in ("cp310", "cp311", "cp312", "cp313", "cp314"):
+        assert any(
+            f"-{python_tag}-{python_tag}-win_amd64.whl" in url
+            for url in wheel_urls
+        )
 
 
 def test_uv_files_are_the_dependency_source_of_truth() -> None:

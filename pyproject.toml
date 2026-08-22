@@ -14,6 +14,7 @@ dependencies = [
     "torch==2.13.0",
     "torchaudio==2.11.0",
     "tqdm",
+    "triton-windows>=3.7.1.post27,<3.8; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
