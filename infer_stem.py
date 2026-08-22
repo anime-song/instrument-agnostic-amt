@@ -311,6 +311,7 @@ def refine_stem_instrument_midis(
     mode: str = "cluster",
     window_seconds: float = 8.0,
     stride_seconds: float = 4.0,
+    window_batch_size: int = 1,
     disable_tqdm: bool = True,
 ) -> dict[str, Path]:
     """ステム音声を使って各ステム MIDI の楽器ラベルを付け直す。
@@ -352,6 +353,7 @@ def refine_stem_instrument_midis(
             device=device,
             window_seconds=window_seconds,
             stride_seconds=stride_seconds,
+            window_batch_size=window_batch_size,
             mode=mode,
             disable_tqdm=disable_tqdm,
             preloaded_model=refinement_model,
@@ -559,6 +561,7 @@ def run_stem_separated_transcription(
                 device=device,
                 stem_names=refinement_stem_names,
                 mode=refinement_mode,
+                window_batch_size=window_batch_size,
                 disable_tqdm=True,
             )
             if refined_midi_paths:
