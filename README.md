@@ -209,8 +209,7 @@ instrument_agnostic_amt/
 
 > Linux and Windows resolve to the CUDA 13.0 wheels. Apple Silicon macOS
 > resolves to the platform PyTorch wheels; PyTorch 2.13 does not provide Intel
-> macOS wheels. Windows CUDA wheel resolution is covered by the lockfile tests,
-> but has not been run on a Windows CUDA host.
+> macOS wheels.
 
 ```bash
 # Clone

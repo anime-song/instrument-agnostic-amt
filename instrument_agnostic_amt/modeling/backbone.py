@@ -111,6 +111,26 @@ class AudioFeatureExtractor(nn.Module):
             ),
             persistent=False,
         )
+        base_bins = torch.arange(self.cqt_n_bins, dtype=torch.float32)
+        harmonic_positions = (
+            base_bins.unsqueeze(0) + self.harmonic_shifts.unsqueeze(1)
+        ).clamp(0, self.n_bins_large - 1)
+        harmonic_lower_indices = harmonic_positions.floor().long()
+        self.register_buffer(
+            "harmonic_lower_indices",
+            harmonic_lower_indices,
+            persistent=False,
+        )
+        self.register_buffer(
+            "harmonic_upper_indices",
+            (harmonic_lower_indices + 1).clamp(max=self.n_bins_large - 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "harmonic_interpolation_alpha",
+            harmonic_positions - harmonic_lower_indices,
+            persistent=False,
+        )
         self.spec_augment = (
             SpecAugment(**spec_augment_params) if spec_augment_params else None
         )
@@ -132,6 +152,37 @@ class AudioFeatureExtractor(nn.Module):
         augmented, _ = self.spec_augment((spec_btf - mean) / std)
         return (augmented * std + mean).transpose(1, 2).clamp_min(0.0)
 
+    def _interpolate_harmonic_specs(
+        self,
+        large_spec: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.training and not torch.is_grad_enabled():
+            lower_values = large_spec[:, self.harmonic_lower_indices, :]
+            spec = large_spec[:, self.harmonic_upper_indices, :]
+            spec.sub_(lower_values).mul_(
+                self.harmonic_interpolation_alpha.unsqueeze(0).unsqueeze(-1)
+            ).add_(lower_values)
+            if self.cqt_log_scale:
+                spec = torch.log(spec + 1e-8)
+            return spec
+
+        harmonic_specs: list[torch.Tensor] = []
+        for index in range(self.num_harmonics):
+            lower = self.harmonic_lower_indices[index]
+            upper = self.harmonic_upper_indices[index]
+            alpha = (
+                self.harmonic_interpolation_alpha[index]
+                .unsqueeze(0)
+                .unsqueeze(-1)
+            )
+            value = large_spec[:, lower, :] + alpha * (
+                large_spec[:, upper, :] - large_spec[:, lower, :]
+            )
+            if self.cqt_log_scale:
+                value = torch.log(value + 1e-8)
+            harmonic_specs.append(value)
+        return torch.stack(harmonic_specs, dim=1)
+
     def forward(self, waveform: torch.Tensor) -> BackboneContext:
         if waveform.ndim != 3 or int(waveform.shape[1]) != self.input_audio_channels:
             raise ValueError(
@@ -152,25 +203,7 @@ class AudioFeatureExtractor(nn.Module):
             )
         large_spec = self._apply_spec_augment(large_spec)
 
-        base_bins = torch.arange(
-            self.cqt_n_bins, device=large_spec.device, dtype=large_spec.dtype
-        )
-        harmonic_specs: list[torch.Tensor] = []
-        for index in range(self.num_harmonics):
-            position = (base_bins + self.harmonic_shifts[index]).clamp(
-                0, int(large_spec.shape[1]) - 1
-            )
-            lower = torch.floor(position).long()
-            upper = (lower + 1).clamp(max=int(large_spec.shape[1]) - 1)
-            alpha = (position - lower).unsqueeze(0).unsqueeze(-1)
-            value = large_spec[:, lower, :] + alpha * (
-                large_spec[:, upper, :] - large_spec[:, lower, :]
-            )
-            if self.cqt_log_scale:
-                value = torch.log(value + 1e-8)
-            harmonic_specs.append(value)
-
-        spec = torch.stack(harmonic_specs, dim=1)
+        spec = self._interpolate_harmonic_specs(large_spec)
         spec = einops.rearrange(
             spec,
             "(b c) h f t -> b c h f t",
@@ -227,13 +260,25 @@ class StemConv(nn.Module):
             nn.GELU(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x) + self.freq_embed[:, :, :, : int(x.shape[-1])]
         x = self.conv2(x)
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
         return self.block4(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.training
+            and torch.is_autocast_enabled(x.device.type)
+            and torch.get_autocast_dtype(x.device.type) == torch.float16
+        ):
+            # FP16 AMP の推論時は、StemConv 全体を FP32 で実行して
+            # 畳み込みのオーバーフローを防ぐ。
+            with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                return self._forward_impl(x.float())
+        return self._forward_impl(x)
 
 
 class PitchQueryEmbedding(nn.Module):

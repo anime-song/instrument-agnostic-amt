@@ -350,6 +350,55 @@ def test_midi_frame_beat_chord_forward_shapes() -> None:
     assert outputs["chord_pitch_logits"].shape == (1, 32, 25)
 
 
+def test_midi_frame_beat_chord_can_omit_auxiliary_outputs() -> None:
+    config = MidiFrameModelConfig(
+        sample_rate=22_050,
+        hop_length=512,
+        pitch_min=21,
+        pitch_max=32,
+        num_input_channels=4,
+        base_ch=2,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_global_tokens=2,
+        dropout=0.0,
+        num_meter_classes=3,
+        num_root_chord_classes=25,
+        inter_refine_layers=(0,),
+    )
+    model = MidiFrameBeatChordModel(config).eval()
+    midi_frames = torch.zeros(1, 4, 32, 12)
+
+    with torch.inference_mode():
+        full = model(
+            midi_frames,
+            include_beat=True,
+            include_chord=True,
+        )
+        minimal = model(
+            midi_frames,
+            include_beat=True,
+            include_chord=True,
+            include_aux_outputs=False,
+        )
+
+    auxiliary_keys = {
+        "global_features",
+        "lowres_global_features",
+        "global_token_features",
+        "lowres_global_tokens",
+        "beat_features",
+        "chord_features",
+        "intermediate_outputs",
+    }
+    assert auxiliary_keys <= set(full)
+    assert set(minimal) == set(full) - auxiliary_keys
+    for key, value in minimal.items():
+        assert isinstance(value, torch.Tensor)
+        assert torch.equal(value, full[key])
+
+
 def test_midi_frame_loader_builds_sustain_and_onset_channels(
     tmp_path: Path,
 ) -> None:
