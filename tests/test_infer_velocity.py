@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from pathlib import Path
 
 import mido
@@ -339,6 +340,7 @@ def test_velocity_inference_skips_unused_stem_gain_head(
     tmp_path: Path,
 ) -> None:
     include_stem_gain_values: list[bool] = []
+    inference_mode_values: list[bool] = []
 
     class FakeVelocityModel:
         def to(self, _device: torch.device) -> FakeVelocityModel:
@@ -355,6 +357,7 @@ def test_velocity_inference_skips_unused_stem_gain_head(
             **kwargs: torch.Tensor,
         ) -> dict[str, torch.Tensor]:
             include_stem_gain_values.append(include_stem_gain)
+            inference_mode_values.append(torch.is_inference_mode_enabled())
             outputs = {
                 "velocity_expected": torch.full_like(
                     kwargs["note_start_seconds"],
@@ -387,6 +390,82 @@ def test_velocity_inference_skips_unused_stem_gain_head(
     )
 
     assert include_stem_gain_values == [False]
+    assert inference_mode_values == [True]
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(),
+                reason="MPS is not available",
+            ),
+        ),
+    ],
+)
+def test_velocity_inference_releases_window_outputs_after_cpu_extraction(
+    device_name: str,
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
+    guitar_midi.instruments[0].notes.append(
+        pretty_midi.Note(
+            velocity=80,
+            pitch=64,
+            start=1.6,
+            end=1.9,
+        )
+    )
+    guitar_midi.write(str(mock_stem_midis["guitar"]))
+
+    output_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    class WindowedVelocityModel:
+        def __call__(
+            self,
+            _audio: torch.Tensor,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            if output_refs:
+                assert output_refs[-1]() is None
+            output = torch.full_like(
+                kwargs["note_start_seconds"],
+                (37.0, 93.0)[len(output_refs)],
+            )
+            output_refs.append(weakref.ref(output))
+            return {"velocity_expected": output}
+
+    model = WindowedVelocityModel()
+    config = VelocityModelConfig(sample_rate=22_050, predict_stem_gain=False)
+    monkeypatch.setattr(
+        velocity_infer,
+        "load_velocity_model",
+        lambda *_args, **_kwargs: (model, config),
+    )
+
+    output_path = tmp_path / "window_output_lifetime.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis={"guitar": mock_stem_midis["guitar"]},
+        stem_audios={"guitar": mock_audio_stems["guitar"]},
+        output_midi_path=output_path,
+        device=device_name,
+        window_seconds=1.0,
+        disable_tqdm=True,
+    )
+
+    assert all(output_ref() is None for output_ref in output_refs)
+    output_midi = pretty_midi.PrettyMIDI(str(output_path))
+    assert {
+        round(note.start, 1): note.velocity
+        for instrument in output_midi.instruments
+        for note in instrument.notes
+    } == {0.5: 37, 1.6: 93}
 
 
 def test_preloaded_velocity_forward_requires_matching_eager_model() -> None:
