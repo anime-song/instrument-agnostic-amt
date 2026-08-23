@@ -210,7 +210,12 @@ def decode_v1_notes(
             enabled=amp_enabled and is_amp_supported(device),
         ):
             outputs = inference_model(
-                batch, valid_audio_frames=valid_tensor, include_aux_outputs=False
+                batch,
+                valid_audio_frames=valid_tensor,
+                include_aux_outputs=False,
+                include_frame_instrument_logits=(
+                    not model._use_interval_instrument_head
+                ),
             )
         valid_mask = outputs.get("frame_valid_mask")
         if valid_mask is None:

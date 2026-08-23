@@ -21,12 +21,12 @@ class BackboneContext:
 
 @dataclass(frozen=True)
 class BackboneOutput:
-    band_features: torch.Tensor
+    band_features: torch.Tensor | None
     global_features: torch.Tensor | None
     pitch_query_features: torch.Tensor
-    lowres_band_features: torch.Tensor
+    lowres_band_features: torch.Tensor | None
     lowres_global_features: torch.Tensor | None
-    lowres_pitch_query_features: torch.Tensor
+    lowres_pitch_query_features: torch.Tensor | None
 
 
 class AudioFeatureExtractor(nn.Module):
@@ -411,7 +411,12 @@ class V1Backbone(nn.Module):
             return F.pad(x, (0, 0, 0, int(target_length) - int(x.shape[2])))
         return x[:, :, :target_length]
 
-    def forward(self, waveform: torch.Tensor) -> BackboneOutput:
+    def forward(
+        self,
+        waveform: torch.Tensor,
+        *,
+        include_aux_outputs: bool = True,
+    ) -> BackboneOutput:
         context = self.feature_extractor(waveform)
         x = einops.rearrange(self.stem(context.spec), "b d t f -> b t f d")
         batch_size, _, num_bands, _ = x.shape
@@ -461,10 +466,12 @@ class V1Backbone(nn.Module):
         pitch_part = self._match_time_length(pitch_part, context.crop_length)
 
         lowres_global_features = (
-            global_part.squeeze(2).contiguous() if global_part is not None else None
+            global_part.squeeze(2).contiguous()
+            if global_part is not None and include_aux_outputs
+            else None
         )
         global_features = None
-        if global_part is not None:
+        if global_part is not None and include_aux_outputs:
             if self.global_up_conv is None:
                 raise RuntimeError("global_up_conv is not initialized")
             global_part = einops.rearrange(global_part, "b t g d -> (b g) d t")
@@ -476,10 +483,20 @@ class V1Backbone(nn.Module):
             global_features = global_part.squeeze(1).contiguous()
 
         return BackboneOutput(
-            band_features=band_part.permute(0, 2, 1, 3).contiguous(),
+            band_features=(
+                band_part.permute(0, 2, 1, 3).contiguous()
+                if include_aux_outputs
+                else None
+            ),
             global_features=global_features,
             pitch_query_features=pitch_part.permute(0, 2, 1, 3).contiguous(),
-            lowres_band_features=band_part.contiguous(),
+            lowres_band_features=(
+                band_part.contiguous() if include_aux_outputs else None
+            ),
             lowres_global_features=lowres_global_features,
-            lowres_pitch_query_features=x[:, :, pitch_start:, :].contiguous(),
+            lowres_pitch_query_features=(
+                x[:, :, pitch_start:, :].contiguous()
+                if include_aux_outputs
+                else None
+            ),
         )

@@ -198,11 +198,15 @@ class AudioSemiCRFTransformer(nn.Module):
         valid_audio_frames: Optional[torch.Tensor] = None,
         include_amt: bool = True,
         include_aux_outputs: bool = True,
+        include_frame_instrument_logits: bool = True,
         **_: object,
     ) -> dict[str, torch.Tensor | None]:
         if not include_amt:
             raise ValueError("this model exposes only the AMT task")
-        backbone_output = self.backbone(waveform)
+        backbone_output = self.backbone(
+            waveform,
+            include_aux_outputs=include_aux_outputs,
+        )
         pitch_features = backbone_output.pitch_query_features
         frame_valid_mask = self._build_frame_valid_mask(
             batch_size=int(waveform.shape[0]),
@@ -210,9 +214,14 @@ class AudioSemiCRFTransformer(nn.Module):
             valid_audio_frames=valid_audio_frames,
             device=waveform.device,
         )
-        outputs: dict[str, torch.Tensor | None] = self.head(
-            pitch_features, frame_valid_mask
-        )
+        if isinstance(self.head, V1SemiCRFHead):
+            outputs: dict[str, torch.Tensor | None] = self.head(
+                pitch_features,
+                frame_valid_mask,
+                include_frame_instrument_logits=include_frame_instrument_logits,
+            )
+        else:
+            outputs = self.head(pitch_features, frame_valid_mask)
         outputs.update(
             {
                 "band_features": (
