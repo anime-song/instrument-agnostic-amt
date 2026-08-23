@@ -237,6 +237,9 @@ def test_stem_workflow_exposes_device_and_amp_options() -> None:
     parameters = signature(run_stem_separated_transcription).parameters
 
     assert (
+        parameters.get("stem_splitter_batch_size").default
+        if parameters.get("stem_splitter_batch_size")
+        else None,
         parameters.get("device").default if parameters.get("device") else None,
         parameters.get("amp").default if parameters.get("amp") else None,
         parameters.get("amp_dtype").default if parameters.get("amp_dtype") else "missing",
@@ -249,7 +252,59 @@ def test_stem_workflow_exposes_device_and_amp_options() -> None:
         parameters.get("compile_mode").default
         if parameters.get("compile_mode")
         else None,
-    ) == ("auto", False, None, False, False, "default")
+    ) == (1, "auto", False, None, False, False, "default")
+
+
+def test_stem_pipeline_changes_separator_batch_size_without_reloading_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"")
+    separator_load_batch_sizes: list[int] = []
+
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (object(), object(), object()),
+    )
+
+    def fake_load_separator(config: SimpleNamespace, **_kwargs: object) -> object:
+        separator_load_batch_sizes.append(config.batch_size)
+        return object()
+
+    monkeypatch.setattr(
+        infer_stem,
+        "load_mss_model",
+        fake_load_separator,
+    )
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    batch_one = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        stem_splitter_batch_size=1,
+    )
+    batch_four = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        stem_splitter_batch_size=4,
+    )
+
+    assert batch_one["sep_config"].batch_size == 1
+    assert batch_four["sep_config"].batch_size == 4
+    assert batch_one["sep_model"] is batch_four["sep_model"]
+    assert separator_load_batch_sizes == [1]
+
+
+def test_stem_pipeline_rejects_invalid_separator_batch_size() -> None:
+    with pytest.raises(ValueError, match="stem_splitter_batch_size"):
+        get_stem_pipeline_models(stem_splitter_batch_size=0)
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:

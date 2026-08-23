@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -231,10 +232,14 @@ def get_stem_pipeline_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
     model_type: str = "default",
+    stem_splitter_batch_size: int = 1,
     compile_model: bool = False,
     compile_mode: str = "default",
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
+    if stem_splitter_batch_size < 1:
+        raise ValueError("stem_splitter_batch_size must be at least 1")
+
     device = resolve_device(device_preference)
 
     resolved_checkpoint = infer._ensure_checkpoint(
@@ -254,12 +259,22 @@ def get_stem_pipeline_models(
 
     if sep_cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading Separation model on {device} ...")
-        sep_config = SeparationConfig(skip_existing=True)
+        sep_config = SeparationConfig(
+            batch_size=int(stem_splitter_batch_size),
+            skip_existing=True,
+        )
         sep_model = load_mss_model(sep_config, device=device)
-        sep_dtype = torch.float16 if sep_config.use_half_precision and device.type == "cuda" else torch.float32
+        sep_dtype = (
+            torch.float16
+            if sep_config.use_half_precision and device.type == "cuda"
+            else torch.float32
+        )
         STEM_PIPELINE_CACHE[sep_cache_key] = (sep_config, sep_model, sep_dtype)
     else:
-        sep_config, sep_model, sep_dtype = STEM_PIPELINE_CACHE[sep_cache_key]
+        cached_sep_config, sep_model, sep_dtype = STEM_PIPELINE_CACHE[sep_cache_key]
+        # 分離モデルは共通のまま、今回の実行にだけバッチサイズを反映する。
+        sep_config = copy.copy(cached_sep_config)
+        sep_config.batch_size = int(stem_splitter_batch_size)
 
     if amt_cache_key not in STEM_PIPELINE_CACHE:
         print(f"Loading AMT model ({model_type}) on {device} ...")
@@ -479,6 +494,7 @@ def run_stem_separated_transcription(
     *,
     checkpoint_path: Path | str | None = None,
     output_root: Path | str = "colab_outputs",
+    stem_splitter_batch_size: int = 1,
     window_batch_size: int = 4,
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
@@ -508,6 +524,7 @@ def run_stem_separated_transcription(
         checkpoint_path=checkpoint_path,
         device_preference=device,
         model_type="default",
+        stem_splitter_batch_size=stem_splitter_batch_size,
         compile_model=compile_model,
         compile_mode=compile_mode,
     )
@@ -549,6 +566,7 @@ def run_stem_separated_transcription(
                 checkpoint_path=checkpoint_path,
                 device_preference=device,
                 model_type=model_type_key,
+                stem_splitter_batch_size=stem_splitter_batch_size,
                 compile_model=compile_model,
                 compile_mode=compile_mode,
             )
@@ -568,7 +586,10 @@ def run_stem_separated_transcription(
         audio_file,
         temp_dir=run_root / "prepared_inputs",
     )
-    print(f"Separating stems for: {audio_file.name}")
+    print(
+        f"Separating stems for: {audio_file.name} "
+        f"(batch_size={stem_splitter_batch_size})"
+    )
     stems = _separate_one_file(
         separation_input,
         stem_dir,
