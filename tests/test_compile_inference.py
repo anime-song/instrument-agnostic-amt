@@ -111,7 +111,7 @@ def _small_amt_model() -> AudioSemiCRFTransformer:
         harmonics=(1.0,),
         hidden_size=8,
         base_ch=4,
-        encoder_num_layers=1,
+        encoder_num_layers=2,
         encoder_num_heads=2,
         dropout=0.0,
         use_gradient_checkpoint=False,

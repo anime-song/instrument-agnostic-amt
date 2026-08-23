@@ -436,7 +436,7 @@ class V1Backbone(nn.Module):
         )
         for time_transformer, band_transformer in self.layers:
             batch_size, time_steps, token_count, token_dim = x.shape
-            x = x.reshape(batch_size * time_steps, token_count, token_dim)
+            x = x.reshape(batch_size * time_steps, token_count, token_dim).contiguous()
             x = _checkpoint(band_transformer, x, enabled=use_checkpoint)
             x = x.reshape(batch_size, time_steps, token_count, token_dim)
             x = einops.rearrange(x, "b t k d -> (b k) t d").contiguous()
