@@ -36,12 +36,16 @@ def _decode_boundary_map(
     presence = presence_logits > 0.0
     offset_dist = torch.distributions.ContinuousBernoulli(logits=offset_logits)
     offsets = torch.clamp((offset_dist.mean - 0.005) / 0.99, 0.0, 1.0)
+    decoded_rows = torch.cat(
+        (presence.to(dtype=offsets.dtype), offsets),
+        dim=-1,
+    ).detach().cpu().tolist()
     return {
         (entry[0], entry[1], entry[2]): (
-            bool(presence[index, 0]),
-            bool(presence[index, 1]),
-            float(offsets[index, 0]),
-            float(offsets[index, 1]),
+            bool(decoded_rows[index][0]),
+            bool(decoded_rows[index][1]),
+            float(decoded_rows[index][2]),
+            float(decoded_rows[index][3]),
         )
         for index, entry in enumerate(entries)
     }
@@ -63,13 +67,50 @@ def _decode_instrument_map(
         else torch.sigmoid(selected_logits)
     )
     order = probabilities.argsort(dim=-1, descending=True)
+    order_rows = order.detach().cpu().tolist()
     decoded = {}
     for index, entry in enumerate(entries):
         candidates = tuple(
             int(allowed_instrument_ids[int(value)])
-            for value in order[index].tolist()
+            for value in order_rows[index]
         )
         decoded[(entry[0], entry[1], entry[2])] = (candidates[0], candidates)
+    return decoded
+
+
+def _decode_frame_instrument_map(
+    frame_logits: torch.Tensor,
+    decoded_batch: list[list[list[tuple[int, int]]]],
+    *,
+    num_pitch_slots: int,
+    allowed_instrument_ids: tuple[int, ...],
+    excluded_keys: set[tuple[int, int, int]],
+) -> dict[tuple[int, int, int], tuple[int, tuple[int, ...]]]:
+    keys: list[tuple[int, int, int]] = []
+    orders: list[torch.Tensor] = []
+    for batch_index, sample_intervals in enumerate(decoded_batch):
+        for track, intervals in enumerate(sample_intervals):
+            pitch_index = track // int(num_pitch_slots)
+            for interval_index, (begin, end) in enumerate(intervals):
+                key = (batch_index, track, interval_index)
+                if key in excluded_keys:
+                    continue
+                logits = frame_logits[
+                    batch_index, begin : end + 1, pitch_index
+                ].float().mean(dim=0)
+                selected_logits = logits[list(allowed_instrument_ids)]
+                keys.append(key)
+                orders.append(selected_logits.argsort(descending=True))
+
+    if not orders:
+        return {}
+    order_rows = torch.stack(orders).detach().cpu().tolist()
+    decoded = {}
+    for key, order_row in zip(keys, order_rows):
+        candidates = tuple(
+            int(allowed_instrument_ids[int(value)]) for value in order_row
+        )
+        decoded[key] = (candidates[0], candidates)
     return decoded
 
 
@@ -175,12 +216,15 @@ def decode_v1_notes(
         if valid_mask is None:
             raise ValueError("V1 inference requires frame_valid_mask")
         valid_lengths = valid_mask.long().sum(dim=-1)
+        valid_length_values = tuple(
+            int(value) for value in valid_lengths.detach().cpu().tolist()
+        )
         decoded_batch: list[list[list[tuple[int, int]]]] = []
         boundary_map: dict[tuple[int, int, int], tuple[bool, bool, float, float]] = {}
         interval_features = outputs.get("interval_features")
         # model forwardは窓バッチのまま、状態に依存する復号だけを窓順に進める。
         for batch_index, window_start in enumerate(active_starts):
-            valid_model_frames = int(valid_lengths[batch_index].item())
+            valid_model_frames = valid_length_values[batch_index]
             window_model_start = int(
                 round(float(window_start) / float(config.hop_length))
             )
@@ -247,6 +291,9 @@ def decode_v1_notes(
                             window_model_start + int(end)
                         )
 
+        batch_decoded_interval_count = sum(
+            len(intervals) for sample in decoded_batch for intervals in sample
+        )
         instrument_map = {}
         instrument_features = outputs.get("instrument_features")
         if (
@@ -265,10 +312,24 @@ def decode_v1_notes(
             )
 
         frame_logits = outputs.get("instrument_logits")
+        fallback_instrument_map = (
+            _decode_frame_instrument_map(
+                frame_logits,
+                decoded_batch,
+                num_pitch_slots=int(config.num_pitch_slots),
+                allowed_instrument_ids=candidate_instrument_ids,
+                excluded_keys=set(instrument_map),
+            )
+            if (
+                frame_logits is not None
+                and len(instrument_map) < batch_decoded_interval_count
+            )
+            else {}
+        )
         for batch_index, (window_start, valid_frames) in enumerate(
             zip(active_starts, active_valid)
         ):
-            valid_model_frames = int(valid_lengths[batch_index])
+            valid_model_frames = valid_length_values[batch_index]
             for track, intervals in enumerate(decoded_batch[batch_index]):
                 pitch_index = track // int(config.num_pitch_slots)
                 slot_index = track % int(config.num_pitch_slots)
@@ -276,17 +337,8 @@ def decode_v1_notes(
                     key = (batch_index, track, interval_index)
                     boundary_flag = boundary_map.get(key)
                     predicted = instrument_map.get(key)
-                    if predicted is None and frame_logits is not None:
-                        logits = frame_logits[
-                            batch_index, begin : end + 1, pitch_index
-                        ].float().mean(dim=0)
-                        selected_logits = logits[list(candidate_instrument_ids)]
-                        candidates_tensor = selected_logits.argsort(descending=True)
-                        candidates = tuple(
-                            int(candidate_instrument_ids[int(value)])
-                            for value in candidates_tensor.tolist()
-                        )
-                        predicted = (candidates[0], candidates)
+                    if predicted is None:
+                        predicted = fallback_instrument_map.get(key)
                     if predicted is None:
                         predicted = (
                             candidate_instrument_ids[0],
@@ -310,6 +362,16 @@ def decode_v1_notes(
                         # continuation track independent of per-window class jitter.
                         note.instrument_id = 0
                         stitcher.notes_by_pair[track].append(note)
+
+        del (
+            outputs,
+            batch,
+            valid_mask,
+            valid_lengths,
+            interval_features,
+            instrument_features,
+            frame_logits,
+        )
 
     notes = stitcher.finalize()
     for note in notes:
