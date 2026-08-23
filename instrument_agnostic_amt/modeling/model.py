@@ -288,6 +288,8 @@ class AudioSemiCRFTransformer(nn.Module):
         interval_features: torch.Tensor,
         selected_pairs: SelectedPairIndices,
         interval_batch: Sequence[Sequence[tuple[int, int]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int]]]:
         if not isinstance(self.head, V2OverlapSemiCRFHead):
             raise RuntimeError("flat interval boundaries require the V2 head")
@@ -295,6 +297,7 @@ class AudioSemiCRFTransformer(nn.Module):
             interval_features,
             selected_pairs,
             interval_batch,
+            compute_dtype=compute_dtype,
         )
 
     def load_state_dict(

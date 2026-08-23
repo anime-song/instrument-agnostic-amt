@@ -184,9 +184,18 @@ class V2OverlapSemiCRFHead(nn.Module):
         interval_features: torch.Tensor,
         selected_pairs: SelectedPairIndices,
         interval_batch: Sequence[Sequence[tuple[int, int]]],
+        *,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int, int, int]]]:
+        output_dtype = (
+            interval_features.dtype if compute_dtype is None else compute_dtype
+        )
         if self.interval_boundary_predictor is None:
-            return interval_features.new_zeros((0, 4)), []
+            return torch.zeros(
+                (0, 4),
+                device=interval_features.device,
+                dtype=output_dtype,
+            ), []
         if interval_features.dim() != 4:
             raise ValueError("interval_features must have shape [B, T, P, D]")
         if len(interval_batch) != selected_pairs.track_count:
@@ -197,7 +206,11 @@ class V2OverlapSemiCRFHead(nn.Module):
             for interval_index, (begin, end) in enumerate(intervals)
         ]
         if not entries:
-            return interval_features.new_zeros((0, 4)), []
+            return torch.zeros(
+                (0, 4),
+                device=interval_features.device,
+                dtype=output_dtype,
+            ), []
 
         # Only decoded/gold endpoints need instrument-conditioned features.  This
         # avoids materializing the full [T, selected-pair, D] tensor used by the
@@ -216,16 +229,14 @@ class V2OverlapSemiCRFHead(nn.Module):
         instrument_indices = selected_pairs.instrument_indices.index_select(0, track)
         pitch_indices = selected_pairs.pitch_indices.index_select(0, track)
         instrument_features = self.instrument_embedding(instrument_indices)
-        begin_features = (
-            interval_features[batch_indices, begin, pitch_indices]
-            + instrument_features
-        )
-        end_features = (
-            interval_features[batch_indices, end, pitch_indices]
-            + instrument_features
-        )
+        begin_features = interval_features[batch_indices, begin, pitch_indices]
+        end_features = interval_features[batch_indices, end, pitch_indices]
+        if compute_dtype is not None:
+            begin_features = begin_features.to(dtype=compute_dtype)
+            end_features = end_features.to(dtype=compute_dtype)
+        begin_features = begin_features + instrument_features
+        end_features = end_features + instrument_features
         endpoints = torch.cat(
             [begin_features, end_features, begin_features * end_features], dim=-1
         )
         return self.interval_boundary_predictor(endpoints), entries
-
