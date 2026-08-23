@@ -252,7 +252,10 @@ def test_stem_workflow_exposes_device_and_amp_options() -> None:
         parameters.get("compile_mode").default
         if parameters.get("compile_mode")
         else None,
-    ) == (1, "auto", False, None, False, False, "default")
+        parameters.get("semi_crf_backend").default
+        if parameters.get("semi_crf_backend")
+        else None,
+    ) == (1, "auto", False, None, False, False, "default", "torch")
 
 
 def test_stem_pipeline_changes_separator_batch_size_without_reloading_model(
@@ -305,6 +308,14 @@ def test_stem_pipeline_changes_separator_batch_size_without_reloading_model(
 def test_stem_pipeline_rejects_invalid_separator_batch_size() -> None:
     with pytest.raises(ValueError, match="stem_splitter_batch_size"):
         get_stem_pipeline_models(stem_splitter_batch_size=0)
+
+
+def test_stem_pipeline_rejects_triton_without_cuda() -> None:
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        get_stem_pipeline_models(
+            device_preference="cpu",
+            semi_crf_backend="triton",
+        )
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:

@@ -229,6 +229,15 @@ def parse_args() -> argparse.Namespace:
         help="Chunk size for Semi-CRF track decoding. Defaults to checkpoint value, or 128.",
     )
     parser.add_argument(
+        "--semi-crf-backend",
+        choices=("torch", "triton"),
+        default="torch",
+        help=(
+            "Dense Semi-CRF decoder backend. Triton requires CUDA and performs "
+            "a one-time JIT compilation for each frame length."
+        ),
+    )
+    parser.add_argument(
         "--semi-crf-sparse-decode",
         action="store_true",
         help="Decode Semi-CRF paths from a sparse interval candidate set.",
@@ -346,6 +355,11 @@ def parse_args() -> argparse.Namespace:
             "--semi-crf-sparse-decode requires --semi-crf-sparse-max-span-ms "
             "to avoid dense score construction"
         )
+    if args.semi_crf_sparse_decode and args.semi_crf_backend != "torch":
+        parser.error(
+            "--semi-crf-backend triton cannot be combined with "
+            "--semi-crf-sparse-decode"
+        )
     if args.instrument_pair_infer_topk < 0:
         parser.error("--instrument-pair-infer-topk must be non-negative")
     if args.instrument_pair_max_pairs <= 0:
@@ -446,6 +460,7 @@ def resolve_inference_settings(
         instrument_probability_mode=(
             "softmax" if training_args.get("instrument_loss_type") == "ce" else "sigmoid"
         ),
+        semi_crf_backend=str(args.semi_crf_backend),
         semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
         semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
         semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
@@ -517,6 +532,7 @@ def process_file(
         f"wrote {len(notes)} notes: {output_midi_path} "
         f"instrument={_instrument_label(instrument_id)} "
         f"window_ms={settings.window_ms} stride_ms={settings.stride_ms} "
+        f"semi_crf_backend={settings.semi_crf_backend} "
         f"windows={stats['window_count']} "
         f"decoded_windows={stats['decoded_window_count']} "
         f"skipped_silent_windows={stats['skipped_silent_window_count']} "
@@ -534,6 +550,8 @@ def process_file(
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
+    if args.semi_crf_backend == "triton" and device.type != "cuda":
+        raise ValueError("--semi-crf-backend triton requires a CUDA device")
     amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
     amp_enabled = bool(args.amp and is_amp_supported(device))
     instrument_id = (

@@ -35,6 +35,7 @@ def _load_model_and_settings(
     stride_ms_override: int | None,
     track_batch_size_override: int | None,
     note_bias: float = 0.0,
+    semi_crf_backend: str = "torch",
 ):
     model, config, training_args = load_model(Path(checkpoint_path), device=device)
     args = SimpleNamespace(
@@ -48,6 +49,7 @@ def _load_model_and_settings(
         note_bias=note_bias,
         disable_tqdm=False,
         no_boundary_head=False,
+        semi_crf_backend=semi_crf_backend,
         semi_crf_sparse_decode=False,
         semi_crf_sparse_topk_per_start=16,
         semi_crf_sparse_score_threshold=None,

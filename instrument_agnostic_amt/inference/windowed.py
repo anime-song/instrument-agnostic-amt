@@ -791,6 +791,7 @@ def decode_notes(
                     note_bias=float(settings.note_bias),
                     track_batch_size=int(settings.track_batch_size),
                     forced_start_pos=forced_start_pos,
+                    backend=settings.semi_crf_backend,
                 )
 
             decoded_interval_count += sum(len(track) for track in decoded_intervals)

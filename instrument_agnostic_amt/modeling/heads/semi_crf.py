@@ -90,6 +90,8 @@ def viterbiBackward(
     score: torch.Tensor,
     noiseScore: torch.Tensor,
     forcedStartPos: Optional[List[int]] = None,
+    *,
+    backend: str = "torch",
 ) -> IntervalBatch:
     """
     左から右へ最良の区間列をデコードする。
@@ -98,7 +100,23 @@ def viterbiBackward(
         score: [T, T, B]。score[end, begin, batch]は[begin, end]のスコア。
         noiseScore: [T-1, B]。位置[t, t+1]をskipするスコア。
         forcedStartPos: 分割デコードで使用するトラックごとの開始位置。
+        backend: dense Viterbiを実行するバックエンド。torchまたはtriton。
     """
+    if backend not in {"torch", "triton"}:
+        raise ValueError("backend must be one of {'torch', 'triton'}")
+    if backend == "triton":
+        if score.device.type != "cuda":
+            raise ValueError("Triton Semi-CRF decoding requires a CUDA tensor")
+        try:
+            from .semi_crf_triton import viterbi_backward_triton
+        except ModuleNotFoundError as exc:
+            if exc.name is None or not exc.name.startswith("triton"):
+                raise
+            raise RuntimeError(
+                "Triton Semi-CRF decoding requires the triton package"
+            ) from exc
+        return viterbi_backward_triton(score, noiseScore, forcedStartPos)
+
     pointers, diag_inclusion = _viterbi_backward_tensors(score, noiseScore)
     time_steps = int(score.shape[0])
     track_count = int(score.shape[2])
@@ -378,12 +396,23 @@ class NeuralSemiCRFInterval:
         self.noiseScore = noiseScore
 
     def decode(
-        self, forcedStartPos: Optional[List[int]] = None, forward: bool = False
+        self,
+        forcedStartPos: Optional[List[int]] = None,
+        forward: bool = False,
+        *,
+        backend: str = "torch",
     ) -> IntervalBatch:
-        """Decode the best interval sequence."""
+        """指定バックエンドで最良の区間列をデコードする。"""
         if forward:
+            if backend != "torch":
+                raise ValueError("forward Viterbi decoding only supports torch")
             return viterbi(self.score, self.noiseScore, forcedStartPos)
-        return viterbiBackward(self.score, self.noiseScore, forcedStartPos)
+        return viterbiBackward(
+            self.score,
+            self.noiseScore,
+            forcedStartPos,
+            backend=backend,
+        )
 
     def evalPath(self, intervals: IntervalBatch) -> torch.Tensor:
         """Compute the unnormalized score of a given interval path."""
@@ -1919,6 +1948,7 @@ def decode_pitch_intervals(
     note_bias: float = 0.0,
     track_batch_size: int = 128,
     forced_start_pos: Optional[torch.Tensor | List[int] | List[List[int]]] = None,
+    backend: str = "torch",
 ) -> PitchIntervalBatch:
     """
     Decode pitch-wise best non-overlapping intervals from interval query/key features.
@@ -2017,7 +2047,10 @@ def decode_pitch_intervals(
                 ).tolist()
             else:
                 chunk_forced_start_pos = None
-            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
+            decoded_chunk = semi_crf.decode(
+                forcedStartPos=chunk_forced_start_pos,
+                backend=backend,
+            )
             for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
                 decoded_flat[int(flat_index)] = intervals
 
@@ -2045,6 +2078,7 @@ def decode_factorized_pair_intervals(
     note_bias: float = 0.0,
     track_batch_size: int = 128,
     forced_start_pos: Optional[torch.Tensor | List[int]] = None,
+    backend: str = "torch",
 ) -> IntervalBatch:
     """Decode independent selected V2 tracks from factorized projections."""
 
@@ -2135,7 +2169,10 @@ def decode_factorized_pair_intervals(
                 if flat_forced_start_pos is not None
                 else None
             )
-            decoded_chunk = semi_crf.decode(forcedStartPos=chunk_forced_start_pos)
+            decoded_chunk = semi_crf.decode(
+                forcedStartPos=chunk_forced_start_pos,
+                backend=backend,
+            )
             for flat_index, intervals in zip(chunk_indices.tolist(), decoded_chunk):
                 decoded_flat[int(flat_index)] = intervals
     return decoded_flat

@@ -256,6 +256,7 @@ def decode_v1_notes(
                 note_bias=settings.note_bias,
                 track_batch_size=settings.track_batch_size,
                 forced_start_pos=forced_start_positions,
+                backend=settings.semi_crf_backend,
             )
             decoded_batch.append(decoded_sample[0])
             decoded_intervals += sum(len(intervals) for intervals in decoded_sample[0])
