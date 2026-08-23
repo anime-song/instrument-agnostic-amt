@@ -168,11 +168,11 @@ def _rank_instrument_candidates_by_pitch(
     if len(candidate_instrument_ids) == 1:
         return [candidate_instrument_ids for _ in range(NUM_PITCHES)]
 
-    scores = pair_gate_logits.detach().float().cpu()
+    score_rows = pair_gate_logits.detach().float().cpu().tolist()
     ranked_by_pitch: list[tuple[int, ...]] = []
     for pitch_index in range(NUM_PITCHES):
         score_values = {
-            instrument_index: float(scores[instrument_index, pitch_index].item())
+            instrument_index: float(score_rows[instrument_index][pitch_index])
             for instrument_index in candidate_instrument_ids
         }
         finite_ids = [
@@ -228,15 +228,20 @@ def _decode_flat_boundary_features(
     boundary_presence = presence_logits > 0.0
     offset_dist = torch.distributions.ContinuousBernoulli(logits=offset_logits)
     offset_values = torch.clamp((offset_dist.mean - 0.005) / 0.99, 0.0, 1.0)
+    decoded_rows = torch.cat(
+        (boundary_presence.to(dtype=offset_values.dtype), offset_values),
+        dim=-1,
+    ).detach().cpu().tolist()
 
     for row_index, entry in enumerate(entries):
         track_index, _, _, _ = entry
+        row = decoded_rows[row_index]
         flags[int(track_index)].append(
             (
-                bool(boundary_presence[row_index, 0].item()),
-                bool(boundary_presence[row_index, 1].item()),
-                float(offset_values[row_index, 0].item()),
-                float(offset_values[row_index, 1].item()),
+                bool(row[0]),
+                bool(row[1]),
+                float(row[2]),
+                float(row[3]),
             )
         )
     return flags
@@ -715,11 +720,14 @@ def decode_notes(
                 "Factorized V2 inference requires interval projections and pair gate logits"
             )
         valid_lengths = frame_valid_mask.to(dtype=torch.long).sum(dim=-1)
+        valid_length_values = tuple(
+            int(value) for value in valid_lengths.detach().cpu().tolist()
+        )
 
         for sample_index, (start_frame, valid_frames) in enumerate(
             zip(active_batch_starts, active_valid_audio_frames)
         ):
-            sample_valid_length = int(valid_lengths[sample_index].item())
+            sample_valid_length = valid_length_values[sample_index]
             if sample_valid_length <= 0:
                 continue
 
@@ -824,7 +832,20 @@ def decode_notes(
                 valid_model_frames=sample_valid_length,
             )
 
-        del outputs, batch_waveform
+        del (
+            outputs,
+            batch_waveform,
+            interval_features,
+            pair_gate_logits,
+            pitch_interval_query,
+            pitch_interval_key,
+            pitch_interval_diag,
+            instrument_interval_query,
+            instrument_interval_key,
+            instrument_interval_diag,
+            frame_valid_mask,
+            valid_lengths,
+        )
 
     notes = note_stitcher.finalize()
     return notes, {
