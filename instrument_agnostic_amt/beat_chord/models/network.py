@@ -152,6 +152,7 @@ class MidiFrameBeatChordModel(nn.Module):
         feedback_chord: bool,
         detach_beat_feedback: bool,
         detach_chord_feedback: bool,
+        include_aux_outputs: bool,
         intermediates_dict: dict[str, dict[str, torch.Tensor]],
     ) -> Callable[[torch.Tensor, int], torch.Tensor]:
         def callback(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -208,7 +209,7 @@ class MidiFrameBeatChordModel(nn.Module):
                         beat_outputs = self.inter_beat_heads[layer_str](beat_features)
 
                 # ロス計算用に保存
-                if include_beat:
+                if include_beat and include_aux_outputs:
                     intermediates_dict[layer_str]["beat"] = beat_outputs
 
                 # 確率計算
@@ -258,7 +259,7 @@ class MidiFrameBeatChordModel(nn.Module):
                         )
 
                 # ロス計算用に保存
-                if include_chord:
+                if include_chord and include_aux_outputs:
                     intermediates_dict[layer_str]["chord"] = chord_outputs
 
                 # 確率計算
@@ -326,6 +327,7 @@ class MidiFrameBeatChordModel(nn.Module):
         feedback_chord: bool | None = None,
         detach_beat_feedback: bool = False,
         detach_chord_feedback: bool = False,
+        include_aux_outputs: bool = True,
     ) -> dict[str, torch.Tensor | dict[str, dict[str, torch.Tensor]]]:
         if not include_beat and not include_chord:
             raise ValueError("At least one task must be enabled")
@@ -365,28 +367,35 @@ class MidiFrameBeatChordModel(nn.Module):
                 feedback_chord=feedback_chord,
                 detach_beat_feedback=detach_beat_feedback,
                 detach_chord_feedback=detach_chord_feedback,
+                include_aux_outputs=include_aux_outputs,
                 intermediates_dict=intermediates_dict,
             )
 
         backbone_outputs = self.backbone(midi_frames, intermediate_callback=callback)
-        outputs: dict[str, torch.Tensor | dict[str, dict[str, torch.Tensor]]] = {
-            "global_features": backbone_outputs.global_features,
-            "lowres_global_features": backbone_outputs.lowres_global_features,
-            "global_token_features": backbone_outputs.global_token_features,
-            "lowres_global_tokens": backbone_outputs.lowres_global_tokens,
-        }
+        outputs: dict[str, torch.Tensor | dict[str, dict[str, torch.Tensor]]] = {}
+        if include_aux_outputs:
+            outputs.update(
+                {
+                    "global_features": backbone_outputs.global_features,
+                    "lowres_global_features": backbone_outputs.lowres_global_features,
+                    "global_token_features": backbone_outputs.global_token_features,
+                    "lowres_global_tokens": backbone_outputs.lowres_global_tokens,
+                }
+            )
 
         if include_beat:
             beat_features = self.beat_adapter(backbone_outputs.global_features)
-            outputs["beat_features"] = beat_features
+            if include_aux_outputs:
+                outputs["beat_features"] = beat_features
             outputs.update(self.beat_head(beat_features))
 
         if include_chord:
             chord_features = self.chord_adapter(backbone_outputs.global_features)
-            outputs["chord_features"] = chord_features
+            if include_aux_outputs:
+                outputs["chord_features"] = chord_features
             outputs.update(self.chord_head(chord_features))
 
-        if len(self.inter_refine_layers) > 0:
+        if include_aux_outputs and len(self.inter_refine_layers) > 0:
             outputs["intermediate_outputs"] = intermediates_dict
 
         return outputs

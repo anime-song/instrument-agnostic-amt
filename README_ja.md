@@ -210,8 +210,7 @@ instrument_agnostic_amt/
 
 > Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
 > プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
-> 向けwheelを提供していません。Windows CUDA wheel の解決はロックファイルの
-> テストで確認していますが、Windows CUDA 実機では未検証です。
+> 向けwheelを提供していません。
 
 ```bash
 # クローン
@@ -444,6 +443,24 @@ CPU・CUDA・MPS 間では、浮動小数点演算による小さな結果差が
 混合精度は `--amp` を指定した場合だけ有効になり、MPS のデフォルトdtypeはfp16です。
 `--amp-dtype` で変更できます。
 
+### regional コンパイル（任意）
+
+`--compile` を指定すると、AMT の共有バックボーンにある time 軸 / band 軸
+Transformer ブロックだけを `torch.compile` します。特徴抽出、予測ヘッド、
+Semi-CRF デコード、MIDI 処理は eager のままです。フル窓と末尾の端数窓は、
+どちらも同じ regional コンパイル済みモデルを使います。
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
+最初のウィンドウには初回コンパイルの時間が含まれるため、`--compile` は既定で
+無効です。短い曲を 1 回だけ処理する場合は遅くなることがあり、ロード済みモデルで
+複数のウィンドウや曲を続けて処理する場合に向いています。`--compile-mode` には
+`default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs`
+を指定できます。
+
 ### Google Colab のステム分離ワークフロー
 
 Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
@@ -500,6 +517,7 @@ python infer.py \
   --output-midi output.mid \
   --device auto \
   --amp \
+  --compile \
   --window-ms 8000 \
   --stride-ms 4000 \
   --window-batch-size 4 \
@@ -518,6 +536,8 @@ python infer.py \
 | `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda`、`mps`、`cpu` の明示指定も可能 |
 | `--amp` | `false` | CUDA または MPS で混合精度推論を有効化 |
 | `--amp-dtype` | デバイス既定 | `fp16` または `bf16`。対応CUDAではbf16、MPSではfp16が既定 |
+| `--compile` | `false` | AMT バックボーンの Transformer ブロックだけを regional `torch.compile` する |
+| `--compile-mode` | `default` | `default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs` から選択 |
 | `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
 | `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
 | `--window-batch-size` | `1` | まとめて処理するウィンドウ数 |

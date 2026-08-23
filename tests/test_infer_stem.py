@@ -83,6 +83,76 @@ def test_stem_pipeline_auto_routes_models_to_mps(
     assert (str(bundle["device"]), loaded_devices) == ("mps", ["mps", "mps"])
 
 
+def test_stem_pipeline_compiles_and_caches_only_the_core_amt_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"")
+    eager_model = torch.nn.Linear(2, 2)
+    compiled_forward = object()
+    compile_calls: list[tuple[object, bool, str]] = []
+
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (eager_model, object(), object()),
+    )
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward if enabled else model
+
+    monkeypatch.setattr(
+        infer_stem,
+        "maybe_compile_forward",
+        fake_compile,
+        raising=False,
+    )
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+    infer_stem.STEM_PIPELINE_CACHE[("sep", "cpu")] = (
+        SimpleNamespace(),
+        object(),
+        torch.float32,
+    )
+
+    first = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_model=True,
+        compile_mode="max-autotune",
+    )
+    second = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        compile_model=True,
+        compile_mode="max-autotune",
+    )
+    eager = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+    )
+
+    assert first["amt_model"] is eager_model
+    assert first["amt_forward"] is compiled_forward
+    assert second["amt_forward"] is compiled_forward
+    assert eager["amt_forward"] is eager_model
+    assert compile_calls == [
+        (eager_model, True, "max-autotune"),
+        (eager_model, False, "default"),
+    ]
+
+
 def test_stem_workflow_exposes_device_and_amp_options() -> None:
     parameters = signature(run_stem_separated_transcription).parameters
 
@@ -90,7 +160,13 @@ def test_stem_workflow_exposes_device_and_amp_options() -> None:
         parameters.get("device").default if parameters.get("device") else None,
         parameters.get("amp").default if parameters.get("amp") else None,
         parameters.get("amp_dtype").default if parameters.get("amp_dtype") else "missing",
-    ) == ("auto", False, None)
+        parameters.get("compile_model").default
+        if parameters.get("compile_model")
+        else None,
+        parameters.get("compile_mode").default
+        if parameters.get("compile_mode")
+        else None,
+    ) == ("auto", False, None, False, "default")
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:
@@ -329,9 +405,11 @@ def _install_fake_waveform_cache_pipeline(
     )
     refinement_config = SimpleNamespace(sample_rate=refinement_sample_rate)
     velocity_config = SimpleNamespace(sample_rate=velocity_sample_rate)
+    amt_model = object()
     bundle = {
         "device": torch.device("cpu"),
-        "amt_model": object(),
+        "amt_model": amt_model,
+        "amt_forward": amt_model,
         "amt_config": model_config,
         "amt_settings": object(),
         "sep_config": SimpleNamespace(stem_names=tuple(stems)),

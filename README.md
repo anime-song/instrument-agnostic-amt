@@ -209,8 +209,7 @@ instrument_agnostic_amt/
 
 > Linux and Windows resolve to the CUDA 13.0 wheels. Apple Silicon macOS
 > resolves to the platform PyTorch wheels; PyTorch 2.13 does not provide Intel
-> macOS wheels. Windows CUDA wheel resolution is covered by the lockfile tests,
-> but has not been run on a Windows CUDA host.
+> macOS wheels.
 
 ```bash
 # Clone
@@ -487,6 +486,24 @@ floating-point differences between CPU, CUDA, and MPS results are expected.
 Mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
 and can be changed with `--amp-dtype`.
 
+### Optional regional compilation
+
+`--compile` enables `torch.compile` only for the time- and band-axis
+Transformer blocks shared by the AMT backbone. Feature extraction, prediction
+heads, Semi-CRF decoding, and MIDI processing remain eager. This regional
+strategy is used for both full and partial inference windows.
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode max-autotune
+```
+
+Compilation is opt-in because the first processed window includes a cold
+compile cost. A short, one-off transcription may therefore be slower; it is
+most useful when the loaded model continues to process more windows or songs.
+`--compile-mode` also accepts `default`, `reduce-overhead`, and
+`max-autotune-no-cudagraphs`.
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -543,6 +560,7 @@ python infer.py \
   --output-midi output.mid \
   --device auto \
   --amp \
+  --compile \
   --window-ms 8000 \
   --stride-ms 4000 \
   --window-batch-size 4 \
@@ -561,6 +579,8 @@ python infer.py \
 | `--device` | `auto` | Inference device. `auto` selects CUDA → MPS → CPU; `cuda`, `mps`, or `cpu` can be set explicitly |
 | `--amp` | `false` | Enable mixed precision inference on CUDA or MPS |
 | `--amp-dtype` | device default | `fp16` or `bf16`; defaults to bf16 on supported CUDA devices and fp16 on MPS |
+| `--compile` | `false` | Opt in to regional `torch.compile` for the AMT backbone Transformer blocks |
+| `--compile-mode` | `default` | Compilation mode: `default`, `reduce-overhead`, `max-autotune`, or `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
 | `--window-batch-size` | `1` | Windows to process at once |

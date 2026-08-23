@@ -26,12 +26,16 @@ from ..modeling.checkpoints import (
     load_compatible_weights,
 )
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
-from ..runtime import is_amp_supported, resolve_amp_dtype, resolve_device
+from ..runtime import (
+    is_amp_supported,
+    maybe_compile_forward,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
 )
-
 
 HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -180,6 +184,22 @@ def parse_args() -> argparse.Namespace:
         "--amp-dtype",
         choices=("fp16", "bf16"),
         default=None,
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile shared AMT Transformer regions with TorchInductor",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default="default",
+        help="torch.compile mode used when --compile is enabled",
     )
     parser.add_argument(
         "--window-ms",
@@ -460,6 +480,7 @@ def process_file(
     output_midi_path: Path,
     *,
     model: AudioSemiCRFTransformer,
+    forward_model: torch.nn.Module | None = None,
     config: SemiCRFModelConfig,
     instrument_id: int | None,
     settings: InferenceSettings,
@@ -479,6 +500,7 @@ def process_file(
         amp_dtype=amp_dtype,
         settings=settings,
         velocity=int(args.velocity),
+        forward_model=forward_model,
     )
     midi, midi_stats = build_midi(
         notes,
@@ -519,6 +541,11 @@ def main() -> None:
     )
     checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
     model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
+    forward_model = maybe_compile_forward(
+        model,
+        enabled=bool(args.compile),
+        mode=str(args.compile_mode),
+    )
     settings = resolve_inference_settings(config, training_args, args)
     requested_instrument_ids = (
         (int(instrument_id),)
@@ -547,6 +574,7 @@ def main() -> None:
                 audio_path,
                 output_path,
                 model=model,
+                forward_model=forward_model,
                 config=config,
                 instrument_id=instrument_id,
                 settings=settings,
@@ -567,6 +595,7 @@ def main() -> None:
         audio_path,
         output_path,
         model=model,
+        forward_model=forward_model,
         config=config,
         instrument_id=instrument_id,
         settings=settings,

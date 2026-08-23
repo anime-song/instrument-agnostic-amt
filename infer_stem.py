@@ -29,6 +29,7 @@ from instrument_agnostic_amt.instrument_refinement.modeling.checkpoints import (
 )
 from instrument_agnostic_amt.runtime import (
     is_amp_supported,
+    maybe_compile_forward,
     resolve_amp_dtype,
     resolve_device,
 )
@@ -226,6 +227,8 @@ def get_stem_pipeline_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
     model_type: str = "default",
+    compile_model: bool = False,
+    compile_mode: str = "default",
 ) -> dict[str, object]:
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
     device = resolve_device(device_preference)
@@ -234,7 +237,15 @@ def get_stem_pipeline_models(
         None if checkpoint_path in (None, "", "DEFAULT") else Path(checkpoint_path),
         model_type=model_type,
     )
-    amt_cache_key = ("amt", str(resolved_checkpoint.resolve()), str(device))
+    compile_cache_key = (
+        ("compiled", str(compile_mode)) if compile_model else ("eager",)
+    )
+    amt_cache_key = (
+        "amt",
+        str(resolved_checkpoint.resolve()),
+        str(device),
+        *compile_cache_key,
+    )
     sep_cache_key = ("sep", str(device))
 
     if sep_cache_key not in STEM_PIPELINE_CACHE:
@@ -255,15 +266,28 @@ def get_stem_pipeline_models(
             stride_ms_override=None,
             track_batch_size_override=None,
         )
-        STEM_PIPELINE_CACHE[amt_cache_key] = (amt_model, amt_config, amt_settings)
+        amt_forward = maybe_compile_forward(
+            amt_model,
+            enabled=bool(compile_model),
+            mode=str(compile_mode),
+        )
+        STEM_PIPELINE_CACHE[amt_cache_key] = (
+            amt_model,
+            amt_forward,
+            amt_config,
+            amt_settings,
+        )
     else:
         print(f"Reusing cached AMT model ({model_type}) on {device} ...")
-        amt_model, amt_config, amt_settings = STEM_PIPELINE_CACHE[amt_cache_key]
+        amt_model, amt_forward, amt_config, amt_settings = STEM_PIPELINE_CACHE[
+            amt_cache_key
+        ]
 
     return {
         "device": device,
         "checkpoint": resolved_checkpoint,
         "amt_model": amt_model,
+        "amt_forward": amt_forward,
         "amt_config": amt_config,
         "amt_settings": amt_settings,
         "sep_config": sep_config,
@@ -427,6 +451,8 @@ def run_stem_separated_transcription(
     device: torch.device | str | None = "auto",
     amp: bool = False,
     amp_dtype: str | None = None,
+    compile_model: bool = False,
+    compile_mode: str = "default",
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
     audio_file = Path(audio_path)
@@ -437,6 +463,8 @@ def run_stem_separated_transcription(
         checkpoint_path=checkpoint_path,
         device_preference=device,
         model_type="default",
+        compile_model=compile_model,
+        compile_mode=compile_mode,
     )
     device = bundle["device"]
     amt_amp_enabled = bool(amp and is_amp_supported(device))
@@ -476,6 +504,8 @@ def run_stem_separated_transcription(
                 checkpoint_path=checkpoint_path,
                 device_preference=device,
                 model_type=model_type_key,
+                compile_model=compile_model,
+                compile_mode=compile_mode,
             )
         return amt_bundles[model_type_key]
 
@@ -526,6 +556,7 @@ def run_stem_separated_transcription(
         model_type = resolve_stem_model_type(stem_name)
         current_bundle = get_amt_bundle(model_type)
         current_amt_model = current_bundle["amt_model"]
+        current_amt_forward = current_bundle["amt_forward"]
         current_amt_config = current_bundle["amt_config"]
         current_amt_settings = current_bundle["amt_settings"]
 
@@ -550,6 +581,7 @@ def run_stem_separated_transcription(
         )
         notes, _, _ = infer.run_inference(
             model=current_amt_model,
+            forward_model=current_amt_forward,
             waveform=waveform.to(device),
             model_config=current_amt_config,
             settings=current_amt_settings,
@@ -681,6 +713,7 @@ def run_stem_separated_transcription(
                 output_midi_path=beat_chord_midi_path,
                 checkpoint_path=beat_chord_checkpoint_path,
                 device=device,
+                window_batch_size=window_batch_size,
             )
             merged_midi_path = beat_chord_midi_path
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
