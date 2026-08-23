@@ -93,3 +93,29 @@ def resolve_amp_dtype(
     if target_device.type == "cpu":
         return torch.float32
     return torch.float16
+
+
+def maybe_compile_forward(
+    model: torch.nn.Module,
+    *,
+    enabled: bool,
+    mode: str = "default",
+) -> torch.nn.Module:
+    """backbone内のTransformerだけを必要時にコンパイルする。"""
+    if not enabled:
+        return model
+    backbone = getattr(model, "backbone", None)
+    layers = getattr(backbone, "layers", None)
+    if layers is None:
+        raise ValueError("Regional compile requires model.backbone.layers")
+    targets = tuple(module for pair in layers for module in pair)
+    if not targets:
+        raise ValueError("Regional compile found no Transformer modules")
+    for target in targets:
+        target.compile(
+            backend="inductor",
+            mode=mode,
+            fullgraph=False,
+            dynamic=True,
+        )
+    return model

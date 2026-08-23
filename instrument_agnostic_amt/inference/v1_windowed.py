@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 from tqdm.auto import tqdm
 
-from ..runtime import is_amp_supported
 from ..modeling.heads.semi_crf import decode_pitch_intervals
 from ..modeling.model import (
     MIN_MIDI_PITCH,
@@ -13,6 +13,7 @@ from ..modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
+from ..runtime import is_amp_supported
 from .instruments import effective_instrument_ids
 from .types import InferenceSettings, PredictedNote
 from .windowed import (
@@ -84,6 +85,7 @@ def decode_v1_notes(
     amp_dtype: torch.dtype,
     settings: InferenceSettings,
     velocity: int,
+    forward_model: Callable[..., dict[str, torch.Tensor | None]] | None = None,
 ) -> tuple[list[PredictedNote], dict[str, int]]:
     if waveform.dim() != 2:
         raise ValueError("waveform must have shape [channels, audio_frames]")
@@ -134,6 +136,7 @@ def decode_v1_notes(
         dynamic_ncols=True,
         disable=settings.disable_tqdm,
     )
+    inference_model = model if forward_model is None else forward_model
     for batch_starts in progress:
         windows: list[torch.Tensor] = []
         valid_audio: list[int] = []
@@ -165,7 +168,7 @@ def decode_v1_notes(
             dtype=amp_dtype,
             enabled=amp_enabled and is_amp_supported(device),
         ):
-            outputs = model(
+            outputs = inference_model(
                 batch, valid_audio_frames=valid_tensor, include_aux_outputs=False
             )
         valid_mask = outputs.get("frame_valid_mask")

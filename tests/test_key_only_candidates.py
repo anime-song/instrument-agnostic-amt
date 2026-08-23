@@ -287,6 +287,122 @@ def test_batch_runner_routes_amp_to_core_amt_inference(
     assert inference_calls[0]["amp_dtype"] is torch.bfloat16
 
 
+def test_batch_cli_exposes_core_amt_compile_options() -> None:
+    defaults = parse_arguments([])
+    enabled = parse_arguments(["--compile", "--compile-mode", "max-autotune"])
+
+    assert (
+        getattr(defaults, "compile", None),
+        getattr(defaults, "compile_mode", None),
+        getattr(enabled, "compile", None),
+        getattr(enabled, "compile_mode", None),
+    ) == (False, "default", True, "max-autotune")
+
+
+def test_batch_runner_routes_compiled_forward_to_core_amt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import infer as amt_infer
+
+    eager_model = object()
+    compiled_forward = object()
+    compile_calls: list[tuple[object, bool, str]] = []
+    inference_calls: list[dict[str, object]] = []
+
+    class _Waveform:
+        def to(self, _device: torch.device) -> _Waveform:
+            return self
+
+    class _Midi:
+        @staticmethod
+        def write(path: str) -> None:
+            Path(path).write_bytes(b"midi")
+
+    def fake_compile(
+        model: object,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> object:
+        compile_calls.append((model, enabled, mode))
+        return compiled_forward
+
+    monkeypatch.setattr(
+        candidates,
+        "maybe_compile_forward",
+        fake_compile,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: tmp_path / "checkpoint.pth",
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_model_and_settings",
+        lambda *_args, **_kwargs: (
+            eager_model,
+            SimpleNamespace(num_instrument_classes=2, sample_rate=1_000),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "resolve_stem_instrument_class_ids",
+        lambda _stem_name: (0,),
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "filter_supported_instrument_class_ids",
+        lambda values, **_kwargs: values,
+    )
+    monkeypatch.setattr(
+        amt_infer,
+        "_load_audio",
+        lambda *_args, **_kwargs: (_Waveform(), 1_000, 2),
+    )
+
+    def fake_run_inference(**kwargs: object) -> tuple[list[object], dict, dict]:
+        inference_calls.append(kwargs)
+        return [], {}, {}
+
+    monkeypatch.setattr(amt_infer, "run_inference", fake_run_inference)
+    monkeypatch.setattr(amt_infer, "_build_midi", lambda *_args, **_kwargs: _Midi())
+    monkeypatch.setattr(
+        candidates,
+        "is_valid_midi_file",
+        lambda path: Path(path).is_file(),
+    )
+    runner = StemTranscriptionRunner(
+        device="cpu",
+        amt_checkpoint_dir=tmp_path,
+        separation_checkpoint=tmp_path / "separation.pth",
+        velocity_checkpoint=tmp_path / "velocity.pth",
+        window_batch_size=1,
+        max_melodic_instruments=15,
+        merge_onset_ms=50.0,
+        transcribe_drums=True,
+        predict_velocity=False,
+        strict_velocity=True,
+        force=False,
+        cleanup_stems=False,
+        compile_model=True,
+        compile_mode="max-autotune",
+    )
+
+    runner._transcribe_stem(
+        stem_name="piano",
+        stem_path=tmp_path / "piano.wav",
+        output_midi=tmp_path / "piano.mid",
+    )
+
+    assert compile_calls == [(eager_model, True, "max-autotune")]
+    assert inference_calls[0]["model"] is eager_model
+    assert inference_calls[0]["forward_model"] is compiled_forward
+
+
 def test_merge_stem_midis_limits_instruments_and_long_notes(
     tmp_path: Path,
 ) -> None:
