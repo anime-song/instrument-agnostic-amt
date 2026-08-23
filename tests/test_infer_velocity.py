@@ -332,6 +332,63 @@ def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
     assert velocities_by_start[1.6] == 91
 
 
+def test_velocity_inference_skips_unused_stem_gain_head(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    include_stem_gain_values: list[bool] = []
+
+    class FakeVelocityModel:
+        def to(self, _device: torch.device) -> FakeVelocityModel:
+            return self
+
+        def eval(self) -> FakeVelocityModel:
+            return self
+
+        def __call__(
+            self,
+            audio: torch.Tensor,
+            *,
+            include_stem_gain: bool = True,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            include_stem_gain_values.append(include_stem_gain)
+            outputs = {
+                "velocity_expected": torch.full_like(
+                    kwargs["note_start_seconds"],
+                    64.0,
+                )
+            }
+            if include_stem_gain:
+                outputs["stem_gain_db"] = torch.zeros(
+                    (audio.shape[0], audio.shape[1]),
+                    device=audio.device,
+                )
+            return outputs
+
+    model = FakeVelocityModel()
+    config = VelocityModelConfig(sample_rate=22_050, predict_stem_gain=True)
+    monkeypatch.setattr(velocity_infer, "VelocityPredictionModel", FakeVelocityModel)
+    monkeypatch.setattr(
+        velocity_infer,
+        "load_velocity_model",
+        lambda *_args, **_kwargs: (model, config),
+    )
+
+    predict_velocity_for_stem_midis(
+        stem_midis=mock_stem_midis,
+        stem_audios=mock_audio_stems,
+        output_midi_path=tmp_path / "velocity_without_stem_gain.mid",
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+    )
+
+    assert include_stem_gain_values == [False]
+
+
 def test_preloaded_velocity_forward_requires_matching_eager_model() -> None:
     with pytest.raises(
         ValueError,
