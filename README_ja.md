@@ -504,9 +504,23 @@ python infer_velocity.py \
   --midi output.mid \
   --stems-dir separated_stems \
   --output-midi output_velocity.mid
+
+# 任意: velocity バックボーンの Transformer 領域をコンパイル
+python infer_velocity.py \
+  --midi output.mid \
+  --stems-dir separated_stems \
+  --compile-velocity \
+  --compile-mode max-autotune
 ```
 
 `--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+
+`--compile-velocity` はコア AMT の `--compile` とは独立したオプションです。
+velocity バックボーンの Transformer ブロックだけを regional コンパイルし、
+MIDI 解析、窓分割、ノート単位のヘッドは eager のままです。フル窓、末尾の
+端数窓、1 窓より短い曲は、すべて同じコンパイル済みモデルを再利用します。
+最初の窓では初回コンパイルの時間がかかるため、短い曲を 1 回だけ処理する場合は
+遅くなることがあり、既定では無効です。
 
 ### その他のオプション
 

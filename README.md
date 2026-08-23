@@ -547,9 +547,23 @@ python infer_velocity.py \
   --midi output.mid \
   --stems-dir separated_stems \
   --output-midi output_velocity.mid
+
+# Optional: compile the velocity backbone Transformer regions
+python infer_velocity.py \
+  --midi output.mid \
+  --stems-dir separated_stems \
+  --compile-velocity \
+  --compile-mode max-autotune
 ```
 
 If `--checkpoint` is omitted, `best_velocity_model.pth` is downloaded automatically from Hugging Face. The stem directory should contain separated audio files whose names identify the stem, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for velocity-model training and dataset preparation.
+
+`--compile-velocity` is independent from the core AMT `--compile` option. It
+regionally compiles the velocity backbone Transformer blocks while MIDI
+parsing, windowing, and the note-level head remain eager. Full windows,
+trailing partial windows, and songs shorter than one window reuse the same
+compiled model. The first window pays a cold compilation cost, so this option
+may be slower for a short, one-off run and is disabled by default.
 
 ### Additional options
 
