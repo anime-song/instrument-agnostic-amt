@@ -277,6 +277,7 @@ def test_colab_exposes_accelerator_and_compile_options() -> None:
         assert f"{option_name} =" in run_source
 
     assert "device=DEVICE" in run_source
+    assert "AMP = True" in run_source
     assert "amp=AMP" in run_source
     assert 'amp_dtype=None if AMP_DTYPE == "default" else AMP_DTYPE' in run_source
     assert "compile_model=COMPILE_MODEL" in run_source
