@@ -25,7 +25,7 @@ from tqdm.auto import tqdm
 
 from ...inference.audio import load_audio
 from ...inference.instruments import resolve_stem_instrument_class_ids
-from ...runtime import resolve_device
+from ...runtime import copy_tensors_to_cpu_once, resolve_device
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -131,6 +131,7 @@ def _scan_windows(
     allowed: tuple[int, ...],
     window_seconds: float,
     stride_seconds: float,
+    window_batch_size: int,
     device: torch.device,
     disable_tqdm: bool,
 ) -> _WindowScan:
@@ -151,41 +152,135 @@ def _scan_windows(
     note_embedding_sums = np.zeros((notes.note_count, config.embedding_size), dtype=np.float64)
     note_observations = np.zeros(notes.note_count, dtype=np.int64)
     context_id = stem_context_id(inference_stem_group(stem_name))
+    if window_batch_size <= 0:
+        raise ValueError("window_batch_size must be positive")
 
-    for sample_start in tqdm(starts, desc="refine instruments", disable=disable_tqdm):
-        valid_frames = min(window_frames, total_frames - sample_start)
-        window = waveform[:, sample_start : sample_start + window_frames]
-        if int(window.shape[-1]) < window_frames:
-            # 末尾の窓は 0 埋めし、有効長は valid_audio_frames でモデルへ伝える。
-            window = torch.nn.functional.pad(window, (0, window_frames - int(window.shape[-1])))
-        # この窓に「発音開始が入っている」ノートだけを対象にする（重複カウント防止）。
-        start_seconds = float(sample_start) / float(config.sample_rate)
-        end_seconds = start_seconds + window_seconds
-        active = (notes.start_seconds >= start_seconds) & (notes.start_seconds < end_seconds)
-        indices = np.flatnonzero(active)
+    start_batches = [
+        starts[offset : offset + int(window_batch_size)]
+        for offset in range(0, len(starts), int(window_batch_size))
+    ]
+    for batch_starts in tqdm(
+        start_batches,
+        desc="refine instruments",
+        disable=disable_tqdm,
+    ):
+        windows: list[torch.Tensor] = []
+        valid_frames_batch: list[int] = []
+        indices_batch: list[np.ndarray] = []
+        relative_starts: list[torch.Tensor] = []
+        relative_ends: list[torch.Tensor] = []
+        pitches: list[torch.Tensor] = []
+        for sample_start in batch_starts:
+            valid_frames = min(window_frames, total_frames - sample_start)
+            window = waveform[:, sample_start : sample_start + window_frames]
+            if int(window.shape[-1]) < window_frames:
+                # 末尾の窓は 0 埋めし、有効長はモデルへ伝える。
+                window = torch.nn.functional.pad(
+                    window,
+                    (0, window_frames - int(window.shape[-1])),
+                )
+            start_seconds = float(sample_start) / float(config.sample_rate)
+            end_seconds = start_seconds + window_seconds
+            active = (notes.start_seconds >= start_seconds) & (
+                notes.start_seconds < end_seconds
+            )
+            indices = np.flatnonzero(active)
+            windows.append(window)
+            valid_frames_batch.append(valid_frames)
+            indices_batch.append(indices)
+            relative_starts.append(
+                torch.from_numpy(notes.start_seconds[indices] - start_seconds)
+            )
+            relative_ends.append(
+                torch.from_numpy(notes.end_seconds[indices] - start_seconds)
+            )
+            pitches.append(torch.from_numpy(notes.pitch[indices]))
+
+        note_start_batch = torch.nn.utils.rnn.pad_sequence(
+            relative_starts,
+            batch_first=True,
+        )
+        note_end_batch = torch.nn.utils.rnn.pad_sequence(
+            relative_ends,
+            batch_first=True,
+        )
+        note_pitch_batch = torch.nn.utils.rnn.pad_sequence(
+            pitches,
+            batch_first=True,
+        )
+        max_notes = int(note_pitch_batch.shape[1])
+        note_mask = torch.zeros(
+            len(batch_starts),
+            max_notes,
+            dtype=torch.bool,
+        )
+        for batch_index, indices in enumerate(indices_batch):
+            note_mask[batch_index, : len(indices)] = True
+
         outputs = model(
-            window.unsqueeze(0).to(device),
-            valid_audio_frames=torch.tensor([valid_frames], device=device),
-            # モデルへは窓先頭からの相対時刻で渡す。
-            note_start_seconds=torch.from_numpy(notes.start_seconds[indices] - start_seconds)
-            .unsqueeze(0)
-            .to(device),
-            note_end_seconds=torch.from_numpy(notes.end_seconds[indices] - start_seconds).unsqueeze(0).to(device),
-            note_pitch=torch.from_numpy(notes.pitch[indices]).unsqueeze(0).to(device),
+            torch.stack(windows).to(device),
+            valid_audio_frames=torch.tensor(
+                valid_frames_batch,
+                device=device,
+            ),
+            note_start_seconds=note_start_batch.to(device),
+            note_end_seconds=note_end_batch.to(device),
+            note_pitch=note_pitch_batch.to(device),
             # AMT が付けた楽器は意図的に渡さない（-1）。音声から判断させるため。
-            note_prior_class=torch.full((1, len(indices)), -1, dtype=torch.long, device=device),
-            note_confidence=torch.ones((1, len(indices)), device=device),
-            note_mask=torch.ones((1, len(indices)), dtype=torch.bool, device=device),
-            stem_context_id=torch.tensor([context_id], dtype=torch.long, device=device),
+            note_prior_class=torch.full(
+                (len(batch_starts), max_notes),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
+            note_confidence=torch.ones(
+                len(batch_starts),
+                max_notes,
+                device=device,
+            ),
+            note_mask=note_mask.to(device),
+            stem_context_id=torch.full(
+                (len(batch_starts),),
+                context_id,
+                dtype=torch.long,
+                device=device,
+            ),
             window_seconds=window_seconds,
         )
-        window_logits.append(_mask_logits(outputs["window_logits"][0].float().cpu().numpy(), allowed))
-        window_embeddings.append(outputs["window_embedding"][0].float().cpu().numpy())
-        window_note_counts.append(len(indices))
-        if len(indices):
-            note_logit_sums[indices] += _mask_logits(outputs["note_logits"][0].float().cpu().numpy(), allowed)
-            note_embedding_sums[indices] += outputs["note_embedding"][0].float().cpu().numpy()
-            note_observations[indices] += 1
+        (
+            window_logits_tensor,
+            window_embeddings_tensor,
+            note_logits_tensor,
+            note_embeddings_tensor,
+        ) = copy_tensors_to_cpu_once(
+            (
+                outputs["window_logits"].float(),
+                outputs["window_embedding"].float(),
+                outputs["note_logits"].float(),
+                outputs["note_embedding"].float(),
+            )
+        )
+        del outputs
+        window_logits_batch = window_logits_tensor.numpy()
+        window_embeddings_batch = window_embeddings_tensor.numpy()
+        note_logits_batch = note_logits_tensor.numpy()
+        note_embeddings_batch = note_embeddings_tensor.numpy()
+        for batch_index, indices in enumerate(indices_batch):
+            window_logits.append(
+                _mask_logits(window_logits_batch[batch_index], allowed)
+            )
+            window_embeddings.append(window_embeddings_batch[batch_index])
+            window_note_counts.append(len(indices))
+            if len(indices):
+                note_logit_sums[indices] += _mask_logits(
+                    note_logits_batch[batch_index, : len(indices)],
+                    allowed,
+                )
+                note_embedding_sums[indices] += note_embeddings_batch[
+                    batch_index,
+                    : len(indices),
+                ]
+                note_observations[indices] += 1
 
     # 曲全体の傾向は、ノートが多い窓ほど重く見る。
     stacked = np.stack(window_logits)
@@ -392,6 +487,7 @@ def refine_midi_instruments(
     device: torch.device | str | None = None,
     window_seconds: float = 8.0,
     stride_seconds: float = 4.0,
+    window_batch_size: int = 1,
     mode: str = "cluster",
     cluster_distance: float = 0.25,
     min_cluster_notes: int = 2,
@@ -402,6 +498,7 @@ def refine_midi_instruments(
     disable_tqdm: bool = False,
     preloaded_model: InstrumentRefinementModel | None = None,
     preloaded_config: InstrumentRefinementConfig | None = None,
+    preloaded_waveform: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """MIDI の楽器を、対応するステム音声から推論し直す。
 
@@ -417,6 +514,7 @@ def refine_midi_instruments(
         global_logit_weight: 曲全体の傾向をクラスタ判定に足す量。0 なら足さない。
         use_stem_mask: stem_name に基づく候補の絞り込みを行うか。
         preloaded_model/preloaded_config: 読み込み済みモデルを使い回す場合に両方渡す。
+        preloaded_waveform: config.sample_rateへresample済みのCPU float32ステレオ波形。
 
     Returns:
         予測結果とデバッグ情報を含む dict。output_json_path を渡すと同じ内容を保存する。
@@ -425,6 +523,8 @@ def refine_midi_instruments(
         raise ValueError("mode must be 'single' or 'cluster'")
     if window_seconds <= 0.0 or stride_seconds <= 0.0:
         raise ValueError("window and stride seconds must be positive")
+    if window_batch_size <= 0:
+        raise ValueError("window_batch_size must be positive")
     if global_logit_weight < 0.0:
         raise ValueError("global_logit_weight must be nonnegative")
     audio_file = Path(audio_path).resolve()
@@ -439,7 +539,16 @@ def refine_midi_instruments(
     )
 
     # 2. 音声と MIDI を読み、楽器の候補集合を決める。
-    waveform = load_audio(audio_file, target_sample_rate=config.sample_rate)
+    if preloaded_waveform is None:
+        waveform = load_audio(audio_file, target_sample_rate=config.sample_rate)
+    else:
+        waveform = preloaded_waveform
+        if waveform.device.type != "cpu":
+            raise ValueError("preloaded_waveform must be on CPU")
+        if waveform.dtype != torch.float32:
+            raise ValueError("preloaded_waveform must have dtype float32")
+        if waveform.ndim != 2 or int(waveform.shape[0]) != 2:
+            raise ValueError("preloaded_waveform must have shape [2, T]")
     notes = load_refinement_note_table(midi_file)
     allowed = _allowed_class_ids(stem_name, use_stem_mask=use_stem_mask)
 
@@ -453,6 +562,7 @@ def refine_midi_instruments(
         allowed=allowed,
         window_seconds=window_seconds,
         stride_seconds=stride_seconds,
+        window_batch_size=int(window_batch_size),
         device=target_device,
         disable_tqdm=disable_tqdm,
     )

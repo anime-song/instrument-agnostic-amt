@@ -7,7 +7,12 @@ from instrument_agnostic_amt.inference import v1_windowed
 from instrument_agnostic_amt.inference.types import InferenceSettings
 from instrument_agnostic_amt.inference.windowed import decode_notes
 from instrument_agnostic_amt.modeling.heads.v2 import SelectedPairIndices
-from instrument_agnostic_amt.modeling.model import NUM_PITCHES, SemiCRFModelConfig
+from instrument_agnostic_amt.modeling.model import (
+    AudioSemiCRFTransformer,
+    NUM_PITCHES,
+    SemiCRFModelConfig,
+)
+from instrument_agnostic_amt.runtime import maybe_compile_forward
 
 
 class _EagerV2DecoderModel:
@@ -91,6 +96,82 @@ def _settings() -> InferenceSettings:
         instrument_pair_gate_threshold=0.5,
         instrument_pair_max_pairs=1,
     )
+
+
+def _small_amt_model() -> AudioSemiCRFTransformer:
+    config = SemiCRFModelConfig(
+        sample_rate=16_000,
+        hop_length=64,
+        n_fft=1_024,
+        semi_crf_version="v1",
+        cqt_fmin=250.0,
+        cqt_n_bins=12,
+        cqt_bins_per_octave=12,
+        cqt_filter_scale=0.5,
+        harmonics=(1.0,),
+        hidden_size=8,
+        base_ch=4,
+        encoder_num_layers=2,
+        encoder_num_heads=2,
+        dropout=0.0,
+        use_gradient_checkpoint=False,
+        semi_crf_head_dim=8,
+        num_instrument_classes=2,
+        instrument_pair_gate_dim=8,
+    )
+    return AudioSemiCRFTransformer(config).eval()
+
+
+def test_regional_compile_reuses_graph_for_variable_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _small_amt_model()
+    graph_count = 0
+
+    def counting_backend(
+        graph_module: torch.fx.GraphModule,
+        _example_inputs: list[torch.Tensor],
+    ) -> object:
+        nonlocal graph_count
+        graph_count += 1
+        return graph_module.forward
+
+    def compile_with_counting_backend(
+        module: torch.nn.Module,
+        *,
+        backend: str,
+        mode: str,
+        fullgraph: bool,
+        dynamic: bool | None,
+    ) -> None:
+        assert backend == "inductor"
+        assert mode == "default"
+        module.forward = torch.compile(  # type: ignore[method-assign]
+            module.forward,
+            backend=counting_backend,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+
+    monkeypatch.setattr(torch.nn.Module, "compile", compile_with_counting_backend)
+    compiled_model = maybe_compile_forward(model, enabled=True)
+
+    with torch.inference_mode():
+        compiled_model(
+            torch.randn(4, 2, 4_096),
+            valid_audio_frames=torch.full((4,), 4_096),
+            include_aux_outputs=False,
+        )
+        initial_graph_count = graph_count
+        for batch_size in (1, 2):
+            compiled_model(
+                torch.randn(batch_size, 2, 4_096),
+                valid_audio_frames=torch.full((batch_size,), 4_096),
+                include_aux_outputs=False,
+            )
+
+    assert initial_graph_count > 0
+    assert graph_count == initial_graph_count
 
 
 def test_v2_reuses_compiled_forward_for_full_and_partial_windows() -> None:

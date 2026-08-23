@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -278,6 +280,7 @@ class _FakeRefinementModel:
 
     def __init__(self, config: InstrumentRefinementConfig) -> None:
         self.config = config
+        self.batch_sizes: list[int] = []
 
     def to(self, _device: torch.device) -> "_FakeRefinementModel":
         return self
@@ -290,6 +293,7 @@ class _FakeRefinementModel:
     ) -> dict[str, torch.Tensor]:
         pitches = kwargs["note_pitch"]
         batch_size, note_count = pitches.shape
+        self.batch_sizes.append(int(batch_size))
         device = pitches.device
         acoustic_guitar = get_instrument_class_id_by_name("acoustic_guitar")
         note_logits = torch.zeros(
@@ -368,18 +372,21 @@ def test_refine_stem_instrument_midis_skips_excluded_stems_and_rewrites_labels(
         embedding_size=8,
         use_gradient_checkpoint=False,
     )
+    model = _FakeRefinementModel(config)
     refined_paths = refine_stem_instrument_midis(
         stem_midis=stem_midis,
         stem_audios=stem_audios,
         output_dir=tmp_path / "refined",
-        refinement_model=_FakeRefinementModel(config),
+        refinement_model=model,
         refinement_config=config,
         device="cpu",
         window_seconds=0.5,
         stride_seconds=0.25,
+        window_batch_size=2,
     )
 
     assert set(refined_paths) == {"other"}
+    assert model.batch_sizes == [2, 1]
     refined_midi = pretty_midi.PrettyMIDI(str(refined_paths["other"]))
     assert [instrument.name for instrument in refined_midi.instruments] == [
         "acoustic_guitar"
@@ -453,3 +460,350 @@ def test_refine_stem_instrument_midis_honors_stem_selection(tmp_path: Path) -> N
     )
 
     assert set(refined_paths) == {"other"}
+
+
+def _install_fake_waveform_cache_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    amt_sample_rate: int = 8_000,
+    refinement_sample_rate: int = 8_000,
+    velocity_sample_rate: int = 8_000,
+    retain_waveforms: bool = True,
+    include_piano_stem: bool = False,
+) -> SimpleNamespace:
+    source_audio = tmp_path / "song.wav"
+    stem_audio = tmp_path / "song_other.wav"
+    _write_stem_audio(source_audio, frequency=440.0)
+    _write_stem_audio(stem_audio, frequency=220.0)
+    stems = {"other": stem_audio}
+    if include_piano_stem:
+        piano_audio = tmp_path / "song_piano.wav"
+        _write_stem_audio(piano_audio, frequency=330.0)
+        stems["piano"] = piano_audio
+
+    model_config = SimpleNamespace(
+        sample_rate=amt_sample_rate,
+        num_instrument_classes=64,
+    )
+    refinement_config = SimpleNamespace(sample_rate=refinement_sample_rate)
+    velocity_config = SimpleNamespace(sample_rate=velocity_sample_rate)
+    amt_model = object()
+    bundle = {
+        "device": torch.device("cpu"),
+        "amt_model": amt_model,
+        "amt_forward": amt_model,
+        "amt_config": model_config,
+        "amt_settings": object(),
+        "sep_config": SimpleNamespace(stem_names=tuple(stems)),
+        "sep_model": object(),
+        "sep_dtype": torch.float32,
+    }
+    monkeypatch.setattr(infer_stem, "get_stem_pipeline_models", lambda **_kwargs: bundle)
+    monkeypatch.setattr(
+        infer_stem,
+        "prepare_audio_for_stem_separation",
+        lambda *_args, **_kwargs: source_audio,
+    )
+    monkeypatch.setattr(
+        infer_stem,
+        "_separate_one_file",
+        lambda *_args, **_kwargs: dict(stems),
+    )
+
+    loaded_waveforms: list[tuple[int, torch.Tensor]] = []
+    loaded_waveform_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def fake_load_audio(
+        audio_path: Path,
+        *,
+        target_sample_rate: int,
+    ) -> tuple[torch.Tensor, int, int]:
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        waveform = torch.arange(16, dtype=torch.float32).reshape(2, 8).clone()
+        loaded_waveform_refs.append(weakref.ref(waveform))
+        if retain_waveforms:
+            loaded_waveforms.append((int(target_sample_rate), waveform))
+        return waveform, int(target_sample_rate), 2
+
+    monkeypatch.setattr(infer_stem.infer, "_load_audio", fake_load_audio)
+    amt_waveforms: list[torch.Tensor] = []
+
+    def fake_run_inference(**kwargs: object) -> tuple[list[object], dict, dict]:
+        if retain_waveforms:
+            amt_waveforms.append(kwargs["waveform"])  # type: ignore[arg-type]
+        return [], {}, {}
+
+    monkeypatch.setattr(infer_stem.infer, "run_inference", fake_run_inference)
+
+    def fake_build_midi(*_args: object, **_kwargs: object) -> pretty_midi.PrettyMIDI:
+        midi = pretty_midi.PrettyMIDI()
+        instrument = pretty_midi.Instrument(program=0, name="piano")
+        instrument.notes.append(
+            pretty_midi.Note(velocity=100, pitch=60, start=0.1, end=0.4)
+        )
+        midi.instruments.append(instrument)
+        return midi
+
+    monkeypatch.setattr(infer_stem.infer, "_build_midi", fake_build_midi)
+    monkeypatch.setattr(
+        infer_stem,
+        "get_refinement_models",
+        lambda **_kwargs: {
+            "refinement_model": object(),
+            "refinement_config": refinement_config,
+        },
+    )
+
+    refinement_waveforms: list[torch.Tensor] = []
+
+    def fake_refine(
+        audio_path: Path,
+        midi_path: Path,
+        *,
+        output_midi_path: Path,
+        preloaded_waveform: torch.Tensor | None = None,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        waveform = preloaded_waveform
+        if waveform is None:
+            waveform, _, _ = fake_load_audio(
+                audio_path,
+                target_sample_rate=refinement_sample_rate,
+            )
+        if retain_waveforms:
+            refinement_waveforms.append(waveform)
+        output_midi_path.write_bytes(Path(midi_path).read_bytes())
+        return {"note_count": 1, "cluster_count": 0, "clusters": []}
+
+    monkeypatch.setattr(infer_stem, "refine_midi_instruments", fake_refine)
+    monkeypatch.setattr(
+        infer_stem,
+        "get_velocity_models",
+        lambda **_kwargs: (object(), object(), velocity_config),
+        raising=False,
+    )
+
+    velocity_waveforms: list[torch.Tensor] = []
+
+    def fake_velocity(
+        *,
+        stem_audios: dict[str, Path],
+        output_midi_path: Path,
+        template_midi_path: Path,
+        preloaded_waveforms: dict[str, torch.Tensor] | None = None,
+        **_kwargs: object,
+    ) -> Path:
+        if preloaded_waveforms is None:
+            waveform, _, _ = fake_load_audio(
+                stem_audios["other"],
+                target_sample_rate=velocity_sample_rate,
+            )
+        else:
+            waveform = preloaded_waveforms.get("other")
+            if waveform is None:
+                waveform = next(iter(preloaded_waveforms.values()))
+        if retain_waveforms:
+            velocity_waveforms.append(waveform)
+        output_midi_path.write_bytes(template_midi_path.read_bytes())
+        return output_midi_path
+
+    monkeypatch.setattr(infer_stem, "predict_velocity_for_stem_midis", fake_velocity)
+
+    beat_waveforms_alive: list[bool] = []
+
+    def fake_beat_chord(
+        *,
+        input_midi_path: Path,
+        output_midi_path: Path,
+        **_kwargs: object,
+    ) -> Path:
+        gc.collect()
+        beat_waveforms_alive.append(
+            any(reference() is not None for reference in loaded_waveform_refs)
+        )
+        output_midi_path.write_bytes(input_midi_path.read_bytes())
+        return output_midi_path
+
+    monkeypatch.setattr(infer_stem, "predict_beat_chord_for_midi", fake_beat_chord)
+
+    run_count = 0
+
+    def run(
+        *,
+        refine_instruments: bool = True,
+        predict_velocity: bool = True,
+        predict_beat_chord: bool = False,
+    ) -> dict[str, object]:
+        nonlocal run_count
+        run_count += 1
+        return infer_stem.run_stem_separated_transcription(
+            source_audio,
+            output_root=tmp_path / f"output_{run_count}",
+            refine_instruments=refine_instruments,
+            predict_velocity=predict_velocity,
+            predict_beat_chord=predict_beat_chord,
+            device="cpu",
+        )
+
+    return SimpleNamespace(
+        run=run,
+        loaded_waveforms=loaded_waveforms,
+        loaded_waveform_refs=loaded_waveform_refs,
+        amt_waveforms=amt_waveforms,
+        refinement_waveforms=refinement_waveforms,
+        velocity_waveforms=velocity_waveforms,
+        beat_waveforms_alive=beat_waveforms_alive,
+        stems=stems,
+    )
+
+
+def test_stem_pipeline_reuses_waveform_across_audio_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(tmp_path, monkeypatch)
+
+    pipeline.run()
+
+    assert [rate for rate, _ in pipeline.loaded_waveforms] == [8_000]
+    waveform = pipeline.loaded_waveforms[0][1]
+    assert pipeline.amt_waveforms[0] is waveform
+    assert pipeline.refinement_waveforms[0] is waveform
+    assert pipeline.velocity_waveforms[0] is waveform
+
+
+def test_stem_pipeline_cache_distinguishes_sample_rates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(
+        tmp_path,
+        monkeypatch,
+        amt_sample_rate=8_000,
+        refinement_sample_rate=16_000,
+        velocity_sample_rate=16_000,
+    )
+
+    pipeline.run()
+
+    assert [rate for rate, _ in pipeline.loaded_waveforms] == [8_000, 16_000]
+    waveform_16k = pipeline.loaded_waveforms[1][1]
+    assert pipeline.refinement_waveforms[0] is waveform_16k
+    assert pipeline.velocity_waveforms[0] is waveform_16k
+
+
+def test_stem_pipeline_does_not_share_waveforms_between_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(tmp_path, monkeypatch)
+
+    pipeline.run()
+    pipeline.run()
+
+    assert [rate for rate, _ in pipeline.loaded_waveforms] == [8_000, 8_000]
+    first_waveform = pipeline.loaded_waveforms[0][1]
+    second_waveform = pipeline.loaded_waveforms[1][1]
+    assert first_waveform is not second_waveform
+    assert pipeline.refinement_waveforms == [first_waveform, second_waveform]
+    assert pipeline.velocity_waveforms == [first_waveform, second_waveform]
+
+
+@pytest.mark.parametrize(
+    ("refine_instruments", "predict_velocity"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_stem_pipeline_releases_waveforms_before_beat_chord(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refine_instruments: bool,
+    predict_velocity: bool,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(
+        tmp_path,
+        monkeypatch,
+        retain_waveforms=False,
+    )
+
+    pipeline.run(
+        refine_instruments=refine_instruments,
+        predict_velocity=predict_velocity,
+        predict_beat_chord=True,
+    )
+
+    assert pipeline.beat_waveforms_alive == [False]
+
+
+def test_stem_pipeline_releases_waveforms_when_velocity_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(
+        tmp_path,
+        monkeypatch,
+        retain_waveforms=False,
+    )
+
+    def fail_velocity(**_kwargs: object) -> None:
+        raise RuntimeError("velocity failed")
+
+    monkeypatch.setattr(
+        infer_stem,
+        "predict_velocity_for_stem_midis",
+        fail_velocity,
+    )
+
+    pipeline.run(predict_beat_chord=True)
+
+    assert pipeline.beat_waveforms_alive == [False]
+
+
+def test_stem_pipeline_releases_waveforms_when_refinement_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(
+        tmp_path,
+        monkeypatch,
+        retain_waveforms=False,
+    )
+
+    def fail_refinement(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("refinement failed")
+
+    monkeypatch.setattr(infer_stem, "refine_midi_instruments", fail_refinement)
+
+    pipeline.run(predict_velocity=False, predict_beat_chord=True)
+
+    assert pipeline.beat_waveforms_alive == [False]
+
+
+def test_stem_pipeline_velocity_ignores_a_missing_stem_during_preload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(
+        tmp_path,
+        monkeypatch,
+        velocity_sample_rate=16_000,
+        include_piano_stem=True,
+    )
+    velocity_config = SimpleNamespace(sample_rate=16_000)
+
+    def remove_other_before_velocity(
+        **_kwargs: object,
+    ) -> tuple[object, object, object]:
+        pipeline.stems["other"].unlink()
+        return object(), object(), velocity_config
+
+    monkeypatch.setattr(
+        infer_stem,
+        "get_velocity_models",
+        remove_other_before_velocity,
+    )
+
+    pipeline.run(refine_instruments=False)
+
+    assert len(pipeline.velocity_waveforms) == 1

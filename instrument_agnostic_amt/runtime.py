@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 
@@ -47,6 +49,33 @@ def empty_device_cache(device: torch.device | str) -> None:
         torch.mps.empty_cache()
 
 
+def copy_tensors_to_cpu_once(
+    tensors: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    """同じdevice・dtypeの推論出力を連結し、device-to-host転送を1回にする。"""
+    values = tuple(tensors)
+    if not values:
+        return ()
+    if values[0].device.type == "cpu":
+        return tuple(value.cpu() for value in values)
+
+    source_device = values[0].device
+    source_dtype = values[0].dtype
+    if any(
+        value.device != source_device or value.dtype != source_dtype
+        for value in values[1:]
+    ):
+        raise ValueError("tensors must share a device and dtype")
+
+    shapes = tuple(tuple(value.shape) for value in values)
+    sizes = tuple(value.numel() for value in values)
+    flattened = torch.cat([value.reshape(-1) for value in values]).cpu()
+    return tuple(
+        chunk.reshape(shape)
+        for chunk, shape in zip(flattened.split(sizes), shapes)
+    )
+
+
 def resolve_amp_dtype(
     device: torch.device | str,
     dtype_name: str | None,
@@ -87,6 +116,6 @@ def maybe_compile_forward(
             backend="inductor",
             mode=mode,
             fullgraph=False,
-            dynamic=None,
+            dynamic=True,
         )
     return model

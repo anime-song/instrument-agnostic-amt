@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import random
+import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,11 +15,13 @@ import pytest
 import soundfile as sf
 import torch
 import torch.nn as nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from instrument_agnostic_amt.instrument_refinement.inference import refine as refine_module
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     DEFAULT_REFINEMENT_CHECKPOINT_FILENAME,
     ensure_refinement_checkpoint,
+    parse_args as parse_refinement_args,
 )
 from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
@@ -801,8 +805,16 @@ def test_temporal_smoothing_and_embedding_clustering() -> None:
 
 
 class _FakeRefinementModel:
-    def __init__(self, config: InstrumentRefinementConfig) -> None:
+    def __init__(
+        self,
+        config: InstrumentRefinementConfig,
+        *,
+        record_inputs: bool = True,
+    ) -> None:
         self.config = config
+        self.record_inputs = record_inputs
+        self.batch_sizes: list[int] = []
+        self.note_counts: list[list[int]] = []
 
     def to(self, _device: torch.device) -> "_FakeRefinementModel":
         return self
@@ -811,10 +823,15 @@ class _FakeRefinementModel:
         return self
 
     def __call__(self, _audio: torch.Tensor, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
-        assert torch.all(kwargs["note_prior_class"] == -1)
         pitches = kwargs["note_pitch"]
         batch_size, note_count = pitches.shape
+        self.batch_sizes.append(int(batch_size))
         device = pitches.device
+        if self.record_inputs:
+            assert torch.all(kwargs["note_prior_class"] == -1)
+            self.note_counts.append(
+                kwargs["note_mask"].sum(dim=1).detach().cpu().tolist()
+            )
         acoustic = get_instrument_class_id_by_name("acoustic_guitar")
         distorted = get_instrument_class_id_by_name("distorted_guitar")
         note_logits = torch.zeros(batch_size, note_count, self.config.num_instrument_classes, device=device)
@@ -837,6 +854,103 @@ class _FakeRefinementModel:
         }
 
 
+class _FailingRefinementModel(_FakeRefinementModel):
+    def __call__(
+        self,
+        _audio: torch.Tensor,
+        **_kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        raise RuntimeError("refinement forward failed")
+
+
+class _OutputLifetimeRefinementModel(_FakeRefinementModel):
+    """次の窓を流す前に前回のdevice出力が解放されたか記録する。"""
+
+    def __init__(self, config: InstrumentRefinementConfig) -> None:
+        super().__init__(config, record_inputs=False)
+        self.previous_output_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self.released_before_next_forward: list[bool] = []
+
+    def __call__(
+        self,
+        audio: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if self.previous_output_refs:
+            self.released_before_next_forward.append(
+                all(reference() is None for reference in self.previous_output_refs)
+            )
+        outputs = super().__call__(audio, **kwargs)
+        self.previous_output_refs = [
+            weakref.ref(value) for value in outputs.values()
+        ]
+        return outputs
+
+
+class _NonCpuScalarReadCounter(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        if "_local_scalar_dense" in str(func):
+            self.count += sum(
+                int(isinstance(value, torch.Tensor) and value.device.type != "cpu")
+                for value in args
+            )
+        return func(*args, **({} if kwargs is None else kwargs))  # type: ignore[operator]
+
+
+def _small_refinement_config() -> InstrumentRefinementConfig:
+    return InstrumentRefinementConfig(
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        embedding_size=8,
+        use_gradient_checkpoint=False,
+    )
+
+
+def _run_refinement_window_case(
+    tmp_path: Path,
+    *,
+    batch_size: int,
+    pitches: tuple[int, ...] = (60, 67),
+    stride_seconds: float = 0.25,
+    model_type: type[_FakeRefinementModel] = _FakeRefinementModel,
+) -> tuple[_FakeRefinementModel, dict[str, object]]:
+    audio_path = tmp_path / "window_case.wav"
+    midi_path = tmp_path / "window_case.mid"
+    _write_audio(audio_path, frequency=330.0)
+    _write_midi(midi_path, pitches=pitches)
+    config = _small_refinement_config()
+    model = model_type(config)
+    report = refine_midi_instruments(
+        audio_path,
+        midi_path,
+        stem_name="guitar",
+        window_seconds=0.5,
+        stride_seconds=stride_seconds,
+        window_batch_size=batch_size,
+        cluster_distance=0.1,
+        min_cluster_notes=1,
+        disable_tqdm=True,
+        preloaded_model=model,  # type: ignore[arg-type]
+        preloaded_config=config,
+    )
+    return model, report
+
+
 def test_ensure_refinement_checkpoint_prefers_local_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     explicit = tmp_path / "custom_refinement.pth"
     explicit.write_bytes(b"")
@@ -848,6 +962,26 @@ def test_ensure_refinement_checkpoint_prefers_local_files(tmp_path: Path, monkey
     default_path.write_bytes(b"")
     assert ensure_refinement_checkpoint(None) == default_path.resolve()
     assert ensure_refinement_checkpoint("DEFAULT") == default_path.resolve()
+
+
+def test_refinement_cli_accepts_window_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "instrument-refinement",
+            "--audio",
+            "audio.wav",
+            "--midi",
+            "input.mid",
+            "--window-batch-size",
+            "3",
+        ],
+    )
+
+    assert parse_refinement_args().window_batch_size == 3
 
 
 def test_refinement_auto_routes_model_to_mps(
@@ -884,17 +1018,7 @@ def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
     output_path = tmp_path / "refined.mid"
     _write_audio(audio_path, frequency=330.0)
     _write_midi(midi_path, pitches=(60, 67))
-    config = InstrumentRefinementConfig(
-        sample_rate=100,
-        hop_length=10,
-        hidden_size=24,
-        base_ch=8,
-        encoder_num_layers=0,
-        encoder_num_heads=3,
-        note_hidden_size=32,
-        embedding_size=8,
-        use_gradient_checkpoint=False,
-    )
+    config = _small_refinement_config()
     report = refine_midi_instruments(
         audio_path,
         midi_path,
@@ -917,6 +1041,184 @@ def test_whole_stem_refinement_rewrites_midi(tmp_path: Path) -> None:
         "acoustic_guitar",
         "distorted_guitar",
     }
+
+
+def test_refinement_uses_preloaded_waveform_without_reloading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "guitar.wav"
+    midi_path = tmp_path / "guitar.mid"
+    _write_audio(audio_path, frequency=330.0)
+    _write_midi(midi_path, pitches=(60,))
+    config = _small_refinement_config()
+    waveform = refine_module.load_audio(
+        audio_path,
+        target_sample_rate=config.sample_rate,
+    )
+    expected_report = refine_midi_instruments(
+        audio_path,
+        midi_path,
+        stem_name="guitar",
+        mode="single",
+        disable_tqdm=True,
+        preloaded_model=_FakeRefinementModel(config),  # type: ignore[arg-type]
+        preloaded_config=config,
+    )
+    monkeypatch.setattr(
+        refine_module,
+        "load_audio",
+        lambda *_args, **_kwargs: pytest.fail("audio should not be reloaded"),
+    )
+
+    report = refine_midi_instruments(
+        audio_path,
+        midi_path,
+        stem_name="guitar",
+        mode="single",
+        disable_tqdm=True,
+        preloaded_model=_FakeRefinementModel(config),  # type: ignore[arg-type]
+        preloaded_config=config,
+        preloaded_waveform=waveform,
+    )
+
+    assert report == expected_report
+
+
+def test_refinement_window_batch_matches_single_window_output(tmp_path: Path) -> None:
+    _, batched_report = _run_refinement_window_case(tmp_path, batch_size=2)
+    _, single_report = _run_refinement_window_case(tmp_path, batch_size=1)
+
+    assert batched_report == single_report
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="MPS上のRefinement出力転送と寿命を検査するテストです",
+)
+def test_refinement_bulk_transfers_and_releases_device_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "transfer.wav"
+    midi_path = tmp_path / "transfer.mid"
+    _write_audio(audio_path, frequency=330.0, duration=1.0)
+    _write_midi(midi_path, pitches=(60,))
+    config = _small_refinement_config()
+    model = _OutputLifetimeRefinementModel(config)
+    scalar_reads = _NonCpuScalarReadCounter()
+    device_to_host_calls: list[tuple[int, ...]] = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_device_to_host(
+        tensor: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        if tensor.device.type != "cpu":
+            device_to_host_calls.append(tuple(tensor.shape))
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", record_device_to_host)
+    with scalar_reads:
+        refine_midi_instruments(
+            audio_path,
+            midi_path,
+            stem_name="guitar",
+            device="mps",
+            window_seconds=0.5,
+            stride_seconds=0.5,
+            window_batch_size=1,
+            disable_tqdm=True,
+            preloaded_model=model,  # type: ignore[arg-type]
+            preloaded_config=config,
+        )
+
+    assert (
+        len(device_to_host_calls),
+        scalar_reads.count,
+        model.released_before_next_forward,
+    ) == (2, 0, [True])
+
+
+def test_refinement_bulk_transfer_preserves_report_and_midi_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "exact.wav"
+    midi_path = tmp_path / "exact.mid"
+    output_midi_path = tmp_path / "refined.mid"
+    _write_audio(audio_path, frequency=330.0, duration=0.5)
+    _write_midi(midi_path, pitches=(60, 67))
+    config = _small_refinement_config()
+
+    def transfer_outputs_individually(
+        tensors: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor.cpu() for tensor in tensors)
+
+    bulk_transfer = refine_module.copy_tensors_to_cpu_once
+
+    def run_refinement() -> dict[str, object]:
+        return refine_midi_instruments(
+            audio_path,
+            midi_path,
+            output_midi_path=output_midi_path,
+            stem_name="guitar",
+            window_seconds=0.5,
+            stride_seconds=0.5,
+            cluster_distance=0.1,
+            min_cluster_notes=1,
+            disable_tqdm=True,
+            preloaded_model=_FakeRefinementModel(config),  # type: ignore[arg-type]
+            preloaded_config=config,
+        )
+
+    monkeypatch.setattr(
+        refine_module,
+        "copy_tensors_to_cpu_once",
+        transfer_outputs_individually,
+    )
+    legacy_report = run_refinement()
+    legacy_midi = output_midi_path.read_bytes()
+
+    monkeypatch.setattr(
+        refine_module,
+        "copy_tensors_to_cpu_once",
+        bulk_transfer,
+    )
+    bulk_report = run_refinement()
+
+    assert (bulk_report, output_midi_path.read_bytes()) == (
+        legacy_report,
+        legacy_midi,
+    )
+
+
+def test_refinement_window_batch_keeps_the_final_partial_batch(tmp_path: Path) -> None:
+    model, _ = _run_refinement_window_case(tmp_path, batch_size=2)
+
+    assert model.batch_sizes == [2, 1]
+
+
+def test_refinement_window_batch_masks_windows_without_notes(tmp_path: Path) -> None:
+    model, _ = _run_refinement_window_case(
+        tmp_path,
+        batch_size=2,
+        pitches=(60,),
+        stride_seconds=0.5,
+    )
+
+    assert model.note_counts == [[1, 0]]
+
+
+def test_refinement_window_batch_preserves_forward_failures(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="refinement forward failed"):
+        _run_refinement_window_case(
+            tmp_path,
+            batch_size=2,
+            model_type=_FailingRefinementModel,
+        )
 
 
 def _class_dataset_units() -> dict[int, dict[str, tuple[int, ...]]]:
