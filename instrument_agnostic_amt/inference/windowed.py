@@ -118,30 +118,25 @@ def _select_pair_candidates(
         start = int(instrument_id) * NUM_PITCHES
         allowed[start : start + NUM_PITCHES] = True
     finite_mask = finite_mask & allowed
-    if not bool(torch.any(finite_mask).item()):
-        return []
-
-    candidate_ids: set[int] = set()
     threshold = float(settings.instrument_pair_gate_threshold)
-    threshold_mask = finite_mask & (scores >= threshold)
-    if bool(torch.any(threshold_mask).item()):
-        candidate_ids.update(
-            int(item) for item in threshold_mask.nonzero().flatten().tolist()
-        )
+    selected_mask = finite_mask & (scores >= threshold)
 
     topk = max(0, int(settings.instrument_pair_infer_topk))
     if topk > 0:
         masked_scores = scores.masked_fill(~finite_mask, float("-inf"))
-        finite_count = int(torch.isfinite(masked_scores).sum().item())
-        if finite_count > 0:
-            top_ids = torch.topk(masked_scores, k=min(topk, finite_count)).indices
-            candidate_ids.update(int(item) for item in top_ids.tolist())
+        top_ids = torch.topk(masked_scores, k=min(topk, int(scores.numel()))).indices
+        selected_mask.scatter_(0, top_ids, True)
+        selected_mask &= finite_mask
 
-    if not candidate_ids:
-        return []
+    selected_scores = scores.masked_fill(~selected_mask, float("-inf"))
+    score_values = selected_scores.detach().cpu().tolist()
     ranked = sorted(
-        candidate_ids,
-        key=lambda pair_id: (-float(scores[int(pair_id)].item()), int(pair_id)),
+        (
+            pair_id
+            for pair_id, score in enumerate(score_values)
+            if math.isfinite(float(score))
+        ),
+        key=lambda pair_id: (-float(score_values[int(pair_id)]), int(pair_id)),
     )
     max_pairs = int(settings.instrument_pair_max_pairs)
     if max_pairs > 0:
