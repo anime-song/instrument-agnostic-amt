@@ -267,8 +267,9 @@ def decode_v1_notes(
                 and interval_features is not None
             ):
                 logits, entries = model.predict_interval_boundaries(
-                    interval_features[batch_index : batch_index + 1].float(),
+                    interval_features[batch_index : batch_index + 1],
                     decoded_sample,
+                    compute_dtype=torch.float32,
                 )
                 local_boundary_map = _decode_boundary_map(logits, entries)
                 boundary_count += len(entries)
@@ -307,7 +308,9 @@ def decode_v1_notes(
             and instrument_features is not None
         ):
             logits, entries = model.predict_interval_instruments(
-                instrument_features.float(), decoded_batch
+                instrument_features,
+                decoded_batch,
+                compute_dtype=torch.float32,
             )
             instrument_map = _decode_instrument_map(
                 logits,
