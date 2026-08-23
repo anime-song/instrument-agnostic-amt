@@ -49,74 +49,90 @@ def _strictly_lower_triangular_mask(T: int, device: torch.device) -> torch.Tenso
 
 
 @torch.jit.script
+def _viterbi_backward_tensors(
+    score: torch.Tensor,
+    noise_score: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Viterbi DPをデバイス上で実行し、tracebackに必要な状態を返す。"""
+    time_steps = _validate_shapes(score, noise_score)
+    track_count = int(score.shape[2])
+
+    q = score.new_zeros(time_steps, track_count)
+    pointers = torch.jit.annotate(List[torch.Tensor], [])
+    q[time_steps - 1] = score[time_steps - 1, time_steps - 1, :] * (
+        score[time_steps - 1, time_steps - 1, :] > 0
+    )
+
+    for offset in range(1, time_steps):
+        begin = time_steps - offset - 1
+
+        # 区間候補とskip候補を別々に評価し、時刻ごとの一時的なcatを作らない。
+        interval_values = q[begin + 1 :, :] + score[begin + 1 :, begin, :]
+        best_interval_value, interval_selection = interval_values.max(dim=0)
+        skip_value = q[begin + 1, :] + noise_score[begin, :]
+
+        # 旧実装ではskipが候補の先頭にあり、同点時はskipが選ばれていた。
+        use_interval = best_interval_value > skip_value
+        pointers.append(torch.where(use_interval, interval_selection, -1))
+        best_value = torch.where(use_interval, best_interval_value, skip_value)
+
+        singleton_mask = score[begin, begin, :] > 0
+        q[begin] = best_value + score[begin, begin, :] * singleton_mask
+
+    # traceback順のpointerをtrack-majorで直接積み、転置コピーを発生させない。
+    return (
+        torch.stack(pointers, dim=1),
+        torch.diagonal(score, dim1=0, dim2=1) > 0,
+    )
+
+
 def viterbiBackward(
     score: torch.Tensor,
     noiseScore: torch.Tensor,
     forcedStartPos: Optional[List[int]] = None,
 ) -> IntervalBatch:
     """
-    Decode intervals from left to right.
+    左から右へ最良の区間列をデコードする。
 
     Args:
-        score: [T, T, B] where score[end, begin, batch] is the score for [begin, end].
-        noiseScore: [T-1, B] score for a non-event transition [t, t+1].
-        forcedStartPos: per-batch forced start position for segmented decoding.
+        score: [T, T, B]。score[end, begin, batch]は[begin, end]のスコア。
+        noiseScore: [T-1, B]。位置[t, t+1]をskipするスコア。
+        forcedStartPos: 分割デコードで使用するトラックごとの開始位置。
     """
-    T = _validate_shapes(score, noiseScore)
-    nBatch = int(score.shape[2])
+    pointers, diag_inclusion = _viterbi_backward_tensors(score, noiseScore)
+    time_steps = int(score.shape[0])
+    track_count = int(score.shape[2])
 
-    q = score.new_zeros(T, nBatch)
-    ptr = []
-
-    q[T - 1] = score[T - 1, T - 1, :] * (score[T - 1, T - 1, :] > 0)
-
-    for offset in range(1, T):
-        t = T - offset - 1
-        subScore = score[t + 1 :, t, :]
-
-        candidates = torch.cat(
-            [
-                q[t + 1 : t + 2, :] + noiseScore[t, :],  # skip current position
-                q[t + 1 :, :] + subScore,  # start an interval at t
-            ],
-            dim=0,
-        )
-
-        bestValue, selection = candidates.max(dim=0)
-        ptr.append(selection - 1)
-
-        singletonMask = score[t, t, :] > 0
-        q[t] = bestValue + score[t, t, :] * singletonMask
-
-    ptr = torch.stack(ptr, dim=0).cpu()
-    diagInclusion = (torch.diagonal(score, dim1=0, dim2=1) > 0).cpu()
+    # TensorのCPUスカラー参照は高コストなため、一括転送後はPython list上を辿る。
+    pointer_values = pointers.cpu().tolist()
+    diag_values = diag_inclusion.cpu().tolist()
 
     if forcedStartPos is None:
-        forcedStartPos = [0] * nBatch
+        forcedStartPos = [0] * track_count
 
     result: IntervalBatch = []
-    for batchIdx in range(nBatch):
-        pos = forcedStartPos[batchIdx]
-        batchResult: List[Interval] = []
-        curDiag = diagInclusion[batchIdx]
+    for track in range(track_count):
+        position = forcedStartPos[track]
+        track_result: List[Interval] = []
+        current_diag = diag_values[track]
 
-        while pos < T - 1:
-            selection = int(ptr[T - pos - 2][batchIdx])
+        while position < time_steps - 1:
+            selection = int(pointer_values[track][time_steps - position - 2])
 
-            if bool(curDiag[pos]):
-                batchResult.append((pos, pos))
+            if bool(current_diag[position]):
+                track_result.append((position, position))
 
             if selection < 0:
-                pos += 1
+                position += 1
             else:
-                end = selection + pos + 1
-                batchResult.append((pos, end))
-                pos = end
+                end = selection + position + 1
+                track_result.append((position, end))
+                position = end
 
-        if bool(curDiag[T - 1]):
-            batchResult.append((T - 1, T - 1))
+        if bool(current_diag[time_steps - 1]):
+            track_result.append((time_steps - 1, time_steps - 1))
 
-        result.append(batchResult)
+        result.append(track_result)
 
     return result
 
