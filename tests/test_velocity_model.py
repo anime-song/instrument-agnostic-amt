@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from instrument_agnostic_amt.modeling.backbone import V1Backbone
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
@@ -26,6 +27,37 @@ class _FakePitchBackbone(nn.Module):
     def forward(self, audio: torch.Tensor) -> SimpleNamespace:
         values = self.projection(audio).transpose(1, 2)
         values = values.reshape(audio.shape[0], values.shape[1], 88, self.query_feature_dim)
+        return SimpleNamespace(pitch_query_features=values)
+
+
+class _AuxAwareFakePitchBackbone(V1Backbone):
+    query_feature_dim = 12
+
+    def __init__(self) -> None:
+        nn.Module.__init__(self)
+        self.projection = nn.Conv1d(
+            2,
+            88 * self.query_feature_dim,
+            5,
+            stride=10,
+            padding=2,
+        )
+        self.include_aux_outputs: list[bool] = []
+
+    def forward(
+        self,
+        audio: torch.Tensor,
+        *,
+        include_aux_outputs: bool = True,
+    ) -> SimpleNamespace:
+        self.include_aux_outputs.append(include_aux_outputs)
+        values = self.projection(audio).transpose(1, 2)
+        values = values.reshape(
+            audio.shape[0],
+            values.shape[1],
+            88,
+            self.query_feature_dim,
+        )
         return SimpleNamespace(pitch_query_features=values)
 
 
@@ -161,6 +193,28 @@ def test_velocity_model_can_skip_unused_stem_gain_head() -> None:
         velocity_only["velocity_expected"],
         reference["velocity_expected"],
     )
+
+
+def test_velocity_model_skips_backbone_auxiliary_outputs() -> None:
+    config = VelocityModelConfig(
+        sample_rate=100,
+        hop_length=10,
+        hidden_size=24,
+        base_ch=8,
+        encoder_num_layers=0,
+        encoder_num_heads=3,
+        note_hidden_size=32,
+        dropout=0.0,
+        use_gradient_checkpoint=False,
+        predict_stem_gain=False,
+    )
+    backbone = _AuxAwareFakePitchBackbone()
+    model = VelocityPredictionModel(config, backbone=backbone).eval()
+
+    with torch.inference_mode():
+        forward_velocity_batch(model, _batch())
+
+    assert backbone.include_aux_outputs == [False]
 
 
 def test_velocity_loss_handles_empty_note_targets() -> None:
