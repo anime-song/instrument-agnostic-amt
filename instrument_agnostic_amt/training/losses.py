@@ -251,6 +251,11 @@ def _compute_v2_losses(
         if args is None
         else float(getattr(args, "semi_crf_false_positive_cost", 0.0))
     )
+    semi_crf_loss_backend = (
+        "torch"
+        if args is None
+        else str(getattr(args, "semi_crf_loss_backend", "torch"))
+    )
     interval_presence_loss_weight = (
         1.0
         if args is None
@@ -321,6 +326,7 @@ def _compute_v2_losses(
             else int(getattr(args, "semi_crf_track_batch_size", 128)),
             false_negative_cost=semi_crf_false_negative_cost,
             false_positive_cost=semi_crf_false_positive_cost,
+            backend=semi_crf_loss_backend,
         )
     )
 

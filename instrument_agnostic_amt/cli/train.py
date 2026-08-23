@@ -153,6 +153,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semi_crf_false_negative_cost", type=float, default=0.0)
     parser.add_argument("--semi_crf_false_positive_cost", type=float, default=0.0)
     parser.add_argument("--semi_crf_track_batch_size", type=int, default=128)
+    parser.add_argument(
+        "--semi-crf-loss-backend",
+        "--semi_crf_loss_backend",
+        choices=("torch", "triton"),
+        default="torch",
+        help="Use the optional fused Triton log-partition on CUDA during training.",
+    )
     parser.add_argument("--instrument_loss_weight", type=float, default=1.0)
     parser.add_argument("--instrument_loss_type", choices=("bce", "ce"), default="bce")
     parser.add_argument("--instrument_pair_train_topk", type=int, default=256)
@@ -221,6 +228,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("harmonic_dropout_p must be in [0, 1)")
     if args.instrument_pair_train_topk < 0 or args.instrument_pair_random_negatives < 0:
         raise ValueError("instrument-pair negative counts must be non-negative")
+    if args.semi_crf_loss_backend == "triton" and not torch.cuda.is_available():
+        raise ValueError("Triton Semi-CRF loss requires CUDA")
 
 
 def _source_value(
@@ -409,7 +418,12 @@ def main() -> None:
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
-    logger.info("Training Semi-CRF %s on %s", config.semi_crf_version, device)
+    logger.info(
+        "Training Semi-CRF %s on %s with %s loss backend",
+        config.semi_crf_version,
+        device,
+        args.semi_crf_loss_backend,
+    )
     for epoch in range(1, args.epochs + 1):
         model.train()
         dataset.set_epoch(epoch)

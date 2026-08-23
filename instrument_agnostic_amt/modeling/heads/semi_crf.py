@@ -320,6 +320,14 @@ class ComputeLogZFasterGrad(torch.autograd.Function):
 computeLogZFasterGrad = ComputeLogZFasterGrad.apply
 
 
+def _validate_loss_backend(backend: str, device: torch.device) -> None:
+    """Semi-CRF loss backend名と実行deviceの組み合わせを検証する。"""
+    if backend not in {"torch", "triton"}:
+        raise ValueError("backend must be one of {'torch', 'triton'}")
+    if backend == "triton" and device.type != "cuda":
+        raise ValueError("Triton Semi-CRF loss requires a CUDA tensor")
+
+
 def evalPath(
     intervals: IntervalBatch, score: torch.Tensor, noiseScore: torch.Tensor
 ) -> torch.Tensor:
@@ -418,22 +426,47 @@ class NeuralSemiCRFInterval:
         """Compute the unnormalized score of a given interval path."""
         return evalPath(intervals, self.score, self.noiseScore)
 
-    def computeLogZ(self, noBackward: bool = False) -> torch.Tensor:
+    def computeLogZ(
+        self,
+        noBackward: bool = False,
+        *,
+        backend: str = "torch",
+    ) -> torch.Tensor:
         """
         Compute log Z.
 
         noBackward=True uses the plain scripted DP.
         noBackward=False uses the custom-autograd implementation with faster gradients.
         """
+        _validate_loss_backend(backend, self.score.device)
         if noBackward:
+            if backend != "torch":
+                raise ValueError("noBackward log-partition only supports torch")
             return computeLogZ(self.score, self.noiseScore)
+        if backend == "triton":
+            try:
+                from .semi_crf_loss_triton import compute_log_z_triton
+            except ModuleNotFoundError as exc:
+                if exc.name is None or not exc.name.startswith("triton"):
+                    raise
+                raise RuntimeError(
+                    "Triton Semi-CRF loss requires the triton package"
+                ) from exc
+            return compute_log_z_triton(self.score, self.noiseScore)
         return computeLogZFasterGrad(self.score, self.noiseScore)
 
     def logProb(
-        self, intervals: IntervalBatch, noBackward: bool = False
+        self,
+        intervals: IntervalBatch,
+        noBackward: bool = False,
+        *,
+        backend: str = "torch",
     ) -> torch.Tensor:
         """Compute log p(intervals)."""
-        return self.evalPath(intervals) - self.computeLogZ(noBackward=noBackward)
+        return self.evalPath(intervals) - self.computeLogZ(
+            noBackward=noBackward,
+            backend=backend,
+        )
 
 
 def _flatten_pitch_interval_batch(
@@ -1383,8 +1416,10 @@ def compute_flat_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """Compute Semi-CRF NLL for an already-selected flat track set."""
+    _validate_loss_backend(backend, flat_query.device)
     if flat_query.shape != flat_key.shape:
         raise ValueError(
             "flat_query and flat_key must share the same shape, "
@@ -1476,12 +1511,12 @@ def compute_flat_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
@@ -1509,8 +1544,10 @@ def compute_factorized_pair_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """Compute V2 Semi-CRF NLL from additive pitch/instrument projections."""
+    _validate_loss_backend(backend, pitch_query.device)
 
     batch_size, _, _, _, track_count = (
         _validate_factorized_interval_inputs(
@@ -1605,12 +1642,12 @@ def compute_factorized_pair_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)
@@ -1632,6 +1669,7 @@ def compute_pitch_interval_loss(
     track_batch_size: int = 128,
     false_negative_cost: float = 0.0,
     false_positive_cost: float = 0.0,
+    backend: str = "torch",
 ) -> tuple[torch.Tensor, int, int]:
     """
     Compute pitch-wise semi-CRF NLL from interval query/key features.
@@ -1647,7 +1685,9 @@ def compute_pitch_interval_loss(
             Cost added during training for active frames that are left uncovered.
         false_positive_cost:
             Cost added during training for silent frames covered by an interval.
+        backend: log-partitionを計算するtorchまたはtriton backend。
     """
+    _validate_loss_backend(backend, interval_query.device)
     if interval_query.shape != interval_key.shape:
         raise ValueError(
             "interval_query and interval_key must share the same shape, "
@@ -1748,12 +1788,12 @@ def compute_pitch_interval_loss(
             )
             if interval_cost is None:
                 semi_crf = NeuralSemiCRFInterval(score, noise_score)
-                chunk_loss = -semi_crf.logProb(chunk_targets)
+                chunk_loss = -semi_crf.logProb(chunk_targets, backend=backend)
             else:
                 augmented_score = score + interval_cost
                 semi_crf = NeuralSemiCRFInterval(augmented_score, noise_score)
                 gold_score = evalPath(chunk_targets, score, noise_score)
-                chunk_loss = semi_crf.computeLogZ() - gold_score
+                chunk_loss = semi_crf.computeLogZ(backend=backend) - gold_score
             total_loss_sum = total_loss_sum + chunk_loss.sum()
             total_tracks += int(chunk_indices.numel())
             total_intervals += sum(len(track) for track in chunk_targets)

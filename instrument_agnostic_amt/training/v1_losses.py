@@ -63,6 +63,7 @@ def compute_v1_losses(
         track_batch_size=int(value("semi_crf_track_batch_size", 128)),
         false_negative_cost=false_negative_cost,
         false_positive_cost=false_positive_cost,
+        backend=str(value("semi_crf_loss_backend", "torch")),
     )
     total_loss = semi_crf_loss * float(value("semi_crf_loss_weight", 1.0))
     zero = interval_query.sum() * 0.0
@@ -162,4 +163,3 @@ def compute_v1_losses(
         "interval_boundary_interval_count": torch.tensor(boundary_count, device=device),
         "instrument_loss": instrument_loss,
     }
-
