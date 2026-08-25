@@ -112,6 +112,13 @@ def parse_args() -> argparse.Namespace:
         default="v1",
         help="v1 keeps pitch/slot compatibility; v2 uses instrument-pitch tracks.",
     )
+    parser.add_argument(
+        "--compile-transformer",
+        "--compile_transformer",
+        choices=("off", "default", "reduce-overhead", "max-autotune"),
+        default="off",
+        help="バックボーンの時間/バンド Transformer だけを torch.compile する。",
+    )
     parser.add_argument("--init-from", "--init_from", type=str, default=None)
     parser.add_argument("--freeze-backbone", "--freeze_backbone", action="store_true")
     parser.add_argument(
@@ -310,6 +317,40 @@ def build_model_config(
     )
 
 
+def drop_unsearchable_path_entries() -> list[str]:
+    """PATH から探索できないエントリを落とし、落としたものを返す。
+
+    torch 2.13 の inductor は生成コードのコメント用に codegen 中へ無条件で
+    ``nvcc --version`` を実行するが、torch 側は FileNotFoundError しか捕捉していない。
+    WSL では PATH に紛れ込んだ実在しない Windows 側ディレクトリのせいで execvp が
+    ENOENT ではなく EACCES を返し、PermissionError でコンパイル全体が落ちる。
+    nvcc 自体はコンパイルに不要（Triton が ptxas を同梱している）。
+    """
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    searchable = [
+        entry for entry in entries if os.path.isdir(entry) and os.access(entry, os.X_OK)
+    ]
+    dropped = [entry for entry in entries if entry not in searchable]
+    if dropped:
+        os.environ["PATH"] = os.pathsep.join(searchable)
+    return dropped
+
+
+def compile_backbone_transformers(model: AudioSemiCRFTransformer, mode: str) -> None:
+    """バックボーンの時間軸/バンド軸 Transformer だけを torch.compile する。
+
+    プロファイル上 1 step の 65% が backward で、その大半は Transformer の
+    elementwise 演算（RMSNorm・RoPE・残差・FFN）だった。matmul 律速ではないので
+    カーネル融合がそのまま効き、RTX 4070 Ti で 1 step が約 1.7 倍速くなる。
+    Semi-CRF ロスは動的な形状を持つ自前 DP なのでコンパイル対象にしない。
+
+    nn.Module.compile は state_dict のキーを変えないため、チェックポイント互換性は保たれる。
+    """
+    for time_transformer, band_transformer in model.backbone.layers:
+        time_transformer.compile(mode=mode)
+        band_transformer.compile(mode=mode)
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -393,7 +434,17 @@ def main() -> None:
         ),
     )
     scaler = torch.amp.GradScaler(device.type) if use_scaler else None
+    # EMA は非コンパイルのコピーを持たせたいので、複製してから compile する。
     ema_model = ModelEma(model, args.ema_decay) if args.ema_decay > 0.0 else None
+    if args.compile_transformer != "off":
+        dropped = drop_unsearchable_path_entries()
+        if dropped:
+            logger.info("Dropped %d unsearchable PATH entries: %s", len(dropped), dropped)
+        compile_backbone_transformers(model, args.compile_transformer)
+        logger.info(
+            "Compiled backbone transformers (mode=%s); the first steps include compilation",
+            args.compile_transformer,
+        )
     os.makedirs(args.save_dir, exist_ok=True)
     if args.wandb:
         wandb.config.update({"model_config": asdict(config)})
