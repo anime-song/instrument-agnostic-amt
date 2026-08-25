@@ -259,6 +259,64 @@ def test_beat_chord_auto_routes_model_to_mps(
     assert loaded_devices == ["mps"]
 
 
+def test_predict_beat_chord_reuses_preloaded_model_and_auto_enables_jit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_midi = tmp_path / "input.mid"
+    input_midi.write_bytes(b"midi")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "ensure_beat_chord_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("checkpoint should not be resolved"),
+    )
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "load_beat_chord_model",
+        lambda *_args, **_kwargs: pytest.fail("model should not be loaded"),
+    )
+    monkeypatch.setattr(
+        "instrument_agnostic_amt.beat_chord.decoding.beat_grid_jit.is_jit_grid_available",
+        lambda: True,
+    )
+
+    def fake_run(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            beat_times=[],
+            meter_segments=[],
+            chord_segments=[],
+            key_segments=[],
+            duration_seconds=0.0,
+            hop_length=1,
+            sample_rate=1,
+        )
+
+    monkeypatch.setattr(beat_chord_infer, "run_beat_chord_inference", fake_run)
+    monkeypatch.setattr(
+        beat_chord_infer,
+        "export_tempo_mapped_midi",
+        lambda **_kwargs: None,
+    )
+    model = torch.nn.Linear(1, 1)
+    model_config = object()
+    metadata = {"checkpoint_args": {}}
+
+    predict_beat_chord_for_midi(
+        input_midi,
+        device="cpu",
+        preloaded_model=model,
+        preloaded_model_config=model_config,
+        preloaded_metadata=metadata,
+    )
+
+    assert captured["model"] is model
+    assert captured["model_config"] is model_config
+    assert captured["checkpoint"] == {}
+    assert captured["config"].grid_jit is True
+
+
 def test_run_beat_chord_batches_windows_without_changing_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

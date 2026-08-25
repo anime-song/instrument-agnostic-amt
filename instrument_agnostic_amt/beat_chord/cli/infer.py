@@ -506,8 +506,17 @@ def predict_beat_chord_for_midi(
     window_batch_size: int = 1,
     beat_mapped_ticks_per_beat: int = 480,
     disable_tqdm: bool = False,
+    grid_jit: bool | None = None,
+    preloaded_model: torch.nn.Module | None = None,
+    preloaded_model_config: MidiFrameModelConfig | None = None,
+    preloaded_metadata: Mapping[str, object] | None = None,
 ) -> Path:
-    """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。"""
+    """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。
+
+    ``grid_jit=None`` はNumbaが利用できる環境で、Python実装と同値な拍グリッド
+    kernelを自動選択する。preloaded引数は長寿命のColabセッションでモデルを
+    再利用し、同じcheckpointを実行ごとに読み直さないために使う。
+    """
     input_midi_file = Path(input_midi_path).resolve()
     if not input_midi_file.exists():
         raise FileNotFoundError(f"Input MIDI file not found: {input_midi_file}")
@@ -519,11 +528,35 @@ def predict_beat_chord_for_midi(
 
     device_obj = resolve_device(device)
 
-    resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
-    model, model_config, metadata = load_beat_chord_model(
-        resolved_checkpoint_path,
-        device=device_obj,
+    preloaded_values = (
+        preloaded_model,
+        preloaded_model_config,
+        preloaded_metadata,
     )
+    if any(value is None for value in preloaded_values) and not all(
+        value is None for value in preloaded_values
+    ):
+        raise ValueError(
+            "preloaded_model, preloaded_model_config, and preloaded_metadata "
+            "must be provided together"
+        )
+    if preloaded_model is None:
+        resolved_checkpoint_path = ensure_beat_chord_checkpoint(checkpoint_path)
+        model, model_config, metadata = load_beat_chord_model(
+            resolved_checkpoint_path,
+            device=device_obj,
+        )
+    else:
+        model = preloaded_model
+        model_config = preloaded_model_config
+        metadata = dict(preloaded_metadata)
+        model.to(device_obj)
+        model.eval()
+
+    if grid_jit is None:
+        from ..decoding.beat_grid_jit import is_jit_grid_available
+
+        grid_jit = is_jit_grid_available()
     
     # Defaults in original function
     config = BeatChordInferenceConfig(
@@ -532,6 +565,7 @@ def predict_beat_chord_for_midi(
         window_ms_override=window_ms_override,
         stride_ms_override=stride_ms_override,
         window_batch_size=int(window_batch_size),
+        grid_jit=bool(grid_jit),
         beat_mapped_ticks_per_beat=beat_mapped_ticks_per_beat,
         disable_tqdm=disable_tqdm,
         beat_threshold=0.3,
@@ -544,7 +578,9 @@ def predict_beat_chord_for_midi(
 
     result = run_beat_chord_inference(
         midi_path=input_midi_file,
-        checkpoint=metadata["checkpoint"],
+        # run_beat_chord_inferenceは互換性のためcheckpoint引数を保持しているが、
+        # 推論本体では展開済みmetadataだけを参照する。
+        checkpoint=metadata.get("checkpoint", {}),
         model=model,
         model_config=model_config,
         metadata=metadata,

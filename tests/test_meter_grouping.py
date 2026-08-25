@@ -8,6 +8,7 @@ from instrument_agnostic_amt.beat_chord.decoding.beat_grid import (
     decode_beats_with_meter_grid_dp,
 )
 from instrument_agnostic_amt.beat_chord.decoding.meter_grouping import (
+    group_boundary_log_odds_array,
     score_major_groupings,
 )
 from instrument_agnostic_amt.beat_chord.heads.meter_grouping import (
@@ -178,6 +179,37 @@ def test_decoder_group_score_selects_the_supported_five_four_pattern() -> None:
 
     assert score > 0.0
     assert patterns == ((2, 3),)
+
+
+def test_precomputed_group_boundary_log_odds_match_the_probability_path() -> None:
+    # ``beat_grid._log_odds_array`` clamps to +-6, which would silently rescale
+    # confident boundaries. The precomputed array must stay bit-identical to the
+    # per-frame ``_logit`` it replaces.
+    generator = np.random.default_rng(0)
+    probabilities = 1.0 / (
+        1.0 + np.exp(-generator.normal(0.0, 6.0, size=200))
+    )
+    grid_frames = tuple(range(48))
+
+    from_probabilities = score_major_groupings(
+        grid_frames=grid_frames,
+        meter_num=6,
+        meter_den=8,
+        bar_count=8,
+        group_boundary_probabilities=probabilities,
+        false_boundary_weight=0.25,
+    )
+    from_log_odds = score_major_groupings(
+        grid_frames=grid_frames,
+        meter_num=6,
+        meter_den=8,
+        bar_count=8,
+        group_boundary_probabilities=probabilities,
+        false_boundary_weight=0.25,
+        group_boundary_log_odds=group_boundary_log_odds_array(probabilities),
+    )
+
+    assert from_log_odds == from_probabilities
 
 
 def test_grid_decoder_reports_major_grouping() -> None:

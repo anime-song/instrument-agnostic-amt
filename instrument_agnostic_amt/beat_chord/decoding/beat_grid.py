@@ -7,7 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from .meter_grouping import score_major_groupings
+from .meter_grouping import (
+    group_boundary_log_odds_array,
+    score_major_groupings,
+)
 
 
 _LOG_TWO = math.log(2.0)
@@ -511,6 +514,7 @@ def _score_grid_edge(
     beat_probabilities: np.ndarray,
     downbeat_probabilities: np.ndarray,
     group_boundary_probabilities: np.ndarray | None,
+    group_boundary_log_odds: np.ndarray | None,
     beat_log_odds: np.ndarray,
     downbeat_log_odds: np.ndarray,
     meter_mean_log_prob: float,
@@ -558,11 +562,24 @@ def _score_grid_edge(
             beat_peak_frames.searchsorted(end_frame, side="left")
         )
     ]
-    extra_peak_score = -float(config.offbeat_peak_weight) * sum(
-        max(0.0, float(beat_log_odds[frame]))
-        for frame in interval_peaks
-        if not _is_near_any(frame, grid_frames, config.tolerance_frames)
-    )
+    # interval_peaksとgrid_framesはともに昇順。peakごとのbisectを避け、1回の
+    # two-pointer走査でgrid近傍にない余分なpeakだけを数える。
+    extra_peak_log_odds = 0.0
+    grid_index = 0
+    tolerance_frames = int(config.tolerance_frames)
+    for peak_frame_value in interval_peaks:
+        peak_frame = int(peak_frame_value)
+        while (
+            grid_index < len(grid_frames)
+            and int(grid_frames[grid_index]) < peak_frame - tolerance_frames
+        ):
+            grid_index += 1
+        if (
+            grid_index >= len(grid_frames)
+            or abs(int(grid_frames[grid_index]) - peak_frame) > tolerance_frames
+        ):
+            extra_peak_log_odds += max(0.0, float(beat_log_odds[peak_frame]))
+    extra_peak_score = -float(config.offbeat_peak_weight) * extra_peak_log_odds
 
     downbeat_score = 0.0
     false_downbeat_score = 0.0
@@ -588,6 +605,7 @@ def _score_grid_edge(
         meter_den=int(meter_den),
         bar_count=int(bar_count),
         group_boundary_probabilities=group_boundary_probabilities,
+        group_boundary_log_odds=group_boundary_log_odds,
         false_boundary_weight=float(config.false_group_boundary_weight),
     )
     grouping_score = float(config.group_boundary_score_weight) * raw_grouping_score
@@ -963,6 +981,11 @@ def _decode_beats_with_meter_grid_dp_single_pass(
         grid_builder = build_regularized_grid_jit
     beat_log_odds = _log_odds_array(beat_probabilities)
     downbeat_log_odds = _log_odds_array(downbeat_probabilities)
+    group_boundary_log_odds = (
+        None
+        if group_boundary_probabilities is None
+        else group_boundary_log_odds_array(group_boundary_probabilities)
+    )
 
     raw_downbeat_candidates = _ranked_peak_candidates(
         downbeat_probabilities,
@@ -1054,6 +1077,11 @@ def _decode_beats_with_meter_grid_dp_single_pass(
             minimum_meter_run_quarter_notes=(config.minimum_meter_run_quarter_notes),
         )
         predecessor_states = states_by_candidate[start_index]
+        # 同じstart候補では、遷移の評価はedgeのquarter periodとmeterだけで決まる。
+        # meter evidenceやbar scoreが異なるedge間で最良predecessorを再利用する。
+        predecessor_choice_cache: dict[
+            tuple[float, int], tuple[_PathState, float]
+        ] = {}
 
         for end_index in range(start_index + 1, len(candidates)):
             if end_index - start_index > int(config.max_boundary_hops):
@@ -1131,6 +1159,7 @@ def _decode_beats_with_meter_grid_dp_single_pass(
                             beat_probabilities=beat_probabilities,
                             downbeat_probabilities=downbeat_probabilities,
                             group_boundary_probabilities=(group_boundary_probabilities),
+                            group_boundary_log_odds=group_boundary_log_odds,
                             beat_log_odds=beat_log_odds,
                             downbeat_log_odds=downbeat_log_odds,
                             meter_mean_log_prob=float(meter_evidence),
@@ -1147,26 +1176,42 @@ def _decode_beats_with_meter_grid_dp_single_pass(
                             edge_cache[edge_key] = edge
                     if edge is None:
                         continue
-                    best_predecessor: _PathState | None = None
-                    best_total = -float("inf")
-                    for predecessor in predecessor_states:
-                        total = (
-                            predecessor.total_score
-                            + edge.score
-                            + _transition_score(
-                                predecessor,
-                                edge,
-                                config,
-                                tempo_penalty_cache,
-                                tempo_free_delta,
-                                tempo_huber_width,
+                    predecessor_key = (
+                        float(edge.quarter_period_frames),
+                        int(edge.meter_index),
+                    )
+                    predecessor_choice = predecessor_choice_cache.get(
+                        predecessor_key
+                    )
+                    if predecessor_choice is None:
+                        best_predecessor: _PathState | None = None
+                        best_predecessor_score = -float("inf")
+                        for predecessor in predecessor_states:
+                            predecessor_score = (
+                                predecessor.total_score
+                                + _transition_score(
+                                    predecessor,
+                                    edge,
+                                    config,
+                                    tempo_penalty_cache,
+                                    tempo_free_delta,
+                                    tempo_huber_width,
+                                )
                             )
+                            if predecessor_score > best_predecessor_score:
+                                best_predecessor_score = float(predecessor_score)
+                                best_predecessor = predecessor
+                        if best_predecessor is None:
+                            continue
+                        predecessor_choice = (
+                            best_predecessor,
+                            best_predecessor_score,
                         )
-                        if total > best_total:
-                            best_total = float(total)
-                            best_predecessor = predecessor
-                    if best_predecessor is None:
-                        continue
+                        predecessor_choice_cache[predecessor_key] = (
+                            predecessor_choice
+                        )
+                    best_predecessor, best_predecessor_score = predecessor_choice
+                    best_total = best_predecessor_score + edge.score
                     edge_quarter_notes = (
                         float(edge.meter_num)
                         * 4.0

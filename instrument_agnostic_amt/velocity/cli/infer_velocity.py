@@ -500,6 +500,70 @@ def predict_velocity_for_stem_midis(
             "This velocity checkpoint does not contain a stem-gain prediction head"
         )
     resolved_audios = _resolve_stem_files(stem_audios)
+    resolved_midis: dict[str, Path] = {}
+    for key, val in stem_midis.items():
+        midi_path = Path(val)
+        if midi_path.exists():
+            resolved_midis[key.lower()] = midi_path
+
+    if not resolved_midis:
+        raise ValueError("No valid stem MIDI files provided.")
+
+    # MIDIを先に読み、velocityを割り当てる必要があるステムを確定する。既定の
+    # velocity-only headでは各stemのbackboneが独立なので、ノートがないstemの音声を
+    # GPUへ載せても予測値には寄与せず、曲全体にわたって計算量だけが増える。
+    flat_notes: list[_VelocityNoteRecord] = []
+    loaded_midi_objs: dict[str, pretty_midi.PrettyMIDI] = {}
+
+    for stem_name, midi_path in resolved_midis.items():
+        pm_obj = pretty_midi.PrettyMIDI(str(midi_path))
+        loaded_midi_objs[stem_name] = pm_obj
+
+        for inst in pm_obj.instruments:
+            for note in inst.notes:
+                flat_notes.append(
+                    _VelocityNoteRecord(
+                        note=note,
+                        program=int(inst.program),
+                        is_drum=bool(inst.is_drum),
+                        stem_index=-1,
+                        stem_name=stem_name,
+                        instrument_name=str(inst.name),
+                    )
+                )
+
+    if not flat_notes:
+        print("Warning: No notes found across stem MIDI files.")
+        return list(resolved_midis.values())[0]
+
+    select_note_stems_only = bool(
+        not apply_stem_gain_to_cc7
+        and isinstance(model, VelocityPredictionModel)
+        and forward_model is model
+    )
+    if select_note_stems_only:
+        active_stem_names = sorted({record.stem_name for record in flat_notes})
+        skipped_stem_names = sorted(
+            (set(resolved_audios) | set(resolved_midis)) - set(active_stem_names)
+        )
+        if skipped_stem_names:
+            print(
+                "Skipping velocity backbone for stems without notes: "
+                f"{skipped_stem_names}"
+            )
+    else:
+        # Legacy stem-gain予測はstem間の相対レベルを使うため、全stemが必要。
+        active_stem_names = sorted(
+            set(resolved_audios.keys()) | set(resolved_midis.keys())
+        )
+
+    stem_index_by_name = {
+        stem_name: stem_index
+        for stem_index, stem_name in enumerate(active_stem_names)
+    }
+    for record in flat_notes:
+        record.stem_index = stem_index_by_name[record.stem_name]
+
     cached_waveforms = {
         str(name).lower(): waveform
         for name, waveform in (preloaded_waveforms or {}).items()
@@ -522,27 +586,14 @@ def predict_velocity_for_stem_midis(
         waveform.flags.writeable = False
         return waveform
 
-    resolved_midis: dict[str, Path] = {}
-    for key, val in stem_midis.items():
-        midi_path = Path(val)
-        if midi_path.exists():
-            resolved_midis[key.lower()] = midi_path
-
-    if not resolved_midis:
-        raise ValueError("No valid stem MIDI files provided.")
-
-    active_stem_names = sorted(set(resolved_audios.keys()) | set(resolved_midis.keys()))
     stem_waveforms: list[np.ndarray] = []
     stem_class_ids: list[int] = []
-
     for name in active_stem_names:
         if name in resolved_audios:
             waveform = resolve_waveform(name, resolved_audios[name])
         else:
             first_name, first_wave = next(iter(resolved_audios.items()))
-            ref_wave = resolve_waveform(first_name, first_wave)
-            waveform = np.zeros_like(ref_wave)
-
+            waveform = np.zeros_like(resolve_waveform(first_name, first_wave))
         stem_waveforms.append(waveform)
         stem_class_ids.append(STEM_CLASS_BY_NAME.get(name, UNKNOWN_STEM_CLASS))
 
@@ -564,35 +615,6 @@ def predict_velocity_for_stem_midis(
         .unsqueeze(0)
         .to(device=target_device)
     )
-
-    flat_notes: list[_VelocityNoteRecord] = []
-    loaded_midi_objs: dict[str, pretty_midi.PrettyMIDI] = {}
-
-    for stem_name, midi_path in resolved_midis.items():
-        if stem_name in active_stem_names:
-            stem_index = active_stem_names.index(stem_name)
-        else:
-            stem_index = 0
-
-        pm_obj = pretty_midi.PrettyMIDI(str(midi_path))
-        loaded_midi_objs[stem_name] = pm_obj
-
-        for inst in pm_obj.instruments:
-            for note in inst.notes:
-                flat_notes.append(
-                    _VelocityNoteRecord(
-                        note=note,
-                        program=int(inst.program),
-                        is_drum=bool(inst.is_drum),
-                        stem_index=stem_index,
-                        stem_name=stem_name,
-                        instrument_name=str(inst.name),
-                    )
-                )
-
-    if not flat_notes:
-        print("Warning: No notes found across stem MIDI files.")
-        return list(resolved_midis.values())[0]
 
     starts = np.array([item.note.start for item in flat_notes], dtype=np.float32)
     ends = np.array([item.note.end for item in flat_notes], dtype=np.float32)
@@ -629,7 +651,25 @@ def predict_velocity_for_stem_midis(
 
             sample_start = int(win_start * config.sample_rate)
             sample_end = min(sample_start + window_samples, max_samples)
-            sub_audio = audio_tensor[:, :, :, sample_start:sample_end]
+            window_stem_indices = stem_indices[indices_in_win]
+            if select_note_stems_only:
+                # stem-gainを使わない経路では、当該窓にノートがあるstemだけをbackboneへ
+                # 通す。stem indexは選択後の局所indexへ詰め直す。
+                selected_stem_indices = np.unique(window_stem_indices)
+                sub_audio = audio_tensor[
+                    :, selected_stem_indices.tolist(), :, sample_start:sample_end
+                ]
+                local_stem_indices = np.searchsorted(
+                    selected_stem_indices,
+                    window_stem_indices,
+                )
+                window_stem_class_tensor = stem_class_tensor[
+                    :, selected_stem_indices.tolist()
+                ]
+            else:
+                sub_audio = audio_tensor[:, :, :, sample_start:sample_end]
+                local_stem_indices = window_stem_indices
+                window_stem_class_tensor = stem_class_tensor
 
             win_starts = (starts[indices_in_win] - win_start).astype(np.float32)
             win_ends = (ends[indices_in_win] - win_start).astype(np.float32)
@@ -650,7 +690,7 @@ def predict_velocity_for_stem_midis(
                 torch.from_numpy(is_drums[indices_in_win]).unsqueeze(0).to(device=target_device)
             )
             note_stem_index_tensor = (
-                torch.from_numpy(stem_indices[indices_in_win]).unsqueeze(0).to(device=target_device)
+                torch.from_numpy(local_stem_indices).unsqueeze(0).to(device=target_device)
             )
 
             forward_kwargs: dict[str, Any] = {
@@ -660,7 +700,7 @@ def predict_velocity_for_stem_midis(
                 "note_program": note_program_tensor,
                 "note_is_drum": note_is_drum_tensor,
                 "note_stem_index": note_stem_index_tensor,
-                "stem_class_id": stem_class_tensor,
+                "stem_class_id": window_stem_class_tensor,
             }
             if configure_stem_gain:
                 forward_kwargs["include_stem_gain"] = bool(

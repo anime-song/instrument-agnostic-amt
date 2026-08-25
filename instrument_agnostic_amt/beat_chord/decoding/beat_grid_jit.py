@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -76,6 +77,25 @@ if njit is not None:
 
 else:
     _build_regularized_grid_kernel = None
+
+
+@lru_cache(maxsize=1)
+def is_jit_grid_available() -> bool:
+    """Return whether the exact Numba grid kernel can be used.
+
+    Numba fails at first call rather than at import, so the kernel is warmed up
+    on a tiny input here. Auto-selection must not hand back a backend that only
+    raises once decoding has started.
+    """
+
+    if _build_regularized_grid_kernel is None:
+        return False
+    probe = np.zeros(8, dtype=np.float64)
+    try:
+        _build_regularized_grid_kernel(probe, probe, 0, 4, 2, 2, 1, 1.0)
+    except Exception:  # pragma: no cover - depends on the local Numba install
+        return False
+    return True
 
 
 def build_regularized_grid_jit(

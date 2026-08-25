@@ -19,6 +19,7 @@ from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
 )
+from instrument_agnostic_amt.velocity.training.dataset import STEM_CLASS_BY_NAME
 
 
 def test_velocity_auto_routes_model_to_mps(
@@ -391,6 +392,72 @@ def test_velocity_inference_skips_unused_stem_gain_head(
 
     assert include_stem_gain_values == [False]
     assert inference_mode_values == [True]
+
+
+def test_velocity_only_inference_runs_only_note_stems_in_each_window(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
+    guitar_midi.instruments[0].notes[0].start = 1.5
+    guitar_midi.instruments[0].notes[0].end = 1.9
+    guitar_midi.write(str(mock_stem_midis["guitar"]))
+    stem_counts: list[int] = []
+    local_stem_indices: list[list[int]] = []
+
+    class RecordingVelocityModel(VelocityPredictionModel):
+        def __init__(self) -> None:
+            torch.nn.Module.__init__(self)
+
+        def forward(
+            self,
+            audio: torch.Tensor,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            stem_counts.append(int(audio.shape[1]))
+            local_stem_indices.append(
+                kwargs["note_stem_index"].squeeze(0).tolist()
+            )
+            selected_classes = kwargs["stem_class_id"].gather(
+                1,
+                kwargs["note_stem_index"],
+            )
+            return {"velocity_expected": selected_classes.float() + 50.0}
+
+    model = RecordingVelocityModel()
+    config = VelocityModelConfig(sample_rate=22_050, predict_stem_gain=False)
+    monkeypatch.setattr(
+        velocity_infer,
+        "load_velocity_model",
+        lambda *_args, **_kwargs: (model, config),
+    )
+
+    output_path = tmp_path / "selected_note_stems.mid"
+    predict_velocity_for_stem_midis(
+        stem_midis={
+            "bass": mock_stem_midis["bass"],
+            "guitar": mock_stem_midis["guitar"],
+        },
+        stem_audios=mock_audio_stems,
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=1.0,
+        disable_tqdm=True,
+    )
+
+    assert stem_counts == [1, 1]
+    assert local_stem_indices == [[0], [0]]
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    velocities = {
+        instrument.name: instrument.notes[0].velocity
+        for instrument in output.instruments
+    }
+    assert velocities == {
+        "bass": STEM_CLASS_BY_NAME["bass"] + 50,
+        "guitar": STEM_CLASS_BY_NAME["guitar"] + 50,
+    }
 
 
 @pytest.mark.parametrize(

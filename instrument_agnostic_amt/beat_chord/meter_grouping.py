@@ -143,6 +143,7 @@ def grouping_spec_for_meter(
     return None
 
 
+@lru_cache(maxsize=None)
 def grouping_boundary_offsets(pattern: GroupingPattern) -> tuple[int, ...]:
     """Return internal boundary offsets in denominator-note units."""
 

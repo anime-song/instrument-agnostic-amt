@@ -6,6 +6,7 @@ import copy
 import shutil
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from importlib.util import find_spec
 from pathlib import Path
 
 import librosa
@@ -16,7 +17,11 @@ import torch
 from stem_splitter.inference import SeparationConfig, _separate_one_file, load_mss_model
 
 import infer
-from infer_beat_chord import predict_beat_chord_for_midi
+from infer_beat_chord import (
+    ensure_beat_chord_checkpoint,
+    load_beat_chord_model,
+    predict_beat_chord_for_midi,
+)
 from infer_instrument_refinement import (
     ensure_refinement_checkpoint,
     refine_midi_instruments,
@@ -240,11 +245,24 @@ def get_stem_pipeline_models(
     """AMT とステム分離モデルを読み込み、セッション中は再利用する。"""
     if stem_splitter_batch_size < 1:
         raise ValueError("stem_splitter_batch_size must be at least 1")
-    if semi_crf_backend not in {"torch", "triton"}:
-        raise ValueError("semi_crf_backend must be one of {'torch', 'triton'}")
+    if semi_crf_backend not in {"auto", "torch", "triton"}:
+        raise ValueError(
+            "semi_crf_backend must be one of {'auto', 'torch', 'triton'}"
+        )
 
     device = resolve_device(device_preference)
-    if semi_crf_backend == "triton" and device.type != "cuda":
+    resolved_semi_crf_backend = str(semi_crf_backend)
+    if resolved_semi_crf_backend == "auto":
+        try:
+            triton_available = find_spec("triton") is not None
+        except (ImportError, ValueError):
+            triton_available = False
+        resolved_semi_crf_backend = (
+            "triton"
+            if device.type == "cuda" and triton_available
+            else "torch"
+        )
+    if resolved_semi_crf_backend == "triton" and device.type != "cuda":
         raise ValueError("semi_crf_backend='triton' requires a CUDA device")
 
     resolved_checkpoint = infer._ensure_checkpoint(
@@ -258,7 +276,7 @@ def get_stem_pipeline_models(
         "amt",
         str(resolved_checkpoint.resolve()),
         str(device),
-        ("semi-crf", semi_crf_backend),
+        ("semi-crf", resolved_semi_crf_backend),
         *compile_cache_key,
     )
     sep_cache_key = ("sep", str(device))
@@ -290,7 +308,7 @@ def get_stem_pipeline_models(
             window_ms_override=None,
             stride_ms_override=None,
             track_batch_size_override=None,
-            semi_crf_backend=semi_crf_backend,
+            semi_crf_backend=resolved_semi_crf_backend,
         )
         amt_forward = maybe_compile_forward(
             amt_model,
@@ -319,6 +337,7 @@ def get_stem_pipeline_models(
         "sep_config": sep_config,
         "sep_model": sep_model,
         "sep_dtype": sep_dtype,
+        "semi_crf_backend": resolved_semi_crf_backend,
     }
 
 
@@ -391,6 +410,35 @@ def get_refinement_models(
     }
 
 
+def get_beat_chord_models(
+    checkpoint_path: Path | str | None = None,
+    device_preference: torch.device | str | None = None,
+) -> tuple[object, object, Mapping[str, object]]:
+    """Beat/chordモデルと軽量な推論metadataをセッション内で再利用する。"""
+    device = resolve_device(device_preference)
+    resolved_checkpoint = ensure_beat_chord_checkpoint(checkpoint_path)
+    cache_key = ("beat-chord", str(resolved_checkpoint.resolve()), str(device))
+
+    cached = STEM_PIPELINE_CACHE.get(cache_key)
+    if cached is not None:
+        cached[0].to(device)
+        cached[0].eval()
+        return cached
+
+    model, config, metadata = load_beat_chord_model(
+        resolved_checkpoint,
+        device=device,
+    )
+    # state_dictを含むcheckpoint全体はモデル構築後に不要。数百MB規模のCPU側
+    # metadataをcacheせず、decoderが参照する展開済み設定だけを保持する。
+    inference_metadata = {
+        key: value for key, value in metadata.items() if key != "checkpoint"
+    }
+    bundle = (model, config, inference_metadata)
+    STEM_PIPELINE_CACHE[cache_key] = bundle
+    return bundle
+
+
 def refine_stem_instrument_midis(
     stem_midis: Mapping[str, Path | str],
     stem_audios: Mapping[str, Path | str],
@@ -439,6 +487,18 @@ def refine_stem_instrument_midis(
 
         source_midi = Path(midi_path)
         refined_midi = output_directory / f"{source_midi.stem}_refined.mid"
+        source_midi_object = pretty_midi.PrettyMIDI(str(source_midi))
+        if not any(
+            instrument.notes
+            for instrument in source_midi_object.instruments
+            if not instrument.is_drum
+        ):
+            # 再割り当てるmelodic noteがなければ、32窓前後の音声backbone走査は
+            # 結果に寄与しない。MIDIをそのまま残して後段との対応だけ維持する。
+            shutil.copyfile(source_midi, refined_midi)
+            refined_midi_paths[stem_name] = refined_midi
+            print(f"Refined stem: {stem_name} (notes=0, clusters=0, instruments=none)")
+            continue
         preloaded_waveform = (
             waveform_loader(
                 Path(stem_audio_path),
@@ -789,12 +849,23 @@ def run_stem_separated_transcription(
         try:
             print("Predicting beat, chord, key from MIDI...")
             beat_chord_midi_path = merged_dir / f"{audio_file.stem}_beat_chord.mid"
+            (
+                beat_chord_model,
+                beat_chord_config,
+                beat_chord_metadata,
+            ) = get_beat_chord_models(
+                checkpoint_path=beat_chord_checkpoint_path,
+                device_preference=device,
+            )
             predict_beat_chord_for_midi(
                 input_midi_path=merged_midi_path,
                 output_midi_path=beat_chord_midi_path,
                 checkpoint_path=beat_chord_checkpoint_path,
                 device=device,
                 window_batch_size=window_batch_size,
+                preloaded_model=beat_chord_model,
+                preloaded_model_config=beat_chord_config,
+                preloaded_metadata=beat_chord_metadata,
             )
             merged_midi_path = beat_chord_midi_path
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
@@ -816,6 +887,7 @@ def run_stem_separated_transcription(
         "instruments_refined": instruments_refined,
         "velocity_predicted": predict_velocity,
         "beat_chord_predicted": predict_beat_chord,
+        "semi_crf_backend": bundle["semi_crf_backend"],
     }
     if instruments_refined:
         result["refined_stem_midi_dir"] = str(refined_stem_midi_dir)

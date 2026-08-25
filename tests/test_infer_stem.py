@@ -14,6 +14,7 @@ import torch
 
 import infer_stem
 from infer_stem import (
+    get_beat_chord_models,
     get_stem_pipeline_models,
     merge_midis_logic,
     refine_stem_instrument_midis,
@@ -233,6 +234,41 @@ def test_velocity_pipeline_compile_is_independent_and_cached_by_mode(
     ]
 
 
+def test_beat_chord_pipeline_caches_model_without_checkpoint_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "beat_chord.pth"
+    checkpoint.write_bytes(b"")
+    model = torch.nn.Linear(2, 2)
+    load_calls: list[tuple[Path, torch.device]] = []
+
+    monkeypatch.setattr(
+        infer_stem,
+        "ensure_beat_chord_checkpoint",
+        lambda _path: checkpoint,
+    )
+
+    def fake_load(
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> tuple[object, object, dict[str, object]]:
+        load_calls.append((path, device))
+        return model, object(), {"checkpoint": {"large_state": object()}, "small": 1}
+
+    monkeypatch.setattr(infer_stem, "load_beat_chord_model", fake_load)
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+
+    first = get_beat_chord_models(checkpoint, device_preference="cpu")
+    second = get_beat_chord_models(checkpoint, device_preference="cpu")
+
+    assert first is second
+    assert first[0] is model
+    assert first[2] == {"small": 1}
+    assert load_calls == [(checkpoint, torch.device("cpu"))]
+
+
 def test_stem_workflow_exposes_device_and_amp_options() -> None:
     parameters = signature(run_stem_separated_transcription).parameters
 
@@ -316,6 +352,45 @@ def test_stem_pipeline_rejects_triton_without_cuda() -> None:
             device_preference="cpu",
             semi_crf_backend="triton",
         )
+
+
+def test_stem_pipeline_auto_semi_crf_uses_torch_without_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"")
+    loaded_backends: list[str] = []
+    monkeypatch.setattr(
+        infer_stem.infer,
+        "_ensure_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+
+    def fake_load_amt(
+        *_args: object,
+        semi_crf_backend: str,
+        **_kwargs: object,
+    ) -> tuple[object, object, object]:
+        loaded_backends.append(semi_crf_backend)
+        return object(), object(), object()
+
+    monkeypatch.setattr(infer_stem.infer, "_load_model_and_settings", fake_load_amt)
+    infer_stem.STEM_PIPELINE_CACHE.clear()
+    infer_stem.STEM_PIPELINE_CACHE[("sep", "cpu")] = (
+        SimpleNamespace(),
+        object(),
+        torch.float32,
+    )
+
+    bundle = get_stem_pipeline_models(
+        checkpoint_path=checkpoint,
+        device_preference="cpu",
+        semi_crf_backend="auto",
+    )
+
+    assert bundle["semi_crf_backend"] == "torch"
+    assert loaded_backends == ["torch"]
 
 
 def test_merge_midis_logic(tmp_path: Path) -> None:
@@ -459,6 +534,40 @@ def test_refine_stem_instrument_midis_skips_excluded_stems_and_rewrites_labels(
     ]
 
 
+def test_refine_stem_instrument_midis_copies_empty_midi_without_audio_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "song_other.wav"
+    midi_path = tmp_path / "song_other.mid"
+    _write_stem_audio(audio_path, frequency=220.0)
+    empty_midi = pretty_midi.PrettyMIDI()
+    empty_midi.instruments.append(
+        pretty_midi.Instrument(program=48, name="strings")
+    )
+    empty_midi.write(str(midi_path))
+    source_bytes = midi_path.read_bytes()
+    monkeypatch.setattr(
+        infer_stem,
+        "refine_midi_instruments",
+        lambda *_args, **_kwargs: pytest.fail(
+            "empty MIDI should not run refinement"
+        ),
+    )
+
+    refined = refine_stem_instrument_midis(
+        stem_midis={"other": midi_path},
+        stem_audios={"other": audio_path},
+        output_dir=tmp_path / "refined",
+        refinement_model=object(),
+        refinement_config=SimpleNamespace(sample_rate=8_000),
+        device="cpu",
+    )
+
+    assert set(refined) == {"other"}
+    assert refined["other"].read_bytes() == source_bytes
+
+
 def test_refine_stem_instrument_midis_excludes_vocals_even_when_selected(
     tmp_path: Path,
 ) -> None:
@@ -564,6 +673,7 @@ def _install_fake_waveform_cache_pipeline(
         "sep_config": SimpleNamespace(stem_names=tuple(stems)),
         "sep_model": object(),
         "sep_dtype": torch.float32,
+        "semi_crf_backend": "torch",
     }
     monkeypatch.setattr(infer_stem, "get_stem_pipeline_models", lambda **_kwargs: bundle)
     monkeypatch.setattr(
@@ -678,21 +788,37 @@ def _install_fake_waveform_cache_pipeline(
     monkeypatch.setattr(infer_stem, "predict_velocity_for_stem_midis", fake_velocity)
 
     beat_waveforms_alive: list[bool] = []
+    beat_chord_calls: list[dict[str, object]] = []
+    beat_chord_bundle = (object(), object(), {"checkpoint_args": {}})
+    beat_chord_load_count = 0
 
     def fake_beat_chord(
         *,
         input_midi_path: Path,
         output_midi_path: Path,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> Path:
         gc.collect()
         beat_waveforms_alive.append(
             any(reference() is not None for reference in loaded_waveform_refs)
         )
+        beat_chord_calls.append(kwargs)
         output_midi_path.write_bytes(input_midi_path.read_bytes())
         return output_midi_path
 
+    def fake_get_beat_chord_models(
+        **_kwargs: object,
+    ) -> tuple[object, object, dict[str, object]]:
+        nonlocal beat_chord_load_count
+        beat_chord_load_count += 1
+        return beat_chord_bundle
+
     monkeypatch.setattr(infer_stem, "predict_beat_chord_for_midi", fake_beat_chord)
+    monkeypatch.setattr(
+        infer_stem,
+        "get_beat_chord_models",
+        fake_get_beat_chord_models,
+    )
 
     run_count = 0
 
@@ -721,6 +847,9 @@ def _install_fake_waveform_cache_pipeline(
         refinement_waveforms=refinement_waveforms,
         velocity_waveforms=velocity_waveforms,
         beat_waveforms_alive=beat_waveforms_alive,
+        beat_chord_calls=beat_chord_calls,
+        beat_chord_bundle=beat_chord_bundle,
+        beat_chord_load_count=lambda: beat_chord_load_count,
         stems=stems,
     )
 
@@ -800,6 +929,38 @@ def test_stem_pipeline_releases_waveforms_before_beat_chord(
     )
 
     assert pipeline.beat_waveforms_alive == [False]
+
+
+def test_stem_pipeline_forwards_cached_beat_chord_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = _install_fake_waveform_cache_pipeline(tmp_path, monkeypatch)
+
+    pipeline.run(
+        refine_instruments=False,
+        predict_velocity=False,
+        predict_beat_chord=True,
+    )
+    pipeline.run(
+        refine_instruments=False,
+        predict_velocity=False,
+        predict_beat_chord=True,
+    )
+
+    model, model_config, metadata = pipeline.beat_chord_bundle
+    assert [call["preloaded_model"] for call in pipeline.beat_chord_calls] == [
+        model,
+        model,
+    ]
+    assert [
+        call["preloaded_model_config"] for call in pipeline.beat_chord_calls
+    ] == [model_config, model_config]
+    assert [call["preloaded_metadata"] for call in pipeline.beat_chord_calls] == [
+        metadata,
+        metadata,
+    ]
+    assert pipeline.beat_chord_load_count() == 2
 
 
 def test_stem_pipeline_releases_waveforms_when_velocity_fails(
