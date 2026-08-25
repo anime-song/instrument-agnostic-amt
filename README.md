@@ -46,6 +46,7 @@ The architecture builds on [**Transkun**](https://github.com/Yujia-Yan/Transkun)
 
 | Date | Update |
 |---|---|
+| 2026-08-20 | ⚡ Moved dependency management to uv and PyTorch 2.13, added MPS inference and AMP/regional compile controls, and reduced device synchronization, temporary copies, and repeated stem-audio loading across the inference pipeline. Two changes deliberately alter output: CUDA inference no longer downcasts attention implicitly, so FP32 is now the default, and V1 window batching propagates decode state in sequential window order, which can change output when multiple windows are processed in a batch. |
 | 2026-08-19 | 🎻 Added other-instrument model v1.5 (`--type other_v1_5`). The Colab stem-separated workflow now uses it by default for `other` stems. On an in-house real-recording evaluation set, COnP improves from 0.7318 (`other`) to 0.7701 (`other_v1_5`). |
 | 2026-08-09 | 🎹 Added the Instrument Refinement model, which re-assigns instrument classes to AMT notes using the separated stem audio. It pulls timbrally close sounds onto a single class, so the instrument stops flickering within a piece and manual clean-up gets easier. Overall top-1 on the held-out RWC-I benchmark improves from 71.3% to 74.5%, but **individual instruments both gain and lose** — see [RWC-I benchmark](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md) for the per-instrument breakdown and what each instrument is confused with. |
 | 2026-07-30 | Added beat, chord, and key inference models to the pipeline. Disabled by default. |
@@ -233,6 +234,24 @@ interpreter without narrowing the supported Python 3.10–3.14 range. If Python
 3.12 is unavailable, uv downloads a managed CPython automatically unless Python
 downloads are disabled or the machine is offline.
 
+### Environments where the transcription pipeline has been tested
+
+- Apple Silicon (M4 Pro, macOS / MPS)
+- CUDA (Colab Tesla T4)
+
+### Running the tests
+
+```bash
+uv sync --locked --all-extras
+uv run pytest
+```
+
+MPS-specific tests are skipped when MPS is unavailable. The compile regression is opt-in:
+
+```bash
+RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
+```
+
 ---
 
 ## Data Preparation
@@ -275,13 +294,12 @@ This creates:
 
 ### 3. (Optional) Resample audio
 
-If your audio files are not at 22050 Hz:
+If your audio files are not at 22050 Hz, resample them in place while preserving the container format and sample subtype:
 
 ```bash
-python preprocess/resample_only.py \
-  --input_dir ./raw_stems \
-  --output_dir ./stems \
-  --target_sr 22050
+python -m preprocess.resample_only \
+  --input ./stems \
+  --resample-rate 22050
 ```
 
 ## Training
@@ -388,7 +406,7 @@ training from AMT-generated merged MIDI, and beat/chord inference from MIDI.
 
 ```bash
 # Beat pretraining from MIDI
-python pretrain_midi_frame_beat.py --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
+python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
 # Joint beat/chord training
 python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
@@ -418,15 +436,19 @@ then add predicted beat, meter, chord, and key metadata, install the optional
 stem separator and run:
 
 ```bash
-pip install stem-splitter
-python create_key_only_candidates.py \
+uv sync --locked --extra stem
+uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates import main; main()" \
   --input-dir beat_chord_dataset/source_audio \
   --output-dir beat_chord_dataset/key_only_candidates
 ```
 
 The script uses the same per-stem model routing as the Colab notebook, merges
 the stem MIDIs, predicts note velocities, and runs `midi_frame_infer` before
-moving on to the next song.
+moving on to the next song. It accepts the same `--device`, `--amp`,
+`--amp-dtype`, `--compile`, and `--compile-mode` options as `infer.py`, plus
+`--compile-velocity` for the velocity model. `--amp` affects only the AMT
+transcription stage; velocity, instrument refinement, and beat/chord/key remain
+in FP32.
 The current beat/chord checkpoint is selected by modification time from
 `beat_chord_checkpoints/midi_frame`; use `--beat-chord-checkpoint` to pin one.
 Final uncorrected files are written under `key_only_candidates/midis/`, separate
@@ -483,8 +505,12 @@ python infer.py --audio input_song.wav --device cpu
 MPS requires an Apple Silicon Mac with a PyTorch MPS backend. If PyTorch reports
 that an operation is unsupported on MPS, retry with `--device cpu`. Small
 floating-point differences between CPU, CUDA, and MPS results are expected.
-Mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
+For standalone CLI inference, mixed precision remains opt-in with `--amp`; on MPS its default dtype is fp16
 and can be changed with `--amp-dtype`.
+
+AMP uses autocast for the AMT forward pass; it does not convert the model weights. CUDA defaults to bf16 when the GPU supports it natively and fp16 otherwise (including Tesla T4), while MPS defaults to fp16. Under fp16 inference autocast, `StemConv` stays in FP32 to prevent activation overflow. In the stem-separated pipeline and key-only batch runner, AMP applies only to AMT transcription; velocity, instrument refinement, and beat/chord/key remain in FP32.
+
+AMP can change the output and is not guaranteed to be faster for every device or song. Without AMP, attention and the rest of the forward pass stay in FP32.
 
 ### Optional regional compilation
 
@@ -504,6 +530,8 @@ most useful when the loaded model continues to process more windows or songs.
 `--compile-mode` also accepts `default`, `reduce-overhead`, and
 `max-autotune-no-cudagraphs`.
 
+Regional compilation does not guarantee bit-exact output, even in FP32. Prefer FP32 eager when byte-stable output matters.
+
 ### Stem-separated workflow in Google Colab
 
 The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) includes an optional workflow that:
@@ -515,6 +543,8 @@ The Google Colab notebook [`Colab_Inference.ipynb`](Colab_Inference.ipynb) inclu
 5. predicts the velocity of each MIDI note from the corresponding separated stem audio.
 
 This is slower than single-pass inference on the mixed song, but in many cases it improves transcription accuracy because each stem is acoustically simpler and overlapping instruments are reduced. It is especially useful for busy mixes, band recordings, and arrangements with sustained chords plus melody lines.
+
+The notebook defaults to `DEVICE = "auto"`, `AMP = True`, `AMP_DTYPE = "default"`, and `WINDOW_BATCH_SIZE = 1`. `COMPILE_MODEL` and `COMPILE_VELOCITY` are independent and default to `False`; both share `COMPILE_MODE = "default"`. AMP applies only to AMT transcription, while the downstream stages remain in FP32.
 
 The stem workflow restricts instrument classification to classes that are plausible for each stem and excludes the remaining classes before calculating instrument probabilities. Standalone `infer.py` runs can use the same filtering by passing comma-separated class names to `--allowed-instruments`.
 
@@ -587,7 +617,7 @@ python infer.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--checkpoint` | (auto) | Path to the trained model. Automatically downloaded from HF if not provided |
-| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: fine-tuned for other instruments. |
+| `--type` | `default` | Type of the model to download. `default`: for all instruments. `bass`: original bass model. `bass_v2`: updated bass model. `vocal`: fine-tuned for vocal. `guitar`: original guitar model. `guitar_v1_5`: updated guitar model. `vocal_harmony`: fine-tuned for vocal harmony. `drums`: **Experimental** drum-focused model. `other`: original other-instrument model. `other_v1_5`: updated other-instrument model. |
 | `--audio` | (required) | Input audio path |
 | `--output-midi` | `<audio>.mid` | Output MIDI path |
 | `--device` | `auto` | Inference device. `auto` selects CUDA → MPS → CPU; `cuda`, `mps`, or `cpu` can be set explicitly |
@@ -597,9 +627,9 @@ python infer.py \
 | `--compile-mode` | `default` | Compilation mode: `default`, `reduce-overhead`, `max-autotune`, or `max-autotune-no-cudagraphs` |
 | `--window-ms` | training value | Inference window size (ms) |
 | `--stride-ms` | `window-ms / 2` | Window stride |
-| `--window-batch-size` | `1` | Windows to process at once |
+| `--window-batch-size` | `1` | Windows to process at once. Lower values reduce peak memory; byte-identical output across batch sizes is not guaranteed |
 | `--merge-gap-ms` | 1 hop | Merge threshold for small note gaps |
-| `--merge-onset-ms` | `20.0` | Merge threshold for near-simultaneous onsets |
+| `--merge-onset-ms` | `50.0` | Merge threshold for near-simultaneous onsets |
 | `--max-midi-melodic-instruments` | `15` | Max instrument tracks |
 | `--allowed-instruments` | all classes | Instrument classification candidates. Accepts comma-separated names or repeated arguments; softmax probabilities are renormalized within the selected classes |
 | `--silence-gate-rms-dbfs` | `-72` | RMS threshold to skip silent windows |
