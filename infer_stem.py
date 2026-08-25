@@ -548,7 +548,7 @@ def resolve_stem_model_type(stem_name: str) -> str:
     if "bass" in stem_name_lower:
         return "bass_v2"
     if "vocal" in stem_name_lower:
-        return "vocal_harmony"
+        return "vocal_harmony_v1_5"
     if "guitar" in stem_name_lower:
         return "guitar_v1_5"
     if "other" in stem_name_lower:
