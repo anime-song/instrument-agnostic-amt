@@ -1,253 +1,134 @@
-# Instrument-Agnostic Automatic Music Transcription
+# tsumugi
 
-**楽器を問わない自動採譜モデル** — Neural Semi-CRF ベース
+![tsumugi — あらゆる楽器を MIDI に採譜](resources/tsumugi.svg)
 
-[English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/instrument-agnostic-amt/blob/main/Colab_Inference.ipynb)
+**あらゆる楽器を MIDI に採譜。** Neural Semi-CRF を基盤とする、単一の楽器非依存モデルです。
 
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://youtu.be/3pCAjQuhzDA">
-        <img src="https://img.youtube.com/vi/3pCAjQuhzDA/0.jpg" alt="採譜結果例" width="480">
-      </a>
-      <br>
-      <strong>採譜結果例</strong>
-    </td>
-    <td align="center">
-      <a href="https://www.youtube.com/watch?v=JuVu-AoC5M0">
-        <img src="https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg" alt="元動画" width="480">
-      </a>
-      <br>
-      <strong>元動画</strong>
-    </td>
-  </tr>
-</table>
+[English README](README.md) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anime-song/tsumugi/blob/main/Colab_Inference.ipynb) | [MIT License](LICENSE)
 
-> **動画について**: 上の画像はクリックできるサムネイルです。クリックすると YouTube で動画を見られます。
+| [![採譜例](https://img.youtube.com/vi/3pCAjQuhzDA/0.jpg)](https://youtu.be/3pCAjQuhzDA)<br>**採譜例** | [![元動画](https://img.youtube.com/vi/JuVu-AoC5M0/0.jpg)](https://www.youtube.com/watch?v=JuVu-AoC5M0)<br>**元動画** |
+| --- | --- |
 
-> **Colab 補足**: [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、**ステム分離してから採譜し、MIDI をマージした後、分離音声から各ノートの velocity を予測する**オプションのワークフローも入っています。曲全体をそのまま 1 回で採譜するより高精度になることが多く、特に音が重なりやすい密なアレンジで有効です。このワークフローでは velocity 予測がデフォルトで有効です。
+どちらの画像もクリックすると YouTube の動画が開きます。
+
+---
+
+## クイックスタート
+
+最も手軽なのは [`Colab_Inference.ipynb`](Colab_Inference.ipynb) です。曲をアップロードしてセルを実行し、MIDI をダウンロードするだけです。環境構築やチェックポイント探しは必要ありません。
+
+ローカルで実行する場合：
+
+```bash
+git clone https://github.com/anime-song/tsumugi.git
+cd tsumugi
+uv sync --locked
+uv run python infer.py --audio input_song.wav
+```
+
+初回実行時にチェックポイントが Hugging Face から自動的にダウンロードされます。
 
 ---
 
 ## 概要
 
-このプロジェクトは、オーディオファイルから MIDI を生成する**楽器非依存の自動採譜 (AMT)** モデルです。
-[Basic Pitch](https://github.com/spotify/basic-pitch) と同じように、楽器の種類を区別せず、ピアノでもギターでもボーカルでも音高があればひとつのモデルでまとめて採譜します。
+オーディオを MIDI に変換する、**楽器非依存の自動採譜（Automatic Music Transcription: AMT）** モデルです。
 
-アーキテクチャは [**Transkun**](https://github.com/Yujia-Yan/Transkun)（Yujia Yan 氏）の Neural Semi-CRF がベースです。
-もともとピアノ採譜用だったこの仕組みを、楽器を問わず使える汎用モデルに拡張しています。
+[Basic Pitch](https://github.com/spotify/basic-pitch) と同じように、演奏している楽器を問いません。ピアノ、ギター、ベース、ボーカル、弦楽器、金管楽器など、音程があれば採譜できます。すべてを 1 つのモデルで扱います。
 
-> **Note**: 楽器を識別してマルチトラック MIDI として出力する機能もありますが、これは**実験的 (Experimental)** な追加機能です。分類精度はまだ十分ではなく、メインの機能はあくまで「楽器を区別しないピッチ検出」です。
+アーキテクチャは、Yujia Yan 氏らによる [**Transkun**](https://github.com/Yujia-Yan/Transkun) で、もともとピアノ向けに設計された Neural Semi-CRF の手法を拡張しています。本プロジェクトでは、これをあらゆる楽器へ一般化しています。
 
-> **Note**: ドラム専用モデル（`--type drums`）は**実験的 (Experimental)** です。精度や挙動は今後変わる可能性があります。
+### 得意な音源と苦手な音源
 
-> **Warning**: エレキギター（特に歪みサウンド）への汎化はまだ弱く、採譜精度が低くなる傾向があります。また、学習データの少ないエスニック楽器（三味線、シタール等）についても同様です。
+クリーンで持続音が多く、ステムごとには単音である素材で最も高い採譜品質が得られます。学習データが少ない領域では精度が下がります。
 
-### 更新履歴
+- **エレキギター**、特にディストーションをかけた音は汎化が難しく、採譜精度が低くなります。
+- **民族楽器**（三味線、シタールなど）は学習データが少なく、同様に精度が低くなります。
+- **速いボーカルフレーズやスウィングのフレージング**では、音高やノート境界が不安定になります。
+- 1 つの持続音が**複数の短いノートに分割される**ことがあります（過分割）。
+- **ステム分離ワークフロー**では、ステム間に小さなタイミングのずれが生じ、MIDI のマージ後に同期ずれとして現れることがあります。
 
-| 日付 | 内容 |
-|---|---|
-| 2026-08-25 | 🎤 ボーカルハモリモデル v1.5（`--type vocal_harmony_v1_5`）を追加。Colab のステム分離ワークフローでは、`vocals` ステムの既定モデルとして使用します。学習に使っていない MIR-ST500 test では COnP が 0.6052（`vocal_harmony`）から 0.6814（`vocal_harmony_v1_5`）に向上しました。 |
-| 2026-08-20 | ⚡ 依存管理をuvとPyTorch 2.13へ移行し、MPS推論とAMP/regional compileの設定を追加しました。あわせて推論パイプラインのdevice同期・一時コピー・分離ステム音声の再読込を削減しました。出力が意図的に変わる変更が2件あります。CUDA推論でAttentionを暗黙に低精度へ落とすのをやめてFP32を既定にした点と、V1の窓バッチがデコード状態を逐次実行と同じ窓順で伝播するようになり、複数windowをまとめて処理すると出力が変わり得る点です。 |
-| 2026-08-19 | 🎻 その他楽器モデル v1.5（`--type other_v1_5`）を追加。Colab のステム分離ワークフローでは、`other` ステムの既定モデルとして使用します。独自の実音源評価データセットでは COnP が 0.7318（`other`）から 0.7701（`other_v1_5`）に向上しました。 |
-| 2026-08-09 | 🎹 分離ステムを使って AMT のノートに楽器クラスを振り直す Instrument Refinement モデルを追加しました。音色の近いものを同じクラスにまとめるので、1 曲の中で楽器がころころ入れ替わることが減り、手作業で修正する際の一貫性が高くなります。学習に使っていない RWC-I ベンチマークでは全体の top-1 が 71.3% から 74.5% に向上しましたが、**楽器単体で見ると上がったものと下がったものがあります**。楽器ごとの増減と、どの楽器がどの楽器に間違われるかは [RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK_ja.md) を参照してください。 |
-| 2026-07-30 | ビート・コード・キーの推論モデルをパイプラインに追加しました。デフォルトでは無効になっています。 |
-| 2026-07-24 | 分離ステムからノートごとの強弱を推定する velocity 予測専用モデルを追加。Colab のステム分離ワークフローでは velocity 予測をデフォルトで有効にし、velocity チェックポイントを Hugging Face から自動取得します。 |
-| 2026-07-22 | ギター専用モデル v1.5（`--type guitar_v1_5`）を追加。Colab のステム分離ワークフローでは、ギターステムの既定モデルとして使用します。 |
-| 2026-07-16 | 🐛 データ拡張処理の不具合によりノートのタイミングにずれが生じていた問題を修正し、修正後にベースモデル v2（`--type bass_v2`）を再学習しました。再学習した `bass_v2` ではノート検出精度が向上し、1つのノートが複数の短いノートに過剰分割される問題も修正されています。これらの改善は `bass_v2` のみに適用されます。 |
-| 2026-07-15 | 🎸 ベースモデル v2（`--type bass_v2`）を追加。楽器分類におけるスラップベースの分類精度が向上しました。 |
-| 2026-07-12 | 🎯 ステムごとに推論対象の楽器クラスを指定できるようにしました。候補外の楽器を除外して確率を計算することで、ステム分離ワークフローにおける楽器の誤分類軽減が期待できます。 |
-| 2026-06-24 | 🥁 推論用のドラム専用モデルを追加（`--type drums`、実験的 / Experimental） |
-| 2026-06-05 | 🎻 その他楽器専用モデルを追加（`--type other`） |
-| 2026-05-31 | 🎤 ボーカルハモリモデルを追加（`--type vocal_harmony`）。ハモリを識別できるように楽器一覧に `vocal_harmony` クラスを追加。<br>🧩 重複するノート区間を同時に予測できる Pitch Slot 機能を追加。 |
-| 2026-05-20 | 🎸 ギター専用モデルを追加（`--type guitar`） |
-| 2026-05-18 | 📦 ピッチシフト・タイムストレッチ用の前処理スクリプトを追加 |
-| 2026-05-17 | 🎤 ボーカル専用モデルを追加（`--type vocal`） |
-| 2026-05-16 | 🎸 ベース専用モデルを追加（`--type bass`） |
-| 2026-05-09 | 🔧 ウィンドウ間のノート結合処理を修正 / ビート・コード学習を追加 |
-| 2026-05-09 | 🎼 ステム分離→採譜→マージのワークフローを Colab に追加 |
-| 2026-05-06 | 🥁 ドラム判定を強化 / 新しいオーグメンテーションを追加 |
-| 2026-05-05 | ✨ EMA・楽器ロスマスク・フォルダ一括推論を追加 |
-| 2026-05-03 | 🚀 初回リリース — マルチ楽器 AMT モデル & Colab ノートブック公開 |
-
-### 特徴
-
-- 🎹 **楽器を問わない採譜** — ピアノ、ギター、ベース、ボーカル、ストリングス、管楽器など
-- 🧠 **Neural Semi-CRF + Pitch Slot** — ピッチごとに最適なノート区間を Viterbi で一括デコード。Pitch Slot により同じ音程の重複ノートも同時に予測可能
-- 🎼 **HCQT 特徴量** — 5つの倍音 × ステレオ 2ch の Harmonic CQT で音高情報をしっかり捉える
-- 🎚️ **ノート単位の velocity 予測** — 専用の後処理モデルが分離ステムから MIDI ノートの強弱を推定
-- 🔧 **豊富なデータ拡張** — ステムの混ぜ合わせ、IR リバーブ、EQ、ノイズ、ドラム追加など
-- 🧪 **[実験的] 楽器識別 & マルチトラック出力** — 33+ 楽器クラスの分類ヘッド付き（精度は改善中）
-
-## 既知の制約
-
-本モデルは現在も開発中であり、入力音源や演奏内容によって以下のような問題が発生することがあります。
-
-### 楽器分類
-
-楽器分類およびマルチトラック MIDI 出力は実験的な機能です。
-
-- ベース採譜では、スラップベースやシンセベースを独立した楽器クラスとして識別できず、`electric bass` に分類することがあります。
-- ピアノ採譜では、エレクトリックピアノとアコースティックピアノの分類精度が低く、両者を頻繁に取り違えることがあります。
-- ステム分離時にギターステムへ混入したシタールやバンジョーなどの楽器を、正しい楽器クラスへ分類できないことがあります。
-
-### 採譜精度
-
-- ボーカル採譜では、速いフレーズやスウィングを含む複雑なフレーズで、ノートの開始位置、長さ、音高を正確に推定できないことがあります。
-- 演奏内容によっては、ひとつの音が複数の短いノートに分割される「過分割」が発生することがあります。
-
-### ステム分離ワークフロー
-
-- 分離したステムを個別に採譜すると、ステムごとの MIDI にわずかなタイミングのずれが生じ、マージ後にパート間の同期が合わなくなることがあります。
+**楽器分類とマルチトラック出力**は動作しますが、分類精度にはまだ制約があります。スラップベースやシンセベースは `electric bass` にまとめられやすく、アコースティックピアノとエレクトリックピアノは頻繁に混同されます。また、分離したギターステムに混入したシタールやバンジョーは誤ったクラスへ分類されることがあります。**ドラムモデル**（`--type drums`）も実験段階で、今後挙動が変わる可能性があります。中核機能である楽器非依存の音高検出は実験機能ではありません。
 
 ---
 
-## アーキテクチャ
+## 特徴
 
-```
-オーディオ波形 [B, 2, T]
-        │
-        ▼
-┌─────────────────────────────┐
-│  AudioFeatureExtractor      │
-│  (Harmonic CQT × 5倍音)    │   → [B, 10, F=312, T]
-│  + SpecAugment (学習時)     │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  StemConv                   │
-│  (2D CNN ダウンサンプリング) │   → [B, D, T/8, F/4]
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  Backbone (Dual-Axis        │
-│  Transformer × N層)         │
-│  + Pitch Query Embedding    │   → バンド特徴量 + ピッチ別特徴量
-│  + Transposed ConvUpsample  │
-└─────────────────────────────┘
-        │
-        ├──────────────────────────┐
-        ▼                          ▼
-┌───────────────────┐   ┌───────────────────────┐
-│ Interval Adapter  │   │ Instrument Adapter    │
-│ + IntervalScorer  │   │ + 楽器分類ヘッド(33cls)│
-│   (Q, K, Diag)    │   └───────────────────────┘
-└───────────────────┘
-        │
-        ▼
-┌───────────────────────────────┐
-│ Neural Semi-CRF               │
-│ (ピッチ別 Viterbi デコード)   │  → ピッチ毎のノート区間 [begin, end]
-│ + Boundary Predictor          │  → Onset/Offset の有無 & サブフレーム補正
-└───────────────────────────────┘
-        │
-        ▼
-    MIDI 出力
-```
+- 🎹 **あらゆる有音程楽器** — ピアノ、ギター、ベース、ボーカル、弦楽器、管楽器などを 1 つのモデルで採譜
+- 🎚️ **ノート単位のベロシティ** — 専用の後処理モデルが分離ステムから強弱を推定
+- 🎯 **ビート、コード、キー** — 任意で使用できる MIDI フレームモデル（デフォルトでは無効）
+- 🧪 **［実験的］楽器分類** — 楽器別 MIDI トラックを出力する 36 クラスのヘッド
 
-### Dual-Axis Transformer
+<details>
+<summary><b>更新履歴</b></summary>
 
-バックボーンでは 2 種類のトークンを同時に処理します:
+| 日付 | 更新内容 |
+| --- | --- |
+| 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
+| 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
+| 2026-08-19 | 🎻 Other-instrument model v1.5（`--type other_v1_5`）を追加し、Colab の `other` ステムのデフォルトに設定。社内の実録音評価セットで COnP が 0.7318 から 0.7701 に向上。 |
+| 2026-08-09 | 🎹 Instrument Refinement model を追加。分離ステムオーディオを使って楽器クラスを再割り当てし、曲中で楽器分類が頻繁に切り替わる問題を抑制。RWC-I の overall top-1 は 71.3% から 74.5% に向上する一方、楽器ごとには改善と悪化の両方があるため、[RWC-I ベンチマーク](instrument_agnostic_amt/instrument_refinement/RWC_BENCHMARK.md)を参照。 |
+| 2026-07-30 | パイプラインにビート、コード、キーの推論モデルを追加。デフォルトでは無効。 |
+| 2026-07-24 | 専用のベロシティ予測モデルを追加し、Colab のステムワークフローでデフォルト有効化。 |
+| 2026-07-22 | 🎸 Guitar model v1.5（`--type guitar_v1_5`）を追加し、Colab のギターステムのデフォルトに設定。 |
+| 2026-07-16 | 🐛 ノートタイミングがずれるデータ拡張のバグを修正し、`bass_v2` を再学習。ノート検出を改善し、持続音の過分割を解消（`bass_v2` のみ）。 |
+| 2026-07-15 | 🎸 スラップベースの分類を改善した更新版ベースモデル（`--type bass_v2`）を追加。 |
+| 2026-07-12 | 🎯 ステムごとの楽器クラス選択を追加。確率計算前に不適切な楽器を除外。 |
+| 2026-06-24 | 🥁 実験的なドラム特化モデル（`--type drums`）を追加。 |
+| 2026-06-05 | 🎻 その他の楽器向けモデル（`--type other`）を追加。 |
+| 2026-05-31 | 🎤 Vocal harmony model と `vocal_harmony` クラスを追加。🧩 重複するノート区間のための Pitch Slot を追加。 |
+| 2026-05-20 | 🎸 ギター特化モデル（`--type guitar`）を追加。 |
+| 2026-05-18 | 📦 ピッチシフト／タイムストレッチの前処理スクリプトを追加。 |
+| 2026-05-17 | 🎤 ボーカル特化モデル（`--type vocal`）を追加。 |
+| 2026-05-16 | 🎸 ベース特化モデル（`--type bass`）を追加。 |
+| 2026-05-09 | 🔧 ウィンドウをまたぐノート結合を修正。ビート／コード学習と Colab のステムワークフローを追加。 |
+| 2026-05-06 | 🥁 ドラム検出を改善し、新しいデータ拡張を追加。 |
+| 2026-05-05 | ✨ EMA、楽器損失のマスキング、ディレクトリ一括推論を追加。 |
+| 2026-05-03 | 🚀 初回リリース。 |
 
-- **バンドトークン**: CNN stem が出力した周波数帯域の特徴量
-- **ピッチクエリトークン**: MIDI ピッチ（21〜108）に対応する学習可能な埋め込み
-
-各レイヤーで **バンド軸 Transformer**（各タイムステップ内で全トークンにアテンド）と **時間軸 Transformer**（各トークンの時系列にアテンド）を交互に適用し、周波数情報とピッチ情報を効率よく統合します。
-
-### Neural Semi-CRF
-
-88 本のピッチトラックをそれぞれ独立した Semi-CRF としてモデル化します:
-
-- **Pitch Slot** — 同じピッチで音が重なる区間（ユニゾン等）を予測できるよう、複数のスロットを並列処理
-- **インターバルスコア** — Query と Key のバイリニアアテンションで算出
-- **対角スコア** — 1フレームだけのノート用の加算バイアス
-- **Viterbi デコード** — 重複しないノート区間の最適解をグローバルに探索
-- **境界予測ヘッド** — Onset/Offset の有無とサブフレームレベルのタイミング補正を予測
+</details>
 
 ---
 
-## プロジェクト構成
-
-```
-instrument_agnostic_amt/
-├── train.py                    # 学習ループ（AMP、W&B、ウォームアップ対応）
-├── infer.py                    # 推論: オーディオ → MIDI
-├── dataset.py                  # StemDataset（ステムの混ぜ合わせ等のオーグメンテーション）
-├── losses.py                   # ロス計算: Semi-CRF NLL + 境界 + 楽器分類
-├── augmentation.py             # AudioAugmentor（EQ、ピッチシフト、リバーブ、ノイズ等）
-├── instrument_classes.py       # 楽器クラスのマッピング（GM program ↔ クラスID）
-├── instrument_merge.json       # 楽器分類の定義
-├── gm_instrument_classes.json  # General MIDI メタデータ
-├── dataset_config.yaml         # データセットの重み付け設定
-├── pyproject.toml              # プロジェクト定義と依存パッケージ（uv）
-├── uv.lock                     # 依存バージョンのロックファイル
-│
-├── models/
-│   ├── model.py                # AudioSemiCRFTransformer（モデル本体）
-│   ├── transcription_model.py  # 特徴抽出、StemConv、Backbone
-│   ├── transformer.py          # RoPE 付き Transformer
-│   ├── cqt.py                  # RecursiveCQT（再帰ダウンサンプリングによる高速 CQT）
-│   ├── semi_crf.py             # Neural Semi-CRF（前向き-後ろ向き、Viterbi、ロス）
-│   ├── interval_boundaries.py  # インターバル境界の特徴量収集
-│   └── spec_augment.py         # SpecAugment & MiniBatch Mixture Masking
-│
-└── preprocess/
-    ├── prepare_dataset.py      # オーディオ/MIDI ペアから manifest.csv を生成
-    ├── resample_only.py        # まとめてリサンプリング
-    └── apply_ir_augmentation.py # IR コンボリューションでリバーブ付きステムを事前生成
-```
-
----
 
 ## インストール
 
-### 必要なもの
+**必要なもの**
 
-- Python 3.10 〜 3.14
-- [uv](https://docs.astral.sh/uv/)（依存パッケージ管理）
-- PyTorch 2.13.0 / torchaudio 2.11.0 — `uv.lock` から自動でインストールされます
-- NVIDIA GPU（VRAM 12GB 以上推奨）、Apple Silicon Mac、または CPU
+- Python 3.10～3.14
+- [uv](https://docs.astral.sh/uv/)
+- PyTorch 2.13.0 / torchaudio 2.11.0（`uv.lock` から自動インストール）
+- NVIDIA GPU（VRAM 12 GB 以上を推奨）、Apple Silicon Mac、または CPU
 
-> Linux / Windows では CUDA 13.0 wheel、Apple Silicon macOS では
-> プラットフォーム向けのPyTorch wheelを解決します。PyTorch 2.13 はIntel Mac
-> 向けwheelを提供していません。
+Linux と Windows では CUDA 13.0 wheel が解決されます。Apple Silicon macOS ではプラットフォーム用 wheel が解決されます。PyTorch 2.13 は Intel macOS 用 wheel を提供していません。
 
 ```bash
-# クローン
-git clone https://github.com/anime-song/instrument-agnostic-amt.git
-cd instrument-agnostic-amt
+git clone https://github.com/anime-song/tsumugi.git
+cd tsumugi
 
-# uv.lock のバージョンに固定した推論用コア依存パッケージ
+# uv.lock に固定された推論用コア依存パッケージ
 uv sync --locked
 
-# 用途別のオプション依存
+# 用途別のオプション依存パッケージ
 uv sync --locked --extra stem        # ステム分離推論
 uv sync --locked --extra evaluation  # 評価スクリプト
-uv sync --locked --extra training    # 学習用依存パッケージ
+uv sync --locked --extra training    # 学習
 ```
 
-`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、
-`uv run python infer.py --audio input.wav` のように各コマンドへ `uv run` を付けてください。
+`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、コマンドの前に `uv run` を付けてください。
 
-リポジトリの `.python-version` は、対応範囲を狭めずに開発環境の既定を
-Python 3.12 へ揃えます。Python 3.12 が未導入の場合、Python の自動取得を
-無効化しているかオフラインでない限り、uv が管理する CPython を自動取得します。
+`.python-version` は開発時のデフォルトとして Python 3.12 を選択しますが、サポート範囲は 3.10～3.14 のままです。3.12 がない場合、ダウンロードが無効化されているかオフラインでない限り、uv が管理対象の CPython をダウンロードします。
 
-### 採譜パイプラインの動作を確認済みの環境
+**動作確認済み：** Apple Silicon（M4 Pro、macOS / MPS）および CUDA（Colab Tesla T4）。
 
-- Apple Silicon（M4 Pro、macOS / MPS）
-- CUDA（Colab Tesla T4）
-
-### テストの実行
+**テスト：**
 
 ```bash
 uv sync --locked --all-extras
 uv run pytest
 ```
 
-MPSが利用できない環境ではMPS専用テストをスキップします。compile回帰はオプトインです:
+MPS が利用できない環境では MPS 固有のテストをスキップします。compile の回帰テストはオプトインです。
 
 ```bash
 RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
@@ -255,31 +136,119 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 
 ---
 
+## 推論
+
+```bash
+python infer.py --audio input_song.wav
+```
+
+`--checkpoint` を指定しない場合、モデルは Hugging Face からダウンロードされます。
+
+### デバイス選択
+
+`--device` のデフォルトは `auto` で、**CUDA → MPS → CPU** の順に利用可能な最初のバックエンドを選びます。バックエンドを明示的に指定した場合、利用できなければ暗黙にフォールバックせずエラーになります。
+
+```bash
+python infer.py --audio input_song.wav                # auto
+python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
+python infer.py --audio input_song.wav --device cpu
+```
+
+### regional compile（任意）
+
+```bash
+python infer.py --audio input_song.wav --compile
+python infer.py --audio input_song.wav --compile --compile-mode reduce-overhead
+```
+
+初回のウィンドウでコンパイルのコストがかかるため、短い曲を 1 回だけ採譜する場合は遅くなる可能性があります。
+読み込んだモデルで多くの曲を続けて処理する場合に効果があります。`--compile-mode` には `default`、`reduce-overhead`、`max-autotune-no-cudagraphs` も指定できます。
+
+### ステム分離ワークフロー
+
+[`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、曲をステムに分離・採譜し、各ノートの楽器を再分類し、ベロシティを予測するワークフローがあります。
+
+ミックス全体を 1 回で処理するより遅いものの、通常は高い精度が得られます。各ステムの音響が単純になり、楽器の重なりが減るためです。差が特に大きいのは、密度の高いミックス、バンド録音、持続和音にメロディを重ねたアレンジです。
+
+### 楽器再判定の単体実行
+
+既存 MIDI の各ノートについて、採譜元のステムを使って楽器を再分類します。タイミングとピッチは維持し、トラックのプログラム番号と名前だけを変更します。
+
+```bash
+python infer_instrument_refinement.py \
+  --audio separated_stems/song_other.wav \
+  --midi stem_midis/song_other.mid \
+  --stem-name other \
+  --output-midi song_other_refined.mid
+```
+
+`--stem-name` は、そのステムに妥当なクラスだけに候補を制限します。`--mode cluster`（デフォルト）は音色埋め込みに基づいてノートをグループ化し、グループごとにラベルを付けます。`--mode single` はステム全体に 1 つの楽器を割り当てます。
+
+### ベロシティ予測の単体実行
+
+AMT とは別の後処理モデルです。MIDI ファイルとステムを入力し、トラック、ピッチ、Note On/Off のタイミングを維持したまま、固定ベロシティをノートごとに予測した強弱へ置き換えます。
+
+```bash
+python infer_velocity.py \
+  --midi output.mid \
+  --stems-dir separated_stems \
+  --output-midi output_velocity.mid
+```
+
+ステムディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を付けたファイルを置いてください。`--compile-velocity` は、コア AMT の `--compile` とは独立してベロシティバックボーンを regional compile します。学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+
+### 主な引数
+
+| 引数 | デフォルト | 説明 |
+| --- | --- | --- |
+| `--audio` | （必須） | 入力オーディオのパス |
+| `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
+| `--checkpoint` | （自動） | 学習済みモデル。省略時は Hugging Face からダウンロード |
+| `--type` | `default` | モデルの種類。下表を参照 |
+| `--device` | `auto` | `auto`（CUDA → MPS → CPU）、`cuda`、`mps`、または `cpu` |
+| `--amp` | `false` | CUDA または MPS で混合精度を有効化 |
+| `--amp-dtype` | デバイスのデフォルト | `fp16` または `bf16` |
+| `--compile` | `false` | バックボーンの Transformer ブロックを regional `torch.compile` |
+| `--compile-mode` | `default` | `default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs` |
+| `--window-ms` | 学習時の値 | 推論ウィンドウサイズ（ms） |
+| `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
+| `--window-batch-size` | `1` | 1 バッチあたりのウィンドウ数。小さくするとピークメモリを削減。バッチサイズ間でバイト単位の同一出力は保証されない |
+| `--merge-gap-ms` | 1 hop | 小さなノート間隔を結合する閾値 |
+| `--merge-onset-ms` | `50.0` | ほぼ同時の onset を結合する閾値 |
+| `--max-midi-melodic-instruments` | `15` | 楽器トラックの最大数 |
+| `--allowed-instruments` | 全クラス | 楽器分類の候補。選択したクラス内で softmax を再正規化 |
+| `--silence-gate-rms-dbfs` | `-72` | 無音ウィンドウをスキップする RMS 閾値 |
+
+**モデルの種類（`--type`）**
+
+| 値 | 備考 |
+| --- | --- |
+| `default` | 全楽器向け |
+| `bass` / `bass_v2` | `bass_v2` が更新版 |
+| `guitar` / `guitar_v1_5` | `guitar_v1_5` が Colab のデフォルト |
+| `vocal` | リードボーカル向けにファインチューニング |
+| `vocal_harmony` / `vocal_harmony_v1_5` | `v1_5` は Pitch Slot が 1 つのため、1 パート内の同時発音を予測しない |
+| `other` / `other_v1_5` | `other_v1_5` が Colab のデフォルト |
+| `drums` | **実験的** |
+
+---
+
 ## データ準備
 
-### 1. ファイルの配置
-
-ステムオーディオと対応する MIDI ファイルを以下のように配置します:
+ステムと対応する MIDI を次の構成で配置します。
 
 ```
-stems/          # オーディオファイル (.wav / .flac)
+stems/          # オーディオ（.wav / .flac）
   ├── song1__piano.wav
   ├── song1__guitar.wav
   ├── song2__vocal.wav
-  └── ...
-
 stem_midis/     # 対応する MIDI
   ├── song1__piano.mid
   ├── song1__guitar.mid
   ├── song2__vocal.mid
-  └── ...
 ```
 
-**命名規則**: `<曲名>__<楽器名>.wav`
-- `__`（アンダースコア 2 つ）が曲名と楽器名の区切り
-- 同じ曲名を持つステムは同一曲のパートとして扱われます
-
-### 2. マニフェスト生成
+命名規則は `<song_name>__<instrument_name>.wav` です。曲名と楽器名を 2 つのアンダースコアで区切ります。同じ曲名を持つステムは 1 つの曲として扱われます。
 
 ```bash
 python preprocess/prepare_dataset.py \
@@ -289,23 +258,17 @@ python preprocess/prepare_dataset.py \
   --manifest_path ./manifest.csv
 ```
 
-これで以下が生成されます:
-- **`stem_npz/`**: ノート情報の前処理済みファイル（開始/終了時刻、ピッチ、ベロシティ、楽器ID）
-- **`manifest.csv`**: データセットのインデックス
+このコマンドは、前処理済みノート配列（開始、終了、音高、ベロシティ、楽器 ID）を格納する `stem_npz/` と、データセットの索引である `manifest.csv` を生成します。
 
-### 3. （任意）リサンプリング
-
-オーディオファイルが22050 Hzでない場合は、container formatとsample subtypeを維持したまま、その場でリサンプリングします:
+オーディオが 22050 Hz でない場合は、コンテナ形式とサンプルサブタイプを維持したまま上書きリサンプリングします。
 
 ```bash
-python -m preprocess.resample_only \
-  --input ./stems \
-  --resample-rate 22050
+python -m preprocess.resample_only --input ./stems --resample-rate 22050
 ```
 
-## 学習
+---
 
-### 基本
+## 学習
 
 ```bash
 python train.py \
@@ -317,44 +280,36 @@ python train.py \
   --wandb
 ```
 
-### フルオーグメンテーション
+すべてのデータ拡張を有効にする場合：
 
 ```bash
 python train.py \
   --dataset_config dataset_config.yaml \
-  --batch_size 8 \
-  --lr 5e-4 \
-  --warmup_steps 1000 \
-  --epochs 3000 \
-  --ir_folder ./IRs \
-  --noise_folder ./noise \
-  --drum_folder ./drum_stems \
-  --p_augment 1.0 \
-  --p_intra_drop 0.3 \
-  --p_cross_mix 0.5 \
-  --p_drum_mix 0.1 \
+  --batch_size 8 --lr 5e-4 --warmup_steps 1000 --epochs 3000 \
+  --ir_folder ./IRs --noise_folder ./noise --drum_folder ./drum_stems \
+  --p_augment 1.0 --p_intra_drop 0.3 --p_cross_mix 0.5 --p_drum_mix 0.1 \
   --sa_p 0.5 --sa_freq_max 10 --sa_time_max 20 --sa_num_freq 2 --sa_num_time 2 \
-  --wandb --project_name instrument_agnostic_amt
+  --wandb --project_name tsumugi
 ```
 
 ### 主な引数
 
 | 引数 | デフォルト | 説明 |
-|---|---|---|
+| --- | --- | --- |
 | `--dataset_config` | `dataset_config.yaml` | 重み付きマルチデータセット設定 |
 | `--batch_size` | `8` | バッチサイズ |
-| `--lr` | `5e-4` | 学習率 (AdamW) |
-| `--warmup_steps` | `1000` | LR ウォームアップのステップ数 |
-| `--window_ms` | `8000` | 入力ウィンドウの長さ (ms) |
-| `--p_intra_drop` | `0.3` | 曲内のステムをランダムに落とす確率 |
-| `--p_cross_mix` | `0.5` | 別の曲からステムを混ぜる確率 |
+| `--lr` | `5e-4` | 学習率（AdamW） |
+| `--warmup_steps` | `1000` | 学習率のウォームアップステップ数 |
+| `--window_ms` | `8000` | 入力ウィンドウ長（ms） |
+| `--p_intra_drop` | `0.3` | 同じ曲のステムをドロップする確率 |
+| `--p_cross_mix` | `0.5` | 別の曲のステムをミックスする確率 |
 | `--p_augment` | `1.0` | オーディオ拡張を適用する確率 |
-| `--init-from` | `None` | 重み初期化用のチェックポイント |
+| `--init-from` | `None` | 重み初期化に使うチェックポイント |
 | `--no_amp` | `false` | 混合精度を無効化 |
 
 ### マルチデータセット設定
 
-`dataset_config.yaml` で複数データセットを重み付きで混合できます:
+`dataset_config.yaml` は、異なる重みで複数のデータセットを混合します。
 
 ```yaml
 datasets:
@@ -371,11 +326,10 @@ datasets:
   - name: musicnet
     manifest: other_db/musicnet_manifest.csv
     weight: 0.5
-    use_for_cross_aug: false  # cross-stem ミキシングには使わない
+    use_for_cross_aug: false  # クロスステムミキシングには使用しない
 ```
 
-別々のmanifestに同じ曲からレンダリングしたstemが入っている場合は、
-オプションの `group` を指定します:
+同じ曲からレンダリングしたステムを別々の manifest に保存している場合は、`group` を使用します。
 
 ```yaml
 datasets:
@@ -390,259 +344,69 @@ datasets:
     allow_multi_stem_same_song: true
 ```
 
-`group` とCSVの `song_name` が同じentryは、1つの仮想的な曲として扱われます。
-そのため `allow_multi_stem_same_song: true` なら、manifestをまたいでstemを
-選択できます。weight、augmentation設定、cross-augmentationへの使用可否は
-従来どおり各entry単位です。`group` を省略した場合は `name` が使われ、
-既存の分離された挙動を維持します。
+同じ `group` と CSV の `song_name` を持つエントリは 1 つの仮想的な曲になるため、`allow_multi_stem_same_song: true` では複数の manifest にまたがってステムを選択できます。重み、データ拡張設定、クロスデータ拡張の対象可否はエントリごとに維持されます。`group` を省略すると `name` が使われ、従来どおり個別に扱われます。
+
+### データ拡張
+
+**ステムレベル** — 同じ曲のステムをドロップして疎なアレンジを再現、別の曲のステムを混ぜて新しい組み合わせを作成、ドラムのないミックスへランダムにドラムを追加。
+
+**オーディオレベル** — 7 バンド EQ、±0.2 半音のマイクロピッチシフト、実際のインパルス応答を使った IR リバーブ、ガウスノイズと背景音、チャンネル入れ替えとランダムパンニング、ステムごとに ±6 dB のゲイン。
+
+**スペクトログラムレベル** — CQT 特徴量への SpecAugment の時間／周波数マスキング、および基音を常に残しながら倍音チャンネルをランダムに落とす harmonic dropout。
 
 ---
 
-## MIDIフレームによるビート・コード学習
-
-MIDIフレームのビート・コードモデルは、通常のAMT学習から独立させて
-[`instrument_agnostic_amt/beat_chord`](instrument_agnostic_amt/beat_chord/README.md)
-に配置しています。MIDIのtempo・拍子情報を使うbeat事前学習、AMTで生成したmerged MIDIを
-使うbeat/chord joint学習、MIDIからのbeat/chord推論に対応します。
+## ビート、コード、キー
 
 ```bash
-# MIDIからbeatを事前学習
-python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
+# MIDI からビートを事前学習
+python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat \
+  --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
-# beat/chordをjoint学習
+# ビート／コードを joint 学習
 python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
 
-# beat/chordを推論
+# ビート／コードを推論
 python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.mid
 ```
 
-`beat_chord_dataset/key_only_dataset/midis/`に置いた修正済み予測MIDIは、既定で
-chord/key学習にも利用されます。ラベルとして扱うのは`key_signature`イベントだけで、
-コードmarker、tempo/拍子metadata、beat情報をこれらのファイルから学習することは
-ありません。この補助データではchord lossをmaskし、chordの自己refinement
-feedbackもdetachします。`--skip_key_only`で無効化、`--key_only_loss_scale`
-で寄与率を変更できます。この小さなdatasetが連続した更新に集中しないよう、
-既定では4学習stepに1回だけkey-only batchを使います。間隔は
-`--key_only_step_interval N`で変更でき、`1`にすると毎stepの動作になります。
-epochあたりのkey-only datasetの走査は最大1回です。minor keyは、
-modelが持つrelative majorのkey classへmapされます。
+---
 
-### 未修正key-only候補の一括生成
+## プロジェクト構成
 
-directory内のすべてのaudioにColabのstem workflowを適用し、予測したbeat・拍子・
-chord・keyのmetadataを付与するには、stem分離用extraを導入して一括実行します:
-
-```bash
-uv sync --locked --extra stem
-uv run python -c "from instrument_agnostic_amt.beat_chord.key_only_candidates import main; main()" \
-  --input-dir beat_chord_dataset/source_audio \
-  --output-dir beat_chord_dataset/key_only_candidates
 ```
-
-このbatch処理はColab notebookと同じstem別model routingを使い、stem MIDIのmerge、
-note velocityの予測、`midi_frame_infer`までを実行してから次の曲へ進みます。
-`infer.py`と同じ`--device` / `--amp` / `--amp-dtype` / `--compile` /
-`--compile-mode`に加え、velocity model用の`--compile-velocity`も指定できます。
-`--amp`が適用されるのはAMT採譜stageだけで、velocity・instrument refinement・
-beat/chord/keyはFP32で実行されます。
-
-beat/chord推論では、既定で
-`beat_chord_predictions/<song>.beat_mapped.mid` も出力します。このType 1 MIDIには、
-予測した連続tempo・拍子mapのconductor track、独立したコードmarker track、
-および元の演奏trackを新しいtempo mapへ再配置したコピーが入ります。全イベントを一度
-絶対秒へ変換してから再配置するため、ペアのオーディオとの同期は維持されます。保存後に再読込し、
-note時刻の誤差が1ms以内であることも検証します。保存先は
-`--beat_mapped_midi_path`、出力の無効化は `--disable_beat_mapped_midi` で指定できます。
-小節内の拍位置の小さな揺れは安定した小節単位tempo区間へ正規化し、検出したダウンビートは
-1ms以内で維持します。明確で一方向に
-持続するritardandoまたはaccelerandoだけは拍単位の滑らかなtempo curveとして残すため、
-演奏eventを量子化せず、編集しやすいtempo mapを出力できます。
-
-モデル、dataset、loss、checkpoint、CLIは通常学習の `train.py` とは別管理です。
-データ配置と全コマンドは[beat/chordパイプラインガイド](instrument_agnostic_amt/beat_chord/README.md)
-を参照してください。
+instrument_agnostic_amt/
+├── train.py                    # 学習ループ（AMP、W&B、warmup）
+├── infer.py                    # 推論：オーディオ → MIDI
+├── dataset.py                  # ステムミキシング拡張を持つ StemDataset
+├── losses.py                   # Semi-CRF NLL＋boundary＋楽器分類
+├── augmentation.py             # AudioAugmentor（EQ、pitch shift、reverb、noise、…）
+├── instrument_classes.py       # 楽器クラスの対応（GM program ↔ class ID）
+├── instrument_merge.json       # 楽器 taxonomy
+├── gm_instrument_classes.json  # General MIDI metadata
+├── dataset_config.yaml         # マルチデータセットの重み付きサンプリング
+│
+├── models/
+│   ├── model.py                # AudioSemiCRFTransformer（トップレベル）
+│   ├── transcription_model.py  # 特徴抽出、StemConv、Backbone
+│   ├── transformer.py          # gated attention を持つ RoPE Transformer
+│   ├── cqt.py                  # RecursiveCQT（高速な octave-recursive CQT）
+│   ├── semi_crf.py             # Neural Semi-CRF（forward-backward、Viterbi、loss）
+│   ├── interval_boundaries.py  # 区間境界の特徴量収集
+│   └── spec_augment.py         # SpecAugment と MiniBatch Mixture Masking
+│
+└── preprocess/
+    ├── prepare_dataset.py      # オーディオ／MIDI ペアから manifest.csv を生成
+    ├── resample_only.py        # 一括リサンプリング
+    └── apply_ir_augmentation.py # オフライン IR convolution
+```
 
 ---
 
-## 推論
+## 謝辞
 
-### 基本
-
-```bash
-python infer.py --audio input_song.wav
-```
-
-> **Note**: `--checkpoint` を指定しない場合、自動的に Hugging Face から最新のモデルがダウンロードされます。
-
-### デバイス選択
-
-`--device` のデフォルトは `auto` で、**CUDA → MPS → CPU** の順に利用可能な
-バックエンドを選びます。デバイスを明示することもでき、利用できないアクセラレータを
-指定した場合は、暗黙にフォールバックせずエラーで停止します。
-
-```bash
-python infer.py --audio input_song.wav                # auto: CUDA → MPS → CPU
-python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
-python infer.py --audio input_song.wav --device cpu
-```
-
-MPS を使うには、PyTorch の MPS バックエンドを利用できる Apple Silicon Mac が必要です。
-PyTorch が MPS 未対応の演算を報告した場合は、`--device cpu` で再実行してください。
-CPU・CUDA・MPS 間では、浮動小数点演算による小さな結果差が生じることがあります。
-単体CLIの推論では、混合精度は`--amp`を指定した場合だけ有効になり、MPSの既定dtypeはfp16です。
-`--amp-dtype`で変更できます。
-
-AMPはAMTのforward passへautocastを適用するもので、model weight自体は変換しません。CUDAではGPUがnative bf16に対応していればbf16、非対応の場合（Tesla T4を含む）はfp16が既定で、MPSではfp16が既定です。fp16の推論時autocastでは、activation overflowを防ぐため`StemConv`をFP32で実行します。stem分離pipelineとkey-only batchではAMT採譜だけへAMPを適用し、velocity・instrument refinement・beat/chord/keyはFP32で実行します。
-
-AMPは出力を変えることがあり、すべてのdeviceや楽曲で速くなる保証はありません。AMPを使わない場合、Attentionを含むforward passはFP32のままです。
-
-### regional コンパイル（任意）
-
-`--compile` を指定すると、AMT の共有バックボーンにある time 軸 / band 軸
-Transformer ブロックだけを `torch.compile` します。特徴抽出、予測ヘッド、
-Semi-CRF デコード、MIDI 処理は eager のままです。フル窓と末尾の端数窓は、
-どちらも同じ regional コンパイル済みモデルを使います。
-
-```bash
-python infer.py --audio input_song.wav --compile
-python infer.py --audio input_song.wav --compile --compile-mode max-autotune
-```
-
-最初のウィンドウには初回コンパイルの時間が含まれるため、`--compile` は既定で
-無効です。短い曲を 1 回だけ処理する場合は遅くなることがあり、ロード済みモデルで
-複数のウィンドウや曲を続けて処理する場合に向いています。`--compile-mode` には
-`default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs`
-を指定できます。
-
-regional compileはFP32でもbit-exactな出力を保証しません。バイト単位で安定した出力が必要な場合はFP32 eagerを選んでください。
-
-### Google Colab のステム分離ワークフロー
-
-Google Colab 用ノートブック [`Colab_Inference.ipynb`](Colab_Inference.ipynb) には、以下のオプション機能があります。
-
-1. 入力した曲をステム分離する
-2. 各ステムを個別に採譜する
-3. （任意）instrument refinement モデルで各ノートの楽器を付け直す
-4. ステムごとの MIDI を 1 本へマージする
-5. 対応する分離ステムから MIDI ノートごとの velocity を予測する
-
-この方法は、ミックス全体をそのまま単発で採譜するより時間はかかりますが、各ステムの音響的な複雑さが下がり、楽器同士の重なりも減るため、採譜精度が上がることが多いです。特に、バンド音源、密な伴奏、和音とメロディが強く重なる曲で有効です。
-
-notebookの既定値は`DEVICE = "auto"`、`AMP = True`、`AMP_DTYPE = "default"`、`WINDOW_BATCH_SIZE = 1`です。`COMPILE_MODEL`と`COMPILE_VELOCITY`は独立しており、どちらも`False`、共通の`COMPILE_MODE`は`"default"`です。AMPはAMT採譜だけに適用し、後段stageはFP32で実行します。
-
-ステム分離ワークフローでは、ステムごとに妥当な楽器クラスだけを候補にし、候補外のクラスを除いて楽器確率を計算します。単体の `infer.py` でも `--allowed-instruments` にカンマ区切りのクラス名を渡すと同じ制限を利用できます。
-
-velocity 予測はデフォルトで有効です（`PREDICT_VELOCITY = True`）。必要な velocity チェックポイント `best_velocity_model.pth` は Hugging Face から自動取得され、最終結果は `_velocity.mid` という接尾辞付きで保存されます。この処理を省略する場合は、ノートブック内で `PREDICT_VELOCITY = False` に設定してください。
-
-楽器の再判定（instrument refinement）はデフォルトで無効です（`REFINE_INSTRUMENTS = False`）。有効にすると、ステムごとの MIDI をマージする前に各分離ステムをもう一度聴き直し、ノートの楽器クラスを割り当て直します。そのため velocity 予測とマージ結果の両方が修正後の楽器を使います。再判定後のステム MIDI は、元の `stem_midis/` と並べて `refined_stem_midis/` に書き出されます。特定のチェックポイントを使う場合は `REFINEMENT_CHECKPOINT` を設定してください。空のままにすると `checkpoints/best_instrument_refinement.pth`、またはローカルで学習した `instrument_agnostic_amt/instrument_refinement/artifacts/checkpoints/best_model.pth` を解決し、どちらも無ければ Hugging Face からチェックポイントを取得します。
-
-ドラムとボーカルのステムは常にスキップされます。ドラムはドラム以外の候補クラスを持たないため、割り当て直す対象がありません。ボーカルを除外する理由はそれとは別で、`melody` と `vocal_harmony` の区別は音色ではなく音楽的な役割（主旋律か、その下に重ねるパートか）の問題であるのに対し、refinement モデルは音色の埋め込みから判断するためです。実際にはボーカルステム全体がどちらか一方に潰れてしまうため、AMT モデル自身のボーカルラベルをそのまま使います。
-
-### 楽器再判定（instrument refinement）の単体実行
-
-instrument refinement モデルは、採譜元となった分離ステムを使って、既存の MIDI にあるすべてのノートの楽器を判定し直します。ノートのタイミングとピッチは維持され、楽器の割り当て（トラックのプログラム番号と名前）だけが変わります。
-
-```bash
-python infer_instrument_refinement.py \
-  --audio separated_stems/song_other.wav \
-  --midi stem_midis/song_other.mid \
-  --stem-name other \
-  --output-midi song_other_refined.mid
-```
-
-`--stem-name` を指定すると、その分離ステムで妥当な楽器クラスだけに候補を絞ります。`--mode cluster`（既定）は音色の埋め込みが近いノートをグループにまとめ、グループごとに楽器を割り当てます。`--mode single` はステム全体に 1 つの楽器を割り当てます。`--checkpoint` を省略した場合は、上記のローカルパスから解決するか、Hugging Face から取得します。
-
-### velocity 予測の単体実行
-
-velocity モデルは、AMT のノート検出モデルとは別の後処理モデルです。既存の MIDI と分離ステムを入力し、固定されていた velocity をノートごとの予測値に置き換えます。元のトラック、ピッチ、Note On/Off のタイミングは維持されます。
-
-```bash
-python infer_velocity.py \
-  --midi output.mid \
-  --stems-dir separated_stems \
-  --output-midi output_velocity.mid
-
-# 任意: velocity バックボーンの Transformer 領域をコンパイル
-python infer_velocity.py \
-  --midi output.mid \
-  --stems-dir separated_stems \
-  --compile-velocity \
-  --compile-mode max-autotune
-```
-
-`--checkpoint` を省略すると、`best_velocity_model.pth` を Hugging Face から自動取得します。ステム用ディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を識別できる分離ステムを配置してください。velocity モデルの学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
-
-`--compile-velocity` はコア AMT の `--compile` とは独立したオプションです。
-velocity バックボーンの Transformer ブロックだけを regional コンパイルし、
-MIDI 解析、窓分割、ノート単位のヘッドは eager のままです。フル窓、末尾の
-端数窓、1 窓より短い曲は、すべて同じコンパイル済みモデルを再利用します。
-最初の窓では初回コンパイルの時間がかかるため、短い曲を 1 回だけ処理する場合は
-遅くなることがあり、既定では無効です。
-
-### その他のオプション
-
-```bash
-python infer.py \
-  --checkpoint checkpoints/checkpoint_epoch_100.pth \
-  --audio input_song.wav \
-  --output-midi output.mid \
-  --device auto \
-  --amp \
-  --compile \
-  --window-ms 8000 \
-  --stride-ms 4000 \
-  --window-batch-size 4 \
-  --velocity 100 \
-  --max-midi-melodic-instruments 15
-```
-
-### 主な引数
-
-| 引数 | デフォルト | 説明 |
-|---|---|---|
-| `--checkpoint` | (自動) | 学習済みモデルのパス。指定しない場合は HF から自動取得 |
-| `--type` | `default` | ダウンロードするモデルの種類。`default`: 全楽器用、`bass`: 従来のベース専用モデル、`bass_v2`: 新しいベース専用モデル、`vocal`: ボーカル専用モデル、`guitar`: 従来のギター専用モデル、`guitar_v1_5`: 新しいギター専用モデル、`vocal_harmony`: ボーカルハモリモデル、`vocal_harmony_v1_5`: 新しいボーカルハモリモデル（Pitch Slot が1つなので、同一パート内の同時発音は予測しません）、`drums`: **実験的 (Experimental)** なドラム専用モデル、`other`: 従来のその他楽器専用モデル、`other_v1_5`: 新しいその他楽器専用モデル |
-| `--audio` | （必須） | 入力オーディオのパス |
-| `--output-midi` | `<audio>.mid` | 出力 MIDI のパス |
-| `--device` | `auto` | 推論デバイス。`auto` は CUDA → MPS → CPU の順に選択。`cuda`、`mps`、`cpu` の明示指定も可能 |
-| `--amp` | `false` | CUDA または MPS で混合精度推論を有効化 |
-| `--amp-dtype` | デバイス既定 | `fp16` または `bf16`。対応CUDAではbf16、MPSではfp16が既定 |
-| `--compile` | `false` | AMT バックボーンの Transformer ブロックだけを regional `torch.compile` する |
-| `--compile-mode` | `default` | `default`、`reduce-overhead`、`max-autotune`、`max-autotune-no-cudagraphs` から選択 |
-| `--window-ms` | 学習時の値 | 推論ウィンドウサイズ (ms) |
-| `--stride-ms` | `window-ms / 2` | ウィンドウのストライド |
-| `--window-batch-size` | `1` | まとめて処理するウィンドウ数。小さくするとpeak memoryを抑えられますが、batch幅を跨いだbyte-identicalな出力は保証されません |
-| `--merge-gap-ms` | 1 hop 分 | ノート間ギャップのマージ閾値 |
-| `--merge-onset-ms` | `50.0` | 近いオンセットのマージ閾値 |
-| `--max-midi-melodic-instruments` | `15` | 楽器トラックの上限 |
-| `--allowed-instruments` | 全クラス | 楽器分類の候補。カンマ区切りまたは引数を繰り返して指定。softmax 使用時は指定候補内で確率を再正規化 |
-| `--silence-gate-rms-dbfs` | `-72` | 無音スキップの RMS 閾値 |
-
----
-
-## データ拡張
-
-学習時には複数のオーグメンテーションを組み合わせて汎化性能を高めています:
-
-### ステムレベル
-- **イントラステムドロップ** — 同じ曲のステムをランダムに落とし、パートが少ない状況をシミュレート
-- **クロスステムミキシング** — 別の曲から異なる楽器のステムを混合
-- **ドラム追加** — ドラムがない曲にドラムトラックをランダムに追加
-
-### オーディオレベル
-- **7 バンド EQ** — 録音環境やミックスの違いをシミュレート
-- **マイクロピッチシフト** — ±0.2 半音のチューニング変動
-- **IR リバーブ** — 実際のインパルスレスポンスによる部屋鳴りの付加
-- **ノイズ注入** — ガウスノイズや環境音
-- **ステレオ操作** — チャンネルスワップ、ランダムパンニング
-- **ゲインランダム化** — ステムごと ±6 dB
-
-### スペクトログラムレベル
-- **SpecAugment** — CQT 特徴量に対する時間・周波数マスキング
-- **ハーモニックドロップアウト** — 倍音チャンネルをランダムにドロップ（基本波は保持）
-
----
+Neural Semi-CRF の定式化とデコード設計の多くは、Yujia Yan 氏らによる [Transkun](https://github.com/Yujia-Yan/Transkun) に基づいています。本プロジェクトでは、その成果をピアノから任意の楽器へ拡張しています。
 
 ## ライセンス
 
-[MIT License](LICENSE)
+[MIT](LICENSE)
