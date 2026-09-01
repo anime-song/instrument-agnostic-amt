@@ -1,9 +1,10 @@
+import math
+
+import numpy as np
+import scipy.signal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import scipy.signal
-import math
 
 
 class RecursiveCQT(nn.Module):
@@ -188,6 +189,28 @@ class RecursiveCQT(nn.Module):
 
         kernel.requires_grad = False
         return kernel
+
+    @property
+    def minimum_input_samples(self) -> int:
+        """全CQT stageでreflect padding可能となる最小入力sample数を返す。"""
+
+        if len(self.fft_sizes) != len(self.resamplers) + 1:
+            raise RuntimeError("CQT stages and resamplers are not aligned")
+        required = self.fft_sizes[-1] // 2 + 1
+        for stage_index in reversed(range(len(self.resamplers))):
+            resampler = self.resamplers[stage_index]
+            if not isinstance(resampler, nn.Conv1d):
+                raise TypeError("CQT resamplers must be Conv1d modules")
+            kernel_size = int(resampler.kernel_size[0])
+            padding = int(resampler.padding[0])
+            stride = int(resampler.stride[0])
+            dilation = int(resampler.dilation[0])
+            required_by_downstream = (
+                stride * (required - 1) - 2 * padding + dilation * (kernel_size - 1) + 1
+            )
+            required_by_local_stft = self.fft_sizes[stage_index] // 2 + 1
+            required = max(required_by_local_stft, required_by_downstream)
+        return int(required)
 
     def forward(self, x, return_complex=False):
         """

@@ -582,7 +582,6 @@ def predict_velocity_for_stem_midis(
         ),
         select_note_stems_only=select_note_stems_only,
         reject_out_of_range=False,
-        pad_final_window=False,
     )
     for record, velocity in zip(flat_notes, predictions.velocities):
         record.note.velocity = int(velocity)

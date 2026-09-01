@@ -258,7 +258,6 @@ class VelocityEstimator:
             ),
             select_note_stems_only=True,
             reject_out_of_range=True,
-            pad_final_window=True,
         )
         if len(predictions.velocities) != len(note_records):
             raise ValueError("Velocity prediction count does not match MIDI notes")

@@ -544,7 +544,7 @@ def test_estimator_rejects_notes_starting_after_the_audio_ends(tmp_path: Path) -
         )
 
 
-def test_estimator_pads_a_short_final_audio_window(tmp_path: Path) -> None:
+def test_estimator_back_aligns_a_short_final_audio_window(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "velocity.pth"
     _write_tiny_velocity_checkpoint(checkpoint_path)
     estimator = VelocityEstimator.from_checkpoint(checkpoint_path, device="cpu")
@@ -562,11 +562,143 @@ def test_estimator_pads_a_short_final_audio_window(tmp_path: Path) -> None:
     source = io.BytesIO()
     midi.save(file=source)
 
+    waveform = torch.arange(8_001, dtype=torch.float32).repeat(2, 1) / 8_001
+
+    class RecordingForward:
+        def __call__(
+            self,
+            audio: torch.Tensor,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            assert audio.shape == (1, 1, 2, 8_000)
+            torch.testing.assert_close(
+                audio[0, 0, :, 0],
+                waveform[:, 1],
+            )
+            torch.testing.assert_close(
+                kwargs["note_start_seconds"],
+                torch.tensor([[7_999 / 8_000]]),
+            )
+            return {"velocity_expected": torch.tensor([[55.0]])}
+
+    estimator._forward_model = RecordingForward()
+
     result = estimator.estimate(
         midi=source.getvalue(),
-        audio=DecodedAudio(torch.zeros(2, 8_001), sample_rate=8_000),
+        audio=DecodedAudio(waveform, sample_rate=8_000),
         stem_kind="other",
         options=VelocityOptions(window_seconds=1.0),
+    )
+
+    assert result.velocity_applied is True
+    assert result.note_count == 1
+
+
+def test_estimator_does_not_reassign_notes_from_overlapping_final_audio(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "velocity.pth"
+    _write_tiny_velocity_checkpoint(checkpoint_path)
+    estimator = VelocityEstimator.from_checkpoint(checkpoint_path, device="cpu")
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    midi.tracks.append(
+        mido.MidiTrack(
+            [
+                mido.MetaMessage("set_tempo", tempo=500_000, time=0),
+                mido.Message("note_on", channel=0, note=59, velocity=80, time=8_640),
+                mido.Message("note_off", channel=0, note=59, velocity=0, time=1),
+                mido.Message("note_on", channel=0, note=60, velocity=80, time=6_719),
+                mido.Message("note_off", channel=0, note=60, velocity=0, time=1),
+                mido.MetaMessage("end_of_track", time=0),
+            ]
+        )
+    )
+    source = io.BytesIO()
+    midi.save(file=source)
+    waveform = torch.arange(17 * 8_000, dtype=torch.float32).repeat(2, 1)
+    waveform /= float(waveform.shape[1])
+    calls: list[tuple[list[int], float, list[float]]] = []
+
+    class RecordingForward:
+        def __call__(
+            self,
+            audio: torch.Tensor,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            calls.append(
+                (
+                    kwargs["note_pitch"].squeeze(0).tolist(),
+                    float(audio[0, 0, 0, 0]),
+                    kwargs["note_start_seconds"].squeeze(0).tolist(),
+                )
+            )
+            velocity = (41.0, 99.0)[len(calls) - 1]
+            return {
+                "velocity_expected": torch.full_like(
+                    kwargs["note_start_seconds"],
+                    velocity,
+                )
+            }
+
+    estimator._forward_model = RecordingForward()
+
+    result = estimator.estimate(
+        midi=source.getvalue(),
+        audio=DecodedAudio(waveform, sample_rate=8_000),
+        stem_kind="other",
+    )
+
+    assert [call[0] for call in calls] == [[59], [60]]
+    assert [call[1] for call in calls] == pytest.approx([8 / 17, 9 / 17])
+    assert [call[2] for call in calls] == [[1.0], [7.0]]
+    output = mido.MidiFile(file=io.BytesIO(result.midi_bytes))
+    assert [
+        int(message.velocity)
+        for track in output.tracks
+        for message in track
+        if message.type == "note_on" and int(message.velocity) > 0
+    ] == [41, 99]
+
+
+def test_estimator_enforces_the_model_cqt_minimum_window(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "velocity.pth"
+    _write_tiny_velocity_checkpoint(checkpoint_path)
+    estimator = VelocityEstimator.from_checkpoint(checkpoint_path, device="cpu")
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    midi.tracks.append(
+        mido.MidiTrack(
+            [
+                mido.Message("note_on", channel=0, note=60, velocity=80, time=0),
+                mido.Message("note_off", channel=0, note=60, velocity=0, time=1),
+                mido.MetaMessage("end_of_track", time=0),
+            ]
+        )
+    )
+    source = io.BytesIO()
+    midi.save(file=source)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"window_seconds is too short for this velocity model: "
+            r"requires at least 2,049 samples "
+            r"\(about 0\.2561 seconds at 8,000 Hz\)"
+        ),
+    ):
+        estimator.estimate(
+            midi=source.getvalue(),
+            audio=DecodedAudio(torch.zeros(2, 2_049), sample_rate=8_000),
+            stem_kind="other",
+            options=VelocityOptions(window_seconds=2_048 / 8_000),
+        )
+
+    result = estimator.estimate(
+        midi=source.getvalue(),
+        audio=DecodedAudio(torch.zeros(2, 2_049), sample_rate=8_000),
+        stem_kind="other",
+        options=VelocityOptions(window_seconds=2_049 / 8_000),
     )
 
     assert result.velocity_applied is True

@@ -4,6 +4,32 @@ import pytest
 import torch
 
 from instrument_agnostic_amt.modeling.backbone import AudioFeatureExtractor
+from instrument_agnostic_amt.modeling.features.cqt import RecursiveCQT
+
+_CQT_MINIMUM_CASES = [
+    (
+        {
+            "sr": 8_000,
+            "hop_length": 128,
+            "fmin": 27.5,
+            "n_bins": 48,
+            "bins_per_octave": 12,
+            "filter_scale": 0.475,
+        },
+        2_049,
+    ),
+    (
+        {
+            "sr": 22_050,
+            "hop_length": 512,
+            "fmin": 27.5,
+            "n_bins": 312,
+            "bins_per_octave": 36,
+            "filter_scale": 0.475,
+        },
+        16_385,
+    ),
+]
 
 
 def _extractor(*, cqt_log_scale: bool = False) -> AudioFeatureExtractor:
@@ -18,6 +44,36 @@ def _extractor(*, cqt_log_scale: bool = False) -> AudioFeatureExtractor:
         cqt_log_scale=cqt_log_scale,
         input_audio_channels=2,
     )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_minimum"),
+    _CQT_MINIMUM_CASES,
+)
+def test_recursive_cqt_reports_its_minimum_input_samples(
+    kwargs: dict[str, int | float],
+    expected_minimum: int,
+) -> None:
+    cqt = RecursiveCQT(**kwargs)
+
+    assert cqt.minimum_input_samples == expected_minimum
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_minimum"),
+    _CQT_MINIMUM_CASES,
+)
+def test_recursive_cqt_minimum_matches_the_forward_boundary(
+    kwargs: dict[str, int | float],
+    expected_minimum: int,
+) -> None:
+    cqt = RecursiveCQT(**kwargs)
+
+    with pytest.raises((RuntimeError, ValueError)):
+        cqt(torch.zeros(1, expected_minimum - 1))
+    output = cqt(torch.zeros(1, expected_minimum))
+
+    assert output.shape[-1] > 0
 
 
 def _legacy_harmonic_interpolation(
