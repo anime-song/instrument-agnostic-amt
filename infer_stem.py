@@ -544,7 +544,7 @@ def resolve_stem_model_type(stem_name: str) -> str:
     """ステム名に対応する AMT モデルタイプを選択する。"""
     stem_name_lower = stem_name.lower()
     if "drum" in stem_name_lower:
-        return "drums"
+        return "drums_v1_5"
     if "bass" in stem_name_lower:
         return "bass_v2"
     if "vocal" in stem_name_lower:

@@ -48,7 +48,7 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 - A sustained note may be **split into several shorter notes** (over-segmentation).
 - The **stem-separated workflow** can introduce small timing offsets between stems, which may cause drift after the MIDI files are merged.
 
-**Instrument classification and multi-track output** are available, but classification accuracy remains limited. Slap and synth bass often collapse into `electric bass`; acoustic and electric piano are frequently confused; and instruments such as sitar or banjo that bleed into a separated guitar stem may be assigned to the wrong class. The **drum model** (`--type drums`) is also experimental and may change. The core instrument-agnostic pitch transcription is not experimental.
+**Instrument classification and multi-track output** are available, but classification accuracy remains limited. Slap and synth bass often collapse into `electric bass`; acoustic and electric piano are frequently confused; and instruments such as sitar or banjo that bleed into a separated guitar stem may be assigned to the wrong class. The **drum models** (`--type drums_v1_5` and the legacy `--type drums`) are experimental and may change. The core instrument-agnostic pitch transcription is not experimental.
 
 ---
 
@@ -64,6 +64,7 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 
 | Date | Update |
 | --- | --- |
+| 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
 | 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
 | 2026-08-20 | ⚡ Migrated to uv and PyTorch 2.13. Added MPS inference and AMP/regional compile controls; reduced device synchronization, temporary copies, and repeated stem loading. Two changes intentionally affect output: CUDA attention no longer downcasts implicitly (FP32 is now the default), and V1 window batching propagates decode state in window order. |
 | 2026-08-19 | 🎻 Added Other-Instrument model v1.5 (`--type other_v1_5`) and made it the Colab default for `other` stems. COnP improved from 0.7318 to 0.7701 on an in-house real-recording set. |
@@ -227,7 +228,7 @@ Name files in the stem directory after their stems, such as `vocals.wav`, `bass.
 | `vocal` | Fine-tuned for lead vocals |
 | `vocal_harmony` / `vocal_harmony_v1_5` | `v1_5` uses one Pitch Slot, so it does not predict simultaneous notes within a part |
 | `other` / `other_v1_5` | `other_v1_5` is the Colab default |
-| `drums` | **Experimental** |
+| `drums` / `drums_v1_5` | `drums_v1_5` is the Colab default; `drums` remains the previous checkpoint (**Experimental**) |
 
 ---
 
