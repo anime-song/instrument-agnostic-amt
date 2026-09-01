@@ -9,6 +9,13 @@ from .transcription import (
     TranscriptionOptions,
     TranscriptionResult,
 )
+from .velocity.estimator import (
+    VelocityEstimator,
+    VelocityEstimatorBusyError,
+    VelocityModelInfo,
+    VelocityOptions,
+    VelocityResult,
+)
 
 __all__ = [
     "DecodedAudio",
@@ -18,4 +25,9 @@ __all__ = [
     "TranscriptionModelInfo",
     "TranscriptionOptions",
     "TranscriptionResult",
+    "VelocityEstimator",
+    "VelocityEstimatorBusyError",
+    "VelocityModelInfo",
+    "VelocityOptions",
+    "VelocityResult",
 ]

@@ -15,6 +15,7 @@ from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     predict_velocity_for_midi,
     predict_velocity_for_stem_midis,
 )
+from instrument_agnostic_amt.velocity.midi import apply_loudness_controls
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
@@ -765,6 +766,119 @@ def test_velocity_only_inference_fixes_loudness_controls_at_maximum(
     assert controls.count((11, 127, 0.0)) == instrument_count
     assert all(number not in (7, 11) or value == 127 for number, value, _ in controls)
     assert any(number == 64 for number, _, _ in controls)
+
+
+def test_velocity_inference_can_preserve_template_loudness_controls(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    input_path = mock_stem_midis["drums"]
+    midi = pretty_midi.PrettyMIDI(str(input_path))
+    midi.instruments[0].control_changes.extend(
+        [
+            pretty_midi.ControlChange(number=7, value=72, time=0.0),
+            pretty_midi.ControlChange(number=64, value=127, time=0.1),
+            pretty_midi.ControlChange(number=11, value=91, time=0.2),
+        ]
+    )
+    midi.write(str(input_path))
+    output_path = tmp_path / "preserved.mid"
+
+    predict_velocity_for_stem_midis(
+        stem_midis={"drums": input_path},
+        stem_audios={"drums": mock_audio_stems["drums"]},
+        output_midi_path=output_path,
+        template_midi_path=input_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        loudness_controls="preserve",
+    )
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    controls = output.instruments[0].control_changes
+    assert [(control.number, control.value) for control in controls] == [
+        (7, 72),
+        (64, 127),
+        (11, 91),
+    ]
+    assert [control.time for control in controls] == pytest.approx([0.0, 0.1, 0.2])
+
+
+def test_strip_loudness_controls_preserves_other_event_ticks() -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.extend(
+        [
+            mido.Message("program_change", channel=0, program=8, time=0),
+            mido.Message("control_change", channel=0, control=7, value=72, time=10),
+            mido.Message("control_change", channel=0, control=64, value=127, time=5),
+            mido.Message("note_on", channel=0, note=60, velocity=80, time=7),
+            mido.MetaMessage("end_of_track", time=20),
+        ]
+    )
+    midi.tracks.append(track)
+
+    apply_loudness_controls(midi, "strip")
+
+    absolute_tick = 0
+    remaining_events: list[tuple[str, int, int]] = []
+    for message in midi.tracks[0]:
+        absolute_tick += int(message.time)
+        if message.type == "control_change":
+            remaining_events.append((message.type, int(message.control), absolute_tick))
+        elif message.type == "note_on":
+            remaining_events.append((message.type, int(message.note), absolute_tick))
+    assert remaining_events == [
+        ("control_change", 64, 15),
+        ("note_on", 60, 22),
+    ]
+
+
+def test_velocity_only_controls_precede_tick_zero_notes_and_strip_automation_tracks() -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    note_track = mido.MidiTrack(
+        [
+            mido.MetaMessage("track_name", name="drums", time=0),
+            mido.Message("program_change", channel=9, program=0, time=0),
+            mido.Message("note_on", channel=9, note=38, velocity=80, time=0),
+            mido.Message("note_off", channel=9, note=38, velocity=23, time=120),
+            mido.MetaMessage("end_of_track", time=0),
+        ]
+    )
+    automation_track = mido.MidiTrack(
+        [
+            mido.Message("control_change", channel=2, control=7, value=50, time=12),
+            mido.Message("control_change", channel=2, control=64, value=127, time=3),
+            mido.MetaMessage("end_of_track", time=0),
+        ]
+    )
+    midi.tracks.extend([note_track, automation_track])
+
+    apply_loudness_controls(midi, "velocity_only")
+
+    note_events = list(midi.tracks[0])
+    note_on_index = next(
+        index for index, message in enumerate(note_events) if message.type == "note_on"
+    )
+    fixed_indices = [
+        index
+        for index, message in enumerate(note_events)
+        if message.type == "control_change" and int(message.control) in (7, 11)
+    ]
+    assert fixed_indices and max(fixed_indices) < note_on_index
+    assert all(int(note_events[index].time) == 0 for index in fixed_indices)
+
+    absolute_tick = 0
+    automation_events: list[tuple[int, int]] = []
+    for message in midi.tracks[1]:
+        absolute_tick += int(message.time)
+        if message.type == "control_change":
+            automation_events.append((int(message.control), absolute_tick))
+    assert automation_events == [(64, 15)]
 
 
 def test_velocity_output_limits_melodic_tracks_and_merges_overflow(
