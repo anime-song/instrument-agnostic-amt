@@ -21,6 +21,7 @@ from .harmony import (
     HarmonyAugmentationManager,
     _build_harmony_augmentation_config,
 )
+from .pitch_aliases import parse_pitch_aliases, remap_drum_pitch_array
 from .notes import (
     WindowNotes,
     concat_window_notes,
@@ -123,6 +124,7 @@ class StemDataset(Dataset):
         self.p_augment = float(p_augment)
         self.seed = int(seed)
         self.epoch = 0
+        self.drum_pitch_aliases: dict[int, int] = {}
         self.ir_folder = ir_folder
         self.noise_folder = noise_folder
         self.group_augmentors: dict[str, AudioAugmentor | None] = {}
@@ -268,6 +270,10 @@ class StemDataset(Dataset):
 
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
+
+        self.drum_pitch_aliases = parse_pitch_aliases(
+            config.get("drum_pitch_aliases"),
+        )
 
         dataset_names: set[str] = set()
         for dataset_entry in config.get("datasets", []):
@@ -489,6 +495,13 @@ class StemDataset(Dataset):
                 velocity = data["note_velocity"]
                 instrument_ids = data.get("note_instrument", np.zeros_like(pitch))
                 instrument_ids = mix_spec.override_instrument_ids(instrument_ids)
+
+            pitch = remap_drum_pitch_array(
+                pitch,
+                instrument_ids,
+                self.drum_pitch_aliases,
+                drum_class_id=DRUM_CLASS_ID,
+            )
 
             carry_in, body = split_window_notes(
                 start_ms=start_ms,

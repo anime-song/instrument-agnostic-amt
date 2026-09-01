@@ -18,6 +18,7 @@ from ..inference.instruments import (
 from ..inference.midi import build_midi
 from ..inference.types import InferenceSettings
 from ..inference.windowed import decode_notes
+from ..data.pitch_aliases import DEFAULT_DRUM_PITCH_ALIASES
 from ..modeling.checkpoints import (
     coerce_model_config,
     extract_model_config,
@@ -302,6 +303,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--velocity", type=int, default=100)
     parser.add_argument(
+        "--collapse-crash-cymbals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Map drum pitch 57 (Crash Cymbal 2) to the canonical pitch 49 "
+            "(Crash Cymbal 1) in exported MIDI. Enabled by default; use "
+            "--no-collapse-crash-cymbals to preserve both pitches."
+        ),
+    )
+    parser.add_argument(
         "--instrument-volume",
         action="append",
         default=[],
@@ -525,6 +536,11 @@ def process_file(
         min_midi_note_ms=float(args.min_midi_note_ms),
         max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
         instrument_volumes=dict(args.instrument_volume_map),
+        drum_pitch_aliases=(
+            DEFAULT_DRUM_PITCH_ALIASES
+            if bool(getattr(args, "collapse_crash_cymbals", True))
+            else None
+        ),
         return_stats=True,
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +560,8 @@ def process_file(
         f"midi_instruments_before_remap={midi_stats['midi_instrument_count_before_remap']} "
         f"midi_instruments_after_remap={midi_stats['midi_instrument_count_after_remap']} "
         f"remapped_instruments={midi_stats['remapped_instrument_count']} "
-        f"remapped_notes={midi_stats['remapped_note_count']}"
+        f"remapped_notes={midi_stats['remapped_note_count']} "
+        f"remapped_drum_pitch_notes={midi_stats['remapped_drum_pitch_note_count']}"
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import replace
 
 import pretty_midi
@@ -9,6 +10,7 @@ from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_program_number_from_class_id,
 )
+from ..data.pitch_aliases import parse_pitch_aliases, resolve_pitch_alias
 from .types import PredictedNote
 
 
@@ -138,6 +140,28 @@ def _is_drum_instrument_id(instrument_id: int) -> bool:
     return _instrument_name(int(instrument_id)).lower() == "drums"
 
 
+def _remap_drum_pitch_notes(
+    notes: list[PredictedNote],
+    aliases: Mapping[int, int] | None,
+) -> tuple[list[PredictedNote], int]:
+    if not notes or not aliases:
+        return notes, 0
+
+    remapped_notes: list[PredictedNote] = []
+    remapped_note_count = 0
+    for note in notes:
+        if not _is_drum_instrument_id(int(note.instrument_id)):
+            remapped_notes.append(note)
+            continue
+        remapped_pitch = resolve_pitch_alias(int(note.pitch), aliases)
+        if remapped_pitch == int(note.pitch):
+            remapped_notes.append(note)
+            continue
+        remapped_notes.append(replace(note, pitch=int(remapped_pitch)))
+        remapped_note_count += 1
+    return remapped_notes, remapped_note_count
+
+
 def _midi_instrument_count(notes: list[PredictedNote]) -> int:
     return len({int(note.instrument_id) for note in notes})
 
@@ -262,6 +286,7 @@ def build_midi(
     min_midi_note_ms: float,
     max_midi_melodic_instruments: int = 0,
     instrument_volumes: dict[str, int] | None = None,
+    drum_pitch_aliases: Mapping[int, int] | None = None,
     return_stats: bool = False,
 ) -> pretty_midi.PrettyMIDI | tuple[pretty_midi.PrettyMIDI, dict[str, int]]:
     midi = pretty_midi.PrettyMIDI(resolution=1920)
@@ -278,6 +303,11 @@ def build_midi(
             for note in export_notes
             if int(note.instrument_id) == int(instrument_id)
         ]
+    normalized_drum_pitch_aliases = parse_pitch_aliases(drum_pitch_aliases)
+    export_notes, remapped_drum_pitch_note_count = _remap_drum_pitch_notes(
+        export_notes,
+        normalized_drum_pitch_aliases,
+    )
     export_notes, midi_stats = _remap_overflow_midi_instruments(
         export_notes,
         max_melodic_instruments=int(max_midi_melodic_instruments),
@@ -293,6 +323,9 @@ def build_midi(
     )
     midi_stats["midi_instrument_count_after_remap"] = _midi_instrument_count(
         export_notes
+    )
+    midi_stats["remapped_drum_pitch_note_count"] = int(
+        remapped_drum_pitch_note_count
     )
 
     grouped_notes: dict[int, list[PredictedNote]] = defaultdict(list)

@@ -17,6 +17,7 @@ from instrument_agnostic_amt.cli.infer import (
     main,
     resolve_inference_settings,
 )
+from instrument_agnostic_amt.data.pitch_aliases import DEFAULT_DRUM_PITCH_ALIASES
 from instrument_agnostic_amt.inference.audio import load_audio
 from instrument_agnostic_amt.inference.instruments import (
     STEM_INSTRUMENT_CLASSES,
@@ -120,6 +121,7 @@ def _build_midi(
     sample_rate: int,
     instrument_volumes=None,
     min_midi_note_ms: float = 5.0,
+    drum_pitch_aliases=None,
 ):
     return build_midi(
         notes,
@@ -128,6 +130,11 @@ def _build_midi(
         min_midi_note_ms=min_midi_note_ms,
         max_midi_melodic_instruments=15,
         instrument_volumes=instrument_volumes,
+        drum_pitch_aliases=(
+            DEFAULT_DRUM_PITCH_ALIASES
+            if drum_pitch_aliases is None
+            else drum_pitch_aliases
+        ),
     )
 
 
