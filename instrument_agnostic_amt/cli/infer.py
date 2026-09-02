@@ -1,41 +1,40 @@
 from __future__ import annotations
 
 import argparse
-import math
-from dataclasses import replace
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
 from tqdm.auto import tqdm
 
+from ..data.pitch_aliases import DEFAULT_DRUM_PITCH_ALIASES
 from ..inference.audio import collect_audio_files, load_audio
 from ..inference.instruments import (
-    filter_supported_instrument_class_ids,
     normalize_instrument_class_name,
     parse_allowed_instrument_args,
 )
+from ..inference.loading import load_inference_model
 from ..inference.midi import build_midi
+from ..inference.settings import (
+    resolve_inference_settings as resolve_typed_inference_settings,
+)
 from ..inference.types import InferenceSettings
 from ..inference.windowed import decode_notes
-from ..data.pitch_aliases import DEFAULT_DRUM_PITCH_ALIASES
-from ..modeling.checkpoints import (
-    coerce_model_config,
-    extract_model_config,
-    extract_training_args,
-    load_checkpoint,
-    load_compatible_weights,
-)
+from ..modeling.checkpoints import CheckpointLoadReport
 from ..modeling.model import AudioSemiCRFTransformer, SemiCRFModelConfig
 from ..runtime import (
-    is_amp_supported,
-    maybe_compile_forward,
-    resolve_amp_dtype,
     resolve_device,
 )
 from ..taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
+)
+from ..transcription import (
+    MidiExportOptions,
+    Transcriber,
+    TranscriptionOptions,
+    TranscriptionResult,
 )
 
 HF_CHECKPOINT_BASE_URL = (
@@ -400,27 +399,66 @@ def parse_args() -> argparse.Namespace:
 def load_model(
     checkpoint_path: Path, *, device: torch.device
 ) -> tuple[AudioSemiCRFTransformer, SemiCRFModelConfig, dict[str, Any]]:
-    checkpoint = load_checkpoint(checkpoint_path)
-    config = coerce_model_config(
-        extract_model_config(checkpoint),
-        for_inference=True,
-    )
-    model = AudioSemiCRFTransformer(config)
-    report = load_compatible_weights(
-        model,
-        checkpoint,
-        prefer_ema=True,
-        require_complete_backbone=True,
-    )
+    bundle = load_inference_model(checkpoint_path, device=device)
+    _print_checkpoint_load_report(bundle.report)
+    return bundle.model, bundle.config, dict(bundle.checkpoint_args)
+
+
+def _print_checkpoint_load_report(report: CheckpointLoadReport) -> None:
     if report.missing_keys:
         print(f"Missing keys while loading checkpoint: {report.missing_keys}")
     if report.unexpected_keys:
         print(f"Skipped checkpoint keys: {report.unexpected_keys}")
     if report.shape_mismatches:
         print(f"Skipped shape-mismatched keys: {report.shape_mismatches}")
-    model.to(device)
-    model.eval()
-    return model, config, extract_training_args(checkpoint)
+
+
+def _transcription_options_from_args(args: argparse.Namespace) -> TranscriptionOptions:
+    allowed_instrument_ids = getattr(args, "allowed_instrument_ids", None)
+    allowed_instruments = (
+        None
+        if allowed_instrument_ids is None
+        else tuple(
+            INSTRUMENT_CLASSES[instrument_id]
+            for instrument_id in allowed_instrument_ids
+        )
+    )
+    return TranscriptionOptions(
+        instrument=getattr(args, "instrument", None),
+        allowed_instruments=allowed_instruments,
+        window_ms=args.window_ms,
+        stride_ms=args.stride_ms,
+        window_batch_size=int(args.window_batch_size),
+        semi_crf_track_batch_size=args.semi_crf_track_batch_size,
+        semi_crf_backend=str(args.semi_crf_backend),
+        semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
+        semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
+        semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
+        semi_crf_sparse_max_span_ms=args.semi_crf_sparse_max_span_ms,
+        instrument_pair_infer_topk=int(args.instrument_pair_infer_topk),
+        instrument_pair_gate_threshold=float(args.instrument_pair_gate_threshold),
+        instrument_pair_max_pairs=int(args.instrument_pair_max_pairs),
+        merge_gap_ms=args.merge_gap_ms,
+        merge_onset_ms=float(args.merge_onset_ms),
+        silence_gate_rms_dbfs=args.silence_gate_rms_dbfs,
+        note_bias=float(args.note_bias),
+        use_boundary_head=not bool(args.no_boundary_head),
+        midi_velocity=int(getattr(args, "velocity", 100)),
+        show_progress=not bool(args.disable_tqdm),
+    )
+
+
+def _midi_export_options_from_args(args: argparse.Namespace) -> MidiExportOptions:
+    return MidiExportOptions(
+        min_midi_note_ms=float(args.min_midi_note_ms),
+        max_midi_melodic_instruments=int(args.max_midi_melodic_instruments),
+        instrument_volumes=dict(args.instrument_volume_map),
+        drum_pitch_aliases=(
+            DEFAULT_DRUM_PITCH_ALIASES
+            if bool(getattr(args, "collapse_crash_cymbals", True))
+            else None
+        ),
+    )
 
 
 def resolve_inference_settings(
@@ -428,59 +466,12 @@ def resolve_inference_settings(
     training_args: dict[str, Any],
     args: argparse.Namespace,
 ) -> InferenceSettings:
-    default_window_ms = int(training_args.get("window_ms") or 8000)
-    window_ms = int(args.window_ms) if args.window_ms is not None else default_window_ms
-    stride_ms = (
-        int(args.stride_ms) if args.stride_ms is not None else max(1, window_ms // 2)
-    )
-    track_batch_size = (
-        int(args.semi_crf_track_batch_size)
-        if args.semi_crf_track_batch_size is not None
-        else int(training_args.get("semi_crf_track_batch_size") or 128)
-    )
-    if window_ms <= 0:
-        raise ValueError("window_ms must be positive")
-    if stride_ms <= 0:
-        raise ValueError("stride_ms must be positive")
-    if track_batch_size <= 0:
-        raise ValueError("semi_crf_track_batch_size must be positive")
-    sparse_max_span_frames = None
-    if args.semi_crf_sparse_max_span_ms is not None:
-        sparse_max_span_frames = max(
-            1,
-            int(
-                math.ceil(
-                    float(args.semi_crf_sparse_max_span_ms)
-                    * float(config.sample_rate)
-                    / 1000.0
-                    / float(config.hop_length)
-                )
-            ),
-        )
-    if int(round(window_ms * int(config.sample_rate) / 1000.0)) < int(config.n_fft):
-        raise ValueError(f"window_ms={window_ms} is too short for n_fft={config.n_fft}")
-    return InferenceSettings(
-        window_ms=window_ms,
-        stride_ms=stride_ms,
-        track_batch_size=track_batch_size,
-        window_batch_size=int(args.window_batch_size),
-        merge_gap_ms=args.merge_gap_ms,
-        merge_onset_ms=float(args.merge_onset_ms),
-        silence_gate_rms_dbfs=args.silence_gate_rms_dbfs,
-        note_bias=float(args.note_bias),
-        disable_tqdm=bool(args.disable_tqdm),
-        use_boundary_head=not bool(args.no_boundary_head),
-        instrument_probability_mode=(
-            "softmax" if training_args.get("instrument_loss_type") == "ce" else "sigmoid"
-        ),
-        semi_crf_backend=str(args.semi_crf_backend),
-        semi_crf_sparse_decode=bool(args.semi_crf_sparse_decode),
-        semi_crf_sparse_topk_per_start=int(args.semi_crf_sparse_topk_per_start),
-        semi_crf_sparse_score_threshold=args.semi_crf_sparse_score_threshold,
-        semi_crf_sparse_max_span_frames=sparse_max_span_frames,
-        instrument_pair_infer_topk=int(args.instrument_pair_infer_topk),
-        instrument_pair_gate_threshold=float(args.instrument_pair_gate_threshold),
-        instrument_pair_max_pairs=int(args.instrument_pair_max_pairs),
+    options = _transcription_options_from_args(args)
+    return resolve_typed_inference_settings(
+        config,
+        training_args,
+        options,
+        allowed_instrument_ids=None,
     )
 
 
@@ -546,18 +537,76 @@ def process_file(
     )
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
     midi.write(str(output_midi_path))
+    _print_transcription_summary(
+        note_count=len(notes),
+        output_midi_path=output_midi_path,
+        instrument_id=instrument_id,
+        settings=settings,
+        inference_stats=stats,
+        midi_stats=midi_stats,
+    )
+
+
+def _process_file_with_transcriber(
+    audio_path: Path,
+    output_midi_path: Path,
+    *,
+    transcriber: Transcriber,
+    options: TranscriptionOptions,
+    midi_options: MidiExportOptions,
+    instrument_id: int | None,
+) -> None:
+    result = transcriber.transcribe(
+        audio_path,
+        options=options,
+        midi_options=midi_options,
+    )
+    output_midi_path.parent.mkdir(parents=True, exist_ok=True)
+    output_midi_path.write_bytes(result.midi_bytes)
+    _print_transcription_result(
+        result,
+        output_midi_path=output_midi_path,
+        instrument_id=instrument_id,
+    )
+
+
+def _print_transcription_result(
+    result: TranscriptionResult,
+    *,
+    output_midi_path: Path,
+    instrument_id: int | None,
+) -> None:
+    _print_transcription_summary(
+        note_count=len(result.notes),
+        output_midi_path=output_midi_path,
+        instrument_id=instrument_id,
+        settings=result.settings,
+        inference_stats=result.inference_stats,
+        midi_stats=result.midi_stats,
+    )
+
+
+def _print_transcription_summary(
+    *,
+    note_count: int,
+    output_midi_path: Path,
+    instrument_id: int | None,
+    settings: InferenceSettings,
+    inference_stats: Mapping[str, int],
+    midi_stats: Mapping[str, int],
+) -> None:
     print(
-        f"wrote {len(notes)} notes: {output_midi_path} "
+        f"wrote {note_count} notes: {output_midi_path} "
         f"instrument={_instrument_label(instrument_id)} "
         f"window_ms={settings.window_ms} stride_ms={settings.stride_ms} "
         f"semi_crf_backend={settings.semi_crf_backend} "
-        f"windows={stats['window_count']} "
-        f"decoded_windows={stats['decoded_window_count']} "
-        f"skipped_silent_windows={stats['skipped_silent_window_count']} "
-        f"selected_pairs={stats['selected_pair_count']} "
-        f"decoded_intervals={stats['decoded_interval_count']} "
-        f"boundary_no_onset={stats['boundary_no_onset_count']} "
-        f"boundary_no_offset={stats['boundary_no_offset_count']} "
+        f"windows={inference_stats['window_count']} "
+        f"decoded_windows={inference_stats['decoded_window_count']} "
+        f"skipped_silent_windows={inference_stats['skipped_silent_window_count']} "
+        f"selected_pairs={inference_stats['selected_pair_count']} "
+        f"decoded_intervals={inference_stats['decoded_interval_count']} "
+        f"boundary_no_onset={inference_stats['boundary_no_onset_count']} "
+        f"boundary_no_offset={inference_stats['boundary_no_offset_count']} "
         f"midi_instruments_before_remap={midi_stats['midi_instrument_count_before_remap']} "
         f"midi_instruments_after_remap={midi_stats['midi_instrument_count_after_remap']} "
         f"remapped_instruments={midi_stats['remapped_instrument_count']} "
@@ -571,31 +620,21 @@ def main() -> None:
     device = resolve_device(args.device)
     if args.semi_crf_backend == "triton" and device.type != "cuda":
         raise ValueError("--semi-crf-backend triton requires a CUDA device")
-    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
-    amp_enabled = bool(args.amp and is_amp_supported(device))
     instrument_id = (
         resolve_instrument_id(args.instrument) if args.instrument is not None else None
     )
     checkpoint_path = _ensure_checkpoint(args.checkpoint, model_type=args.type)
-    model, config, training_args = load_model(checkpoint_path.resolve(), device=device)
-    forward_model = maybe_compile_forward(
-        model,
-        enabled=bool(args.compile),
-        mode=str(args.compile_mode),
+    transcriber = Transcriber.from_checkpoint(
+        checkpoint_path.resolve(),
+        device=device,
+        amp=bool(args.amp),
+        amp_dtype=args.amp_dtype,
+        compile=bool(args.compile),
+        compile_mode=str(args.compile_mode),
     )
-    settings = resolve_inference_settings(config, training_args, args)
-    requested_instrument_ids = (
-        (int(instrument_id),)
-        if instrument_id is not None
-        else args.allowed_instrument_ids
-    )
-    settings = replace(
-        settings,
-        allowed_instrument_ids=filter_supported_instrument_class_ids(
-            requested_instrument_ids,
-            num_model_classes=int(config.num_instrument_classes),
-        ),
-    )
+    _print_checkpoint_load_report(transcriber.load_report)
+    transcription_options = _transcription_options_from_args(args)
+    midi_options = _midi_export_options_from_args(args)
 
     if args.audio_dir is not None:
         audio_dir = args.audio_dir.resolve()
@@ -607,18 +646,13 @@ def main() -> None:
             output_path = output_dir / audio_path.relative_to(audio_dir).with_suffix(
                 ".mid"
             )
-            process_file(
+            _process_file_with_transcriber(
                 audio_path,
                 output_path,
-                model=model,
-                forward_model=forward_model,
-                config=config,
+                transcriber=transcriber,
+                options=transcription_options,
+                midi_options=midi_options,
                 instrument_id=instrument_id,
-                settings=settings,
-                device=device,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-                args=args,
             )
         return
 
@@ -628,18 +662,13 @@ def main() -> None:
         if args.output_midi is not None
         else audio_path.with_suffix(".mid")
     )
-    process_file(
+    _process_file_with_transcriber(
         audio_path,
         output_path,
-        model=model,
-        forward_model=forward_model,
-        config=config,
+        transcriber=transcriber,
+        options=transcription_options,
+        midi_options=midi_options,
         instrument_id=instrument_id,
-        settings=settings,
-        device=device,
-        amp_enabled=amp_enabled,
-        amp_dtype=amp_dtype,
-        args=args,
     )
 
 
