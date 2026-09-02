@@ -58,14 +58,14 @@ uv run python infer.py --audio input_song.wav
 - 🎚️ **ノート単位のベロシティ** — 専用の後処理モデルが分離ステムから強弱を推定
 - 🎯 **ビート、コード、キー** — 任意で使用できる MIDI フレームモデル（デフォルトでは無効）
 - 🧪 **［実験的］楽器分類** — 楽器別 MIDI トラックを出力する 36 クラスのヘッド
-- 🐍 **Python API** — チェックポイントを一度だけ読み込み、ファイルやメモリ上の音声を自分のコードから採譜できる `Transcriber`
+- 🐍 **Python API** — チェックポイントを一度だけ読み込み、ファイルやメモリ上の音声・MIDI を自分のコードから処理できる `Transcriber` と `VelocityEstimator`
 
 <details>
 <summary><b>更新履歴</b></summary>
 
 | 日付 | 更新内容 |
 | --- | --- |
-| 2026-09-02 | 🐍 別の Python プロジェクトへ依存パッケージとしてインストールできるように変更。チェックポイントを一度だけ読み込み、モデルを呼び出し間で再利用する `Transcriber` を追加。 |
+| 2026-09-02 | 🐍 別の Python プロジェクトへ依存パッケージとしてインストールできるように変更。読み込んだモデルを再利用できる `Transcriber` と `VelocityEstimator` を追加。ベロシティ推定が音声末尾の短い区間で失敗する問題を修正。 |
 | 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
 | 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
 | 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
@@ -248,6 +248,29 @@ python infer_velocity.py \
 ```
 
 ステムディレクトリには、`vocals.wav`、`bass.wav`、`drums.wav`、`other.wav` のようにステム名を付けたファイルを置いてください。`--compile-velocity` は、コア AMT の `--compile` とは独立してベロシティバックボーンを regional compile します。学習とデータ準備については [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) を参照してください。
+
+同じモデルを、Python からは `VelocityEstimator` として利用できます。1 回の呼び出しで扱うのは 1 つの論理的なステムです。そのステムに属するノートだけを含む MIDI と、そのステムの音声を渡します。MIDI は tsumugi の出力でも、別の採譜器の出力でも、アプリケーション側で結合したものでもかまいません。トラック名からステムを推測することはなく、ノートの結合や削除も行いません。
+
+```python
+from pathlib import Path
+
+from instrument_agnostic_amt import VelocityEstimator, VelocityOptions
+
+estimator = VelocityEstimator.from_checkpoint("checkpoints/best_velocity_model.pth")
+result = estimator.estimate(
+    midi="stem_midis/song_bass.mid",    # パスまたは MIDI のバイト列
+    audio="separated_stems/bass.wav",   # パスまたは DecodedAudio
+    stem_kind="bass",
+    options=VelocityOptions(loudness_controls="preserve"),
+)
+Path("song_bass_velocity.mid").write_bytes(result.midi_bytes)
+```
+
+`stem_kind` は `bass`、`drums`、`guitar`、`other`、`piano`、`vocals`、`unknown` のいずれかです。出力で変わるのは Note On のベロシティだけで、それ以外のイベント、トラック、tick の位置はすべて維持されます。`loudness_controls` は CC7/CC11 の扱いを決めます。既定の `velocity_only` は CLI と同じく、ノートのあるチャンネルの CC7/CC11 を 127 にします。`preserve` は元のまま残し、`strip` は取り除きます。
+
+ノートを含まない MIDI は、`velocity_applied=False` を付けてそのまま返します。推定は `window_seconds`（既定 8 秒）ごとのウィンドウで行い、各ノートは 1 回だけ推定されます。末尾に長さの足りないウィンドウが残る場合は、末尾に揃えたウィンドウ 1 つ分の音声をモデルに渡します。音声の終了後に始まるノートがある場合や、モデルの CQT が処理できる長さより短い `window_seconds` を指定した場合は `ValueError` になります。Note On を音符として対にできない MIDI、たとえば対応する Note Off のない Note On や、Note On と同じ tick に Note Off がある長さ 0 の音符を含む場合も `ValueError` になるので、呼び出す前に取り除いてください。
+
+`Transcriber` と同じく、`from_checkpoint()` に渡すのは信頼できる既存のローカルチェックポイントで、ダウンロードは行いません。1 つのインスタンスが同時に処理する呼び出しは 1 件です（`VelocityEstimatorBusyError`）。`close()` と `with VelocityEstimator.from_checkpoint(...) as estimator:` の形も `Transcriber` と同じ意味で使えます。
 
 ### 主な引数
 

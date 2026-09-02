@@ -58,14 +58,14 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 - 🎚️ **Per-note velocity** — a dedicated post-processing model estimates dynamics from separated stems
 - 🎯 **Beat, chord, and key** — optional MIDI-frame models, disabled by default
 - 🧪 **[Experimental] Instrument classification** — a 36-class head for per-instrument MIDI tracks
-- 🐍 **Python API** — `Transcriber` loads a checkpoint once and transcribes files or in-memory audio from your own code
+- 🐍 **Python API** — `Transcriber` and `VelocityEstimator` load a checkpoint once and work on files or in-memory audio and MIDI from your own code
 
 <details>
 <summary><b>Changelog</b></summary>
 
 | Date | Update |
 | --- | --- |
-| 2026-09-02 | 🐍 Made tsumugi installable as a dependency of other Python projects. Added `Transcriber`, which loads a checkpoint once and reuses the model across calls. |
+| 2026-09-02 | 🐍 Made tsumugi installable as a dependency of other Python projects. Added `Transcriber` and `VelocityEstimator`, which reuse the loaded model across calls. Fixed velocity estimation failing on a short segment at the end of the audio. |
 | 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
 | 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
 | 2026-08-20 | ⚡ Migrated to uv and PyTorch 2.13. Added MPS inference and AMP/regional compile controls; reduced device synchronization, temporary copies, and repeated stem loading. Two changes intentionally affect output: CUDA attention no longer downcasts implicitly (FP32 is now the default), and V1 window batching propagates decode state in window order. |
@@ -242,6 +242,25 @@ python infer_velocity.py \
 ```
 
 Name files in the stem directory after their stems, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. `--compile-velocity` regionally compiles the velocity backbone independently of the core AMT `--compile`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for training and data preparation.
+
+`VelocityEstimator` runs the same model from Python on one logical stem per call: a MIDI whose notes all belong to that stem, plus the stem's audio. The MIDI may come from tsumugi, from another transcriber, or from a merge done by your application; the estimator never guesses the stem from track names and never merges or drops notes.
+
+```python
+from pathlib import Path
+
+from instrument_agnostic_amt import VelocityEstimator, VelocityOptions
+
+estimator = VelocityEstimator.from_checkpoint("checkpoints/best_velocity_model.pth")
+result = estimator.estimate(
+    midi="stem_midis/song_bass.mid",    # path or MIDI bytes
+    audio="separated_stems/bass.wav",   # path or DecodedAudio
+    stem_kind="bass",
+    options=VelocityOptions(loudness_controls="preserve"),
+)
+Path("song_bass_velocity.mid").write_bytes(result.midi_bytes)
+```
+
+`stem_kind` is one of `bass`, `drums`, `guitar`, `other`, `piano`, `vocals`, or `unknown`. Only Note On velocities change in the output; every other event, track, and tick is preserved. `loudness_controls` handles CC7/CC11: `velocity_only` (the default, as in the CLI) sets them to 127 on note-bearing channels, `preserve` keeps them, and `strip` removes them. A MIDI without notes is returned unchanged with `velocity_applied=False`. Notes are predicted once each in windows of `window_seconds` (default 8 s); a trailing partial window is evaluated on the last full window of audio. A note that starts after the audio ends, or a `window_seconds` shorter than the model's CQT can process, raises `ValueError`. So does a MIDI whose Note On events cannot be paired into notes, such as a Note On without a matching Note Off, or a note whose Note Off falls on the same tick as its Note On; clean those up before calling. Like `Transcriber`, `from_checkpoint()` takes an existing, trusted local checkpoint and never downloads, and one instance handles one call at a time (`VelocityEstimatorBusyError`). `close()` and `with VelocityEstimator.from_checkpoint(...) as estimator:` work the same way as for `Transcriber`.
 
 ### Key arguments
 
