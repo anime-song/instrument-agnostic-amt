@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,10 @@ from instrument_agnostic_amt.beat_chord.decoding.audio_tempo import (
     TempoPriorConfig,
     compute_pulse_curve,
     compute_tempo_prior,
+)
+from instrument_agnostic_amt.beat_chord.decoding.beat_grid import (
+    BeatGridDPConfig,
+    _tempo_transition_penalty,
 )
 from instrument_agnostic_amt.beat_chord.decoding.beat_refine import (
     fit_piecewise_constant_tempo,
@@ -243,6 +249,57 @@ class TestMetricalLevel:
             beat_log_odds=None,
             seconds_per_frame=SECONDS_PER_FRAME,
         ) == -float("inf")
+
+
+class TestTempoTransitionPenalty:
+    def _config(self, **overrides: float) -> BeatGridDPConfig:
+        return BeatGridDPConfig(
+            sample_rate=SAMPLE_RATE, hop_length=HOP_LENGTH, **overrides
+        )
+
+    def test_default_free_band_still_costs_nothing(self) -> None:
+        config = self._config()
+        assert _tempo_transition_penalty(100.0, 105.0, config) == 0.0
+
+    def test_change_penalty_applies_once_past_the_free_band(self) -> None:
+        config = self._config(tempo_free_ratio=1.015, tempo_change_penalty=3.0)
+        small = _tempo_transition_penalty(100.0, 102.0, config)
+        assert small >= 3.0
+        # A drift of 2 % and a real change to 3/4 speed differ by the Huber term
+        # only; the fixed cost makes many small steps expensive relative to one.
+        large = _tempo_transition_penalty(100.0, 133.0, config)
+        assert large > small
+
+    def test_octave_jumps_stay_penalised(self) -> None:
+        config = self._config()
+        octave = _tempo_transition_penalty(100.0, 200.0, config)
+        near = _tempo_transition_penalty(100.0, 170.0, config)
+        assert octave > near
+
+    def test_penalty_is_symmetric_in_log_ratio(self) -> None:
+        config = self._config(tempo_free_ratio=1.015, tempo_change_penalty=1.0)
+        up = _tempo_transition_penalty(100.0, 100.0 * math.e**0.1, config)
+        down = _tempo_transition_penalty(100.0, 100.0 / math.e**0.1, config)
+        assert up == pytest.approx(down)
+
+
+class TestDecoderIntegration:
+    def test_tempo_prior_defaults_leave_the_decoder_unchanged(self) -> None:
+        config = BeatGridDPConfig(sample_rate=SAMPLE_RATE, hop_length=HOP_LENGTH)
+        assert config.tempo_prior_weight == 0.0
+        assert config.tempo_change_penalty == 0.0
+
+    def test_negative_weights_are_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            BeatGridDPConfig(
+                sample_rate=SAMPLE_RATE, hop_length=HOP_LENGTH, tempo_prior_weight=-1.0
+            )
+        with pytest.raises(ValueError):
+            BeatGridDPConfig(
+                sample_rate=SAMPLE_RATE,
+                hop_length=HOP_LENGTH,
+                tempo_change_penalty=-1.0,
+            )
 
 
 class TestMeterRescaling:

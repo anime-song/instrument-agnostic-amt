@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from .audio_tempo import TempoPrior
 from .meter_grouping import (
     group_boundary_log_odds_array,
     score_major_groupings,
@@ -82,6 +83,19 @@ class BeatGridDPConfig:
     leading_trailing_penalty_per_second: float = 0.25
     tempo_free_ratio: float = 1.08
     tempo_huber_ratio: float = 1.20
+    # Absolute tempo evidence from the waveform. Weight zero keeps the decoder
+    # bit-identical to the MIDI-only path, so the prior is opt-in.
+    tempo_prior_weight: float = 0.0
+    # A tempogram measures the pulse it can hear, which in any x/8 meter is the
+    # eighth rather than the notated quarter, so the beat period is what the
+    # prior should be asked about. Set False to score the quarter-note period
+    # instead, which only matches the prior when the beat is a quarter note.
+    tempo_prior_uses_beat_period: bool = True
+    # Fixed cost for changing tempo at all, on top of the size-dependent Huber
+    # term. Without it the only defence against slow drift is a wide free band,
+    # which lets a grid wander a few BPM per segment for free; with it, staying
+    # put is cheap and a genuine tempo change pays once.
+    tempo_change_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -130,6 +144,10 @@ class BeatGridDPConfig:
             raise ValueError("tempo_free_ratio must be at least one")
         if self.tempo_huber_ratio <= self.tempo_free_ratio:
             raise ValueError("tempo_huber_ratio must exceed tempo_free_ratio")
+        if self.tempo_prior_weight < 0.0:
+            raise ValueError("tempo_prior_weight must be non-negative")
+        if self.tempo_change_penalty < 0.0:
+            raise ValueError("tempo_change_penalty must be non-negative")
 
     @property
     def seconds_per_frame(self) -> float:
@@ -525,6 +543,7 @@ def _score_grid_edge(
     meter_den: int,
     bar_count: int,
     config: BeatGridDPConfig,
+    tempo_prior: TempoPrior | None = None,
     grid_builder: Any = _build_regularized_grid,
 ) -> GridEdgeHypothesis | None:
     start_frame = int(candidates[start_candidate_index])
@@ -611,6 +630,21 @@ def _score_grid_edge(
     grouping_score = float(config.group_boundary_score_weight) * raw_grouping_score
     segment_score = -float(config.segment_penalty)
     missing_bar_score = -float(config.missing_bar_penalty) * float(bar_count - 1)
+    quarter_period_frames = beat_period_frames * float(meter_den) / 4.0
+    # Scaled by beat_count so it carries the same weight per beat as the meter
+    # term, which keeps the two weights on a comparable scale.
+    prior_period_frames = (
+        beat_period_frames
+        if config.tempo_prior_uses_beat_period
+        else quarter_period_frames
+    )
+    tempo_prior_score = (
+        0.0
+        if tempo_prior is None or config.tempo_prior_weight <= 0.0
+        else float(config.tempo_prior_weight)
+        * float(beat_count)
+        * tempo_prior.mean_log_prob(start_frame, end_frame, prior_period_frames)
+    )
     score_components = {
         "beat_grid": float(beat_score),
         "offbeat_peaks": float(extra_peak_score),
@@ -620,9 +654,9 @@ def _score_grid_edge(
         "major_grouping": float(grouping_score),
         "segment": float(segment_score),
         "missing_bars": float(missing_bar_score),
+        "tempo_prior": float(tempo_prior_score),
     }
     total_score = float(sum(score_components.values()))
-    quarter_period_frames = beat_period_frames * float(meter_den) / 4.0
     return GridEdgeHypothesis(
         start_candidate_index=int(start_candidate_index),
         end_candidate_index=int(end_candidate_index),
@@ -684,6 +718,7 @@ def _tempo_transition_penalty(
         normalized = (delta - free_delta) / max(1e-6, huber_width)
         huber = 0.5 * normalized**2 if normalized <= 1.0 else normalized - 0.5
         base_penalty = float(config.tempo_transition_weight) * huber
+        base_penalty += float(config.tempo_change_penalty)
 
     octave_distance = abs(delta - _LOG_TWO)
     if octave_distance <= _LOG_TEMPO_OCTAVE_WINDOW:
@@ -958,6 +993,7 @@ def _decode_beats_with_meter_grid_dp_single_pass(
     meter_logits: np.ndarray,
     meter_classes: list[tuple[int, int]],
     config: BeatGridDPConfig,
+    tempo_prior: TempoPrior | None = None,
     edge_cache: (
         dict[tuple[int, int, int, int], GridEdgeHypothesis | None] | None
     ) = None,
@@ -1170,6 +1206,7 @@ def _decode_beats_with_meter_grid_dp_single_pass(
                             meter_den=int(meter_den),
                             bar_count=int(bar_count),
                             config=config,
+                            tempo_prior=tempo_prior,
                             grid_builder=grid_builder,
                         )
                         if edge_cache is not None:
@@ -1433,6 +1470,7 @@ def decode_beats_with_meter_grid_dp(
     meter_classes: list[tuple[int, int]],
     config: BeatGridDPConfig,
     group_boundary_probabilities: np.ndarray | None = None,
+    tempo_prior: TempoPrior | None = None,
 ) -> BeatGridDecodeResult:
     """Decode a stable primary path and selectively overlay repeated 7/4 evidence."""
 
@@ -1444,6 +1482,7 @@ def decode_beats_with_meter_grid_dp(
         meter_logits=meter_logits,
         meter_classes=meter_classes,
         config=config,
+        tempo_prior=tempo_prior,
         edge_cache=edge_cache,
     )
     if not config.additive_auxiliary_pass or (7, 4) not in meter_classes:
@@ -1462,6 +1501,7 @@ def decode_beats_with_meter_grid_dp(
         meter_logits=meter_logits,
         meter_classes=meter_classes,
         config=auxiliary_config,
+        tempo_prior=tempo_prior,
         edge_cache=edge_cache,
     )
     return _overlay_auxiliary_additive_meters(
