@@ -20,7 +20,7 @@ from instrument_agnostic_amt import (
     VelocityEstimatorBusyError,
     VelocityOptions,
 )
-from instrument_agnostic_amt.velocity.inference import VelocityPredictions
+from instrument_agnostic_amt.velocity.windowed import VelocityPredictions
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,

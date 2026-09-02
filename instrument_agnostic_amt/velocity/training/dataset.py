@@ -13,11 +13,9 @@ import torch
 import torchaudio.functional as audio_functional
 from torch.utils.data import Dataset
 
+from ..stems import STEM_CLASS_BY_NAME, STEM_NAMES as STEM_NAMES, UNKNOWN_STEM_CLASS
 
 SplitName = Literal["train", "validation", "test", "all"]
-STEM_NAMES = ("bass", "drums", "guitar", "other", "piano", "vocals")
-STEM_CLASS_BY_NAME = {name: index for index, name in enumerate(STEM_NAMES)}
-UNKNOWN_STEM_CLASS = len(STEM_NAMES)
 
 
 @dataclass(frozen=True)

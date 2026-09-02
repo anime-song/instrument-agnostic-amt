@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import mido
 
+from .midi_events import remove_control_changes
+
 
 @dataclass(slots=True)
 class VelocityNoteRecord:
@@ -226,20 +228,7 @@ def strip_loudness_controls(midi: mido.MidiFile) -> None:
     """Remove CC7/CC11 while retaining every remaining event's absolute tick."""
 
     for track in midi.tracks:
-        rebuilt_track = mido.MidiTrack()
-        carried_delta = 0
-        for message in track:
-            if (
-                message.type == "control_change"
-                and int(message.control) in (7, 11)
-            ):
-                carried_delta += int(message.time)
-                continue
-            rebuilt_track.append(message.copy(time=int(message.time) + carried_delta))
-            carried_delta = 0
-        if carried_delta:
-            rebuilt_track.append(mido.MetaMessage("end_of_track", time=carried_delta))
-        track[:] = rebuilt_track
+        track[:] = remove_control_changes(track, control_numbers=(7, 11))
 
 
 def replace_fixed_loudness_controls(midi: mido.MidiFile) -> None:

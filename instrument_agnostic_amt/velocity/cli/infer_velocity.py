@@ -14,11 +14,11 @@ import torch
 import torchaudio.functional as audio_functional
 
 from ...runtime import maybe_compile_forward, resolve_device
-from ..inference import VelocityNoteQuery, predict_velocity_values
-from ..midi import apply_loudness_controls
+from ..midi_template import apply_loudness_controls
 from ..modeling.checkpoints import load_velocity_checkpoint
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
-from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ..stems import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ..windowed import VelocityNoteQuery, predict_velocity_values
 
 HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"

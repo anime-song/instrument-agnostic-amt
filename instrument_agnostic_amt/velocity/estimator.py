@@ -11,13 +11,11 @@ from typing import Literal
 
 import mido
 import torch
-import torchaudio.functional as audio_functional
 
-from ..inference.audio import load_audio
+from ..inference.audio import DecodedAudio, prepare_waveform
+from ..inference.loading import resolve_checkpoint_path
 from ..runtime import empty_device_cache, maybe_compile_forward, resolve_device
-from ..transcription import DecodedAudio
-from .inference import VelocityNoteQuery, predict_velocity_values
-from .midi import (
+from .midi_template import (
     apply_velocities_to_template,
     note_records_from_mido,
 )
@@ -26,7 +24,8 @@ from .modeling.checkpoints import (
     load_velocity_checkpoint,
 )
 from .modeling.model import VelocityModelConfig, VelocityPredictionModel
-from .training.dataset import STEM_CLASS_BY_NAME, UNKNOWN_STEM_CLASS
+from .stems import STEM_CLASS_BY_NAME, UNKNOWN_STEM_CLASS
+from .windowed import VelocityNoteQuery, predict_velocity_values
 
 
 class VelocityEstimatorBusyError(RuntimeError):
@@ -104,9 +103,7 @@ class VelocityEstimator:
     ) -> VelocityEstimator:
         """Load one trusted local velocity checkpoint without downloading files."""
 
-        resolved_checkpoint = Path(checkpoint_path).expanduser().resolve(strict=True)
-        if not resolved_checkpoint.is_file():
-            raise FileNotFoundError(f"Checkpoint is not a file: {resolved_checkpoint}")
+        resolved_checkpoint = resolve_checkpoint_path(checkpoint_path)
         target_device = resolve_device(device)
         model, config, report = load_velocity_checkpoint(
             resolved_checkpoint,
@@ -278,22 +275,11 @@ class VelocityEstimator:
         )
 
     def _prepare_audio(self, audio: str | Path | DecodedAudio):
-        if isinstance(audio, DecodedAudio):
-            waveform = audio.samples.detach()
-            if int(waveform.shape[0]) == 1:
-                waveform = waveform.repeat(2, 1)
-            if int(audio.sample_rate) != int(self._config.sample_rate):
-                waveform = audio_functional.resample(
-                    waveform,
-                    int(audio.sample_rate),
-                    int(self._config.sample_rate),
-                )
-        else:
-            waveform = load_audio(
-                Path(audio),
-                target_sample_rate=int(self._config.sample_rate),
-            )
-        return waveform.contiguous().numpy()
+        waveform = prepare_waveform(
+            audio,
+            target_sample_rate=int(self._config.sample_rate),
+        )
+        return waveform.numpy()
 
     @staticmethod
     def _read_midi_bytes(midi: str | Path | bytes) -> bytes:

@@ -15,7 +15,7 @@ from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     predict_velocity_for_midi,
     predict_velocity_for_stem_midis,
 )
-from instrument_agnostic_amt.velocity.midi import apply_loudness_controls
+from instrument_agnostic_amt.velocity.midi_template import apply_loudness_controls
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
