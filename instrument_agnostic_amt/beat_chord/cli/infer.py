@@ -2,7 +2,7 @@ import dataclasses
 import argparse
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 # Windowsでの PosixPath アンピクル対策
 # Linux環境等で保存された PosixPath を含むチェックポイントを Windows で読み込めるようにする
@@ -22,6 +22,12 @@ from ..chord_vocabulary import (
     load_chord_quality_map_json,
     normalize_chord_quality_map,
 )
+from ..decoding.audio_refinement import (
+    AudioRefinementConfig,
+    analyze_audio,
+    decode_beats_with_audio,
+)
+from ..decoding.audio_tempo import TempoPriorConfig
 from ..decoding.beat_grid import (
     BeatGridDPConfig,
     MeterGridSegment,
@@ -167,6 +173,14 @@ class BeatChordInferenceConfig:
     quality_json: Path | None = None
     beat_decoder_cache_path: Path | None = None
     beat_mapped_ticks_per_beat: int = 480
+    # Optional source audio. The beat model only ever sees a MIDI frame roll, so
+    # supplying the waveform is what lets the decoder use absolute tempo
+    # evidence; without it every audio-driven pass is skipped.
+    audio_path: Path | None = None
+    audio_refinement: AudioRefinementConfig | None = None
+    tempo_prior_config: TempoPriorConfig = dataclasses.field(
+        default_factory=TempoPriorConfig
+    )
 
 @dataclasses.dataclass
 class BeatChordInferenceResult:
@@ -186,6 +200,72 @@ class BeatChordInferenceResult:
     hop_length: int = 0
     sample_rate: int = 0
     meter_classes: list[tuple[int, int]] | None = None
+    # Maps pre-refinement seconds onto the refined grid. Bar boundaries are
+    # reported as frames, so they have to travel through the same map as the
+    # beats or the export cannot line the two up.
+    beat_time_warp: Callable[[float], float] | None = None
+    metrical_level_ratio: float = 1.0
+    tempo_segment_count: int = 0
+
+
+def _warp_seconds(
+    warp: Callable[[float], float] | None, seconds: float
+) -> float:
+    return float(seconds) if warp is None else float(warp(float(seconds)))
+
+
+def _load_audio_tempo_evidence(
+    audio_path: Path,
+    *,
+    sample_rate: int,
+    hop_length: int,
+    frame_count: int,
+    tempo_prior_config: TempoPriorConfig,
+):
+    """Read the source audio at the beat model's rate and analyse its tempo."""
+
+    import soundfile as sf
+
+    waveform, source_rate = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    waveform = np.asarray(waveform, dtype=np.float32)
+    if waveform.ndim > 1:
+        waveform = waveform.mean(axis=1)
+    if int(source_rate) != int(sample_rate):
+        import librosa
+
+        waveform = librosa.resample(
+            waveform, orig_sr=int(source_rate), target_sr=int(sample_rate)
+        )
+    return analyze_audio(
+        waveform,
+        sample_rate=int(sample_rate),
+        hop_length=int(hop_length),
+        frame_count=int(frame_count),
+        config=tempo_prior_config,
+    )
+
+
+def build_meter_segment_specs(
+    result: "BeatChordInferenceResult",
+) -> list[MeterSegmentSpec]:
+    """Bar spans in seconds, moved onto the refined grid when there is one."""
+
+    seconds_per_frame = result.hop_length / result.sample_rate
+    return [
+        MeterSegmentSpec(
+            start_seconds=_warp_seconds(
+                result.beat_time_warp, segment.start_frame * seconds_per_frame
+            ),
+            end_seconds=_warp_seconds(
+                result.beat_time_warp, segment.end_frame * seconds_per_frame
+            ),
+            numerator=segment.meter_num,
+            denominator=segment.meter_den,
+            bar_count=segment.bar_count,
+            score=segment.score,
+        )
+        for segment in result.meter_segments
+    ]
 
 
 def run_beat_chord_inference(
@@ -366,7 +446,11 @@ def run_beat_chord_inference(
 
     meter_segments = []
     decoder_diagnostics = {}
-    
+    refined_beat_seconds: list[float] | None = None
+    beat_time_warp: Callable[[float], float] | None = None
+    metrical_level_ratio = 1.0
+    tempo_segment_count = 0
+
     if beat_decode_mode == "grid" and meter_classes is not None:
         dp_config = BeatGridDPConfig(
             hop_length=hop_length,
@@ -393,19 +477,57 @@ def run_beat_chord_inference(
             minimum_meter_run_quarter_notes=config.grid_minimum_meter_run_quarter_notes,
             octave_jump_penalty=config.grid_octave_jump_penalty,
         )
-        beat_grid_result = decode_beats_with_meter_grid_dp(
+        audio_evidence = None
+        if config.audio_path is not None:
+            try:
+                audio_evidence = _load_audio_tempo_evidence(
+                    config.audio_path,
+                    sample_rate=sample_rate,
+                    hop_length=hop_length,
+                    frame_count=total_frames,
+                    tempo_prior_config=config.tempo_prior_config,
+                )
+            except Exception as error:  # noqa: BLE001 - audio is an optional aid
+                print(f"Warning: audio tempo analysis skipped: {error}")
+
+        # Without audio every pass that needs it is inert, and the one that does
+        # not -- the piecewise tempo fit -- would silently change results for
+        # callers who never asked for it. Default to the historical behaviour
+        # unless the caller supplies audio or an explicit refinement config.
+        if config.audio_refinement is not None:
+            refinement = config.audio_refinement
+        elif audio_evidence is not None:
+            refinement = AudioRefinementConfig()
+        else:
+            refinement = AudioRefinementConfig(
+                tempo_prior_weight=0.0,
+                select_metrical_level=False,
+                snap_to_pulse=False,
+                piecewise_tempo=False,
+            )
+        refined = decode_beats_with_audio(
             beat_probabilities=beat_probabilities_numpy,
             downbeat_probabilities=downbeat_probabilities_numpy,
             group_boundary_probabilities=group_boundary_probabilities_numpy,
             meter_logits=meter_logits_numpy,
             meter_classes=meter_classes,
             config=dp_config,
+            evidence=audio_evidence,
+            refinement=refinement,
         )
+        beat_grid_result = refined.decode
         decoder_diagnostics = result_to_diagnostics(beat_grid_result)
+        decoder_diagnostics["audio_tempo_used"] = audio_evidence is not None
+        decoder_diagnostics["metrical_level_ratio"] = refined.metrical_level_ratio
+        decoder_diagnostics["tempo_segment_count"] = refined.tempo_segment_count
         if beat_grid_result.beat_frames:
             beat_frame_indices = list(beat_grid_result.beat_frames)
             downbeat_frame_indices = list(beat_grid_result.downbeat_frames)
             meter_segments = list(beat_grid_result.meter_segments)
+            refined_beat_seconds = list(refined.beat_seconds)
+            beat_time_warp = refined.warp
+            metrical_level_ratio = refined.metrical_level_ratio
+            tempo_segment_count = refined.tempo_segment_count
         else:
             beat_decode_mode = "grid_legacy"
             
@@ -426,8 +548,17 @@ def run_beat_chord_inference(
         beat_frame_indices = detect_peaks(beat_probabilities_numpy, threshold=config.beat_threshold)
         meter_segments = []
 
-    beat_times = [float(f * hop_length / sample_rate) for f in beat_frame_indices]
-    downbeat_times = [float(f * hop_length / sample_rate) for f in downbeat_frame_indices]
+    if refined_beat_seconds is not None and len(refined_beat_seconds) == len(
+        beat_frame_indices
+    ):
+        beat_times = [float(value) for value in refined_beat_seconds]
+    else:
+        beat_times = [float(f * hop_length / sample_rate) for f in beat_frame_indices]
+        beat_time_warp = None
+    downbeat_times = [
+        _warp_seconds(beat_time_warp, float(f * hop_length / sample_rate))
+        for f in downbeat_frame_indices
+    ]
     
     mapped_downbeat_frame_indices = sorted(
         {
@@ -442,7 +573,7 @@ def run_beat_chord_inference(
     elif downbeat_frame_indices:
         mapped_downbeat_frame_indices = list(downbeat_frame_indices)
     mapped_downbeat_times = [
-        float(frame * hop_length / sample_rate)
+        _warp_seconds(beat_time_warp, float(frame * hop_length / sample_rate))
         for frame in mapped_downbeat_frame_indices
     ]
 
@@ -491,6 +622,9 @@ def run_beat_chord_inference(
         hop_length=hop_length,
         sample_rate=sample_rate,
         meter_classes=meter_classes,
+        beat_time_warp=beat_time_warp,
+        metrical_level_ratio=metrical_level_ratio,
+        tempo_segment_count=tempo_segment_count,
     )
 
 
@@ -510,12 +644,19 @@ def predict_beat_chord_for_midi(
     preloaded_model: torch.nn.Module | None = None,
     preloaded_model_config: MidiFrameModelConfig | None = None,
     preloaded_metadata: Mapping[str, object] | None = None,
+    audio_path: Path | str | None = None,
+    audio_refinement: AudioRefinementConfig | None = None,
 ) -> Path:
     """指定された MIDI 入力に対して beat/chord/key を推論し、テンポマップ書き込み済み MIDI を出力する。
 
     ``grid_jit=None`` はNumbaが利用できる環境で、Python実装と同値な拍グリッド
     kernelを自動選択する。preloaded引数は長寿命のColabセッションでモデルを
     再利用し、同じcheckpointを実行ごとに読み直さないために使う。
+
+    ``audio_path`` を渡すと、元音源から絶対テンポの手がかり (tempogram と
+    PLP) を取り出してビートデコードに使う。beat モデルは MIDI ロールしか
+    見ないため、倍テンポ/半テンポとフレーム量子化由来のテンポ揺れは
+    この情報がないと原理的に直せない。省略時は従来どおり MIDI のみで動く。
     """
     input_midi_file = Path(input_midi_path).resolve()
     if not input_midi_file.exists():
@@ -561,6 +702,8 @@ def predict_beat_chord_for_midi(
     # Defaults in original function
     config = BeatChordInferenceConfig(
         device=device_obj,
+        audio_path=None if audio_path is None else Path(audio_path),
+        audio_refinement=audio_refinement,
         beat_decode_mode=beat_decode_mode,
         window_ms_override=window_ms_override,
         stride_ms_override=stride_ms_override,
@@ -592,17 +735,7 @@ def predict_beat_chord_for_midi(
         source_midi_path=input_midi_file,
         output_midi_path=output_midi_file,
         beat_times=result.beat_times,
-        meter_segments=[
-            MeterSegmentSpec(
-                start_seconds=segment.start_frame * result.hop_length / result.sample_rate,
-                end_seconds=segment.end_frame * result.hop_length / result.sample_rate,
-                numerator=segment.meter_num,
-                denominator=segment.meter_den,
-                bar_count=segment.bar_count,
-                score=segment.score,
-            )
-            for segment in result.meter_segments
-        ],
+        meter_segments=build_meter_segment_specs(result),
         chord_segments=result.chord_segments,
         key_segments=result.key_segments,
         duration_seconds=result.duration_seconds,
@@ -1439,17 +1572,7 @@ def main() -> None:
             source_midi_path=args.midi_path,
             output_midi_path=beat_mapped_midi_path,
             beat_times=result.beat_times,
-            meter_segments=[
-                MeterSegmentSpec(
-                    start_seconds=segment.start_frame * result.hop_length / result.sample_rate,
-                    end_seconds=segment.end_frame * result.hop_length / result.sample_rate,
-                    numerator=segment.meter_num,
-                    denominator=segment.meter_den,
-                    bar_count=segment.bar_count,
-                    score=segment.score,
-                )
-                for segment in result.meter_segments
-            ],
+            meter_segments=build_meter_segment_specs(result),
             chord_segments=result.chord_segments,
             key_segments=result.key_segments,
             duration_seconds=result.duration_seconds,
@@ -1472,8 +1595,8 @@ def main() -> None:
         "mapped_downbeats": result.mapped_downbeat_times,
         "meters": [
             {
-                "start": round(segment.start_frame * result.hop_length / result.sample_rate, 3),
-                "end": round(segment.end_frame * result.hop_length / result.sample_rate, 3),
+                "start": round(_warp_seconds(result.beat_time_warp, segment.start_frame * result.hop_length / result.sample_rate), 3),
+                "end": round(_warp_seconds(result.beat_time_warp, segment.end_frame * result.hop_length / result.sample_rate), 3),
                 "meter_index": int(segment.meter_index),
                 "meter": f"{segment.meter_num}/{segment.meter_den}",
                 "bar_count": int(segment.bar_count),

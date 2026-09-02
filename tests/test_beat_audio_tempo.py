@@ -7,6 +7,9 @@ import math
 import numpy as np
 import pytest
 
+from instrument_agnostic_amt.beat_chord.decoding.audio_refinement import (
+    rescale_decode_to_level,
+)
 from instrument_agnostic_amt.beat_chord.decoding.audio_tempo import (
     TempoPrior,
     TempoPriorConfig,
@@ -15,6 +18,8 @@ from instrument_agnostic_amt.beat_chord.decoding.audio_tempo import (
 )
 from instrument_agnostic_amt.beat_chord.decoding.beat_grid import (
     BeatGridDPConfig,
+    BeatGridDecodeResult,
+    MeterGridSegment,
     _tempo_transition_penalty,
 )
 from instrument_agnostic_amt.beat_chord.decoding.beat_refine import (
@@ -312,3 +317,74 @@ class TestMeterRescaling:
     def test_non_integral_or_odd_denominators_are_refused(self) -> None:
         assert rescale_meter(3, 4, 0.5) is None  # 1.5/2 is not a meter
         assert rescale_meter(4, 4, 1.5) is None  # 6/6 has no MIDI denominator
+
+
+class TestDecodeRescaling:
+    """A restated decode must keep its bars, downbeats and quarter tempo."""
+
+    def test_rescaled_decode_preserves_bars_and_quarter_tempo(self) -> None:
+        # Two bars of 8/8, one beat every 10 frames.
+        segments = tuple(
+            MeterGridSegment(
+                start_frame=bar * 80,
+                end_frame=(bar + 1) * 80,
+                meter_index=0,
+                meter_num=8,
+                meter_den=8,
+                bar_count=1,
+                mapped_downbeat_frames=(bar * 80,),
+                score=1.0,
+                quarter_note_bpm=120.0,
+            )
+            for bar in range(2)
+        )
+        decode = BeatGridDecodeResult(
+            beat_frames=tuple(range(0, 160, 10)),
+            downbeat_frames=(0, 80),
+            meter_segments=segments,
+            raw_downbeat_candidates=(),
+            all_boundary_candidates=(),
+            rejected_downbeat_candidates=(),
+            inferred_downbeat_frames=(),
+            total_score=0.0,
+            confidence_margin=None,
+        )
+
+        rescaled = rescale_decode_to_level(decode, 0.5)
+
+        assert rescaled is not None
+        assert [(s.meter_num, s.meter_den) for s in rescaled.meter_segments] == [
+            (4, 4),
+            (4, 4),
+        ]
+        # A bar still spans the same frames and still holds a whole number of
+        # beats -- half as many, each twice as long.
+        assert [s.start_frame for s in rescaled.meter_segments] == [0, 80]
+        assert [s.quarter_note_bpm for s in rescaled.meter_segments] == [120.0, 120.0]
+        assert list(rescaled.beat_frames) == list(range(0, 160, 20))
+
+    def test_a_meter_that_cannot_scale_is_refused(self) -> None:
+        decode = BeatGridDecodeResult(
+            beat_frames=tuple(range(0, 120, 10)),
+            downbeat_frames=(0,),
+            meter_segments=(
+                MeterGridSegment(
+                    start_frame=0,
+                    end_frame=30,
+                    meter_index=0,
+                    meter_num=3,
+                    meter_den=4,
+                    bar_count=1,
+                    mapped_downbeat_frames=(0,),
+                    score=1.0,
+                ),
+            ),
+            raw_downbeat_candidates=(),
+            all_boundary_candidates=(),
+            rejected_downbeat_candidates=(),
+            inferred_downbeat_frames=(),
+            total_score=0.0,
+            confidence_margin=None,
+        )
+
+        assert rescale_decode_to_level(decode, 0.5) is None

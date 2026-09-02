@@ -574,6 +574,7 @@ def run_stem_separated_transcription(
     velocity_checkpoint_path: Path | str | None = None,
     predict_beat_chord: bool = False,
     beat_chord_checkpoint_path: Path | str | None = None,
+    beat_chord_use_audio: bool = True,
     merge_onset_ms: float = 20.0,
     device: torch.device | str | None = "auto",
     amp: bool = False,
@@ -866,6 +867,10 @@ def run_stem_separated_transcription(
                 preloaded_model=beat_chord_model,
                 preloaded_model_config=beat_chord_config,
                 preloaded_metadata=beat_chord_metadata,
+                # The beat model reads a MIDI roll, which cannot tell a
+                # quarter-note pulse from the eighths above it. Handing the
+                # decoder the original mix restores that evidence.
+                audio_path=audio_file if beat_chord_use_audio else None,
             )
             merged_midi_path = beat_chord_midi_path
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
