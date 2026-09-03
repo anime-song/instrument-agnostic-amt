@@ -15,7 +15,12 @@ import torch
 import torchaudio.functional as audio_functional
 from tqdm.auto import tqdm
 
-from ...runtime import maybe_compile_forward, resolve_device
+from ...runtime import (
+    is_amp_supported,
+    maybe_compile_forward,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
 from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
@@ -418,6 +423,8 @@ def predict_velocity_for_stem_midis(
     preloaded_config: VelocityModelConfig | None = None,
     preloaded_forward: Any | None = None,
     preloaded_waveforms: Mapping[str, torch.Tensor] | None = None,
+    amp: bool = False,
+    amp_dtype: str | torch.dtype | None = None,
 ) -> Path | dict[str, Path]:
     """各ステムの音声とMIDIを対応づけ、ノートVelocityを予測して反映する。
 
@@ -425,8 +432,14 @@ def predict_velocity_for_stem_midis(
     同じ基準でノートVelocityを唯一の可変音量表現にする。template_midi_pathを
     指定した場合は、そのMIDIのNote Onイベントへ予測値だけを書き戻す。
     preloaded_waveforms にはconfig.sample_rateへresample済みのCPU float32ステレオ波形を渡せる。
+    ampを立てると窓ごとのbackboneをautocastで走らせる。予測値はfloat32へ戻してから
+    丸めるため、AMP由来の差はvelocity数段階に収まる。
     """
     target_device = resolve_device(device)
+    amp_enabled = bool(amp and is_amp_supported(target_device))
+    resolved_amp_dtype = (
+        amp_dtype if isinstance(amp_dtype, torch.dtype) else resolve_amp_dtype(target_device, amp_dtype)
+    )
     if max_melodic_instruments < 0:
         raise ValueError("max_melodic_instruments must be nonnegative")
     if window_seconds <= 0:
@@ -628,14 +641,21 @@ def predict_velocity_for_stem_midis(
             }
             if configure_stem_gain:
                 forward_kwargs["include_stem_gain"] = bool(apply_stem_gain_to_cc7)
-            outputs = forward_model(sub_audio, **forward_kwargs)
+            with torch.amp.autocast(
+                device_type=target_device.type,
+                dtype=resolved_amp_dtype,
+                enabled=amp_enabled,
+            ):
+                outputs = forward_model(sub_audio, **forward_kwargs)
 
-            velocity_expected = outputs["velocity_expected"].squeeze(0).cpu().numpy()
+            # autocast下ではheadの出力もbf16/fp16になる。numpyはbf16を扱えず、
+            # 丸め位置もdtypeで変わるため、float32へ戻してから量子化する。
+            velocity_expected = outputs["velocity_expected"].squeeze(0).float().cpu().numpy()
             velocity_clamped = np.clip(np.round(velocity_expected), 1, 127).astype(np.int32)
             predicted_velocities[indices_in_win] = velocity_clamped
 
             if "stem_gain_db" in outputs:
-                stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
+                stem_gain_np = outputs["stem_gain_db"].squeeze(0).float().cpu().numpy()
                 predicted_stem_gains_db_list.append(stem_gain_np)
             del outputs
 

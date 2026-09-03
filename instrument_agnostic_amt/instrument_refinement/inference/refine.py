@@ -25,7 +25,12 @@ from tqdm.auto import tqdm
 
 from ...inference.audio import load_audio
 from ...inference.instruments import resolve_stem_instrument_class_ids
-from ...runtime import copy_tensors_to_cpu_once, resolve_device
+from ...runtime import (
+    copy_tensors_to_cpu_once,
+    is_amp_supported,
+    resolve_amp_dtype,
+    resolve_device,
+)
 from ...taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -132,6 +137,8 @@ def _scan_windows(
     window_batch_size: int,
     device: torch.device,
     disable_tqdm: bool,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> _WindowScan:
     """音声を窓に切ってモデルを流し、窓をまたいで平均する。
 
@@ -212,36 +219,43 @@ def _scan_windows(
         for batch_index, indices in enumerate(indices_batch):
             note_mask[batch_index, : len(indices)] = True
 
-        outputs = model(
-            torch.stack(windows).to(device),
-            valid_audio_frames=torch.tensor(
-                valid_frames_batch,
-                device=device,
-            ),
-            note_start_seconds=note_start_batch.to(device),
-            note_end_seconds=note_end_batch.to(device),
-            note_pitch=note_pitch_batch.to(device),
-            # AMT が付けた楽器は意図的に渡さない（-1）。音声から判断させるため。
-            note_prior_class=torch.full(
-                (len(batch_starts), max_notes),
-                -1,
-                dtype=torch.long,
-                device=device,
-            ),
-            note_confidence=torch.ones(
-                len(batch_starts),
-                max_notes,
-                device=device,
-            ),
-            note_mask=note_mask.to(device),
-            stem_context_id=torch.full(
-                (len(batch_starts),),
-                context_id,
-                dtype=torch.long,
-                device=device,
-            ),
-            window_seconds=window_seconds,
-        )
+        # backboneのCQT/convとTransformerが窓ごとの支配項なので、AMTと同じ
+        # autocastをかける。集約はこの直後にfloat32へ戻してから行う。
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            outputs = model(
+                torch.stack(windows).to(device),
+                valid_audio_frames=torch.tensor(
+                    valid_frames_batch,
+                    device=device,
+                ),
+                note_start_seconds=note_start_batch.to(device),
+                note_end_seconds=note_end_batch.to(device),
+                note_pitch=note_pitch_batch.to(device),
+                # AMT が付けた楽器は意図的に渡さない（-1）。音声から判断させるため。
+                note_prior_class=torch.full(
+                    (len(batch_starts), max_notes),
+                    -1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                note_confidence=torch.ones(
+                    len(batch_starts),
+                    max_notes,
+                    device=device,
+                ),
+                note_mask=note_mask.to(device),
+                stem_context_id=torch.full(
+                    (len(batch_starts),),
+                    context_id,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                window_seconds=window_seconds,
+            )
         (
             window_logits_tensor,
             window_embeddings_tensor,
@@ -506,6 +520,8 @@ def refine_midi_instruments(
     preloaded_model: InstrumentRefinementModel | None = None,
     preloaded_config: InstrumentRefinementConfig | None = None,
     preloaded_waveform: torch.Tensor | None = None,
+    amp: bool = False,
+    amp_dtype: str | torch.dtype | None = None,
 ) -> dict[str, Any]:
     """MIDI の楽器を、対応するステム音声から推論し直す。
 
@@ -522,6 +538,8 @@ def refine_midi_instruments(
         use_stem_mask: stem_name に基づく候補の絞り込みを行うか。
         preloaded_model/preloaded_config: 読み込み済みモデルを使い回す場合に両方渡す。
         preloaded_waveform: config.sample_rateへresample済みのCPU float32ステレオ波形。
+        amp: 窓ごとの backbone を autocast で走らせるか。CUDA / MPS でのみ有効。
+        amp_dtype: "fp16" / "bf16" / torch.dtype。省略時はデバイス既定を使う。
 
     Returns:
         予測結果とデバッグ情報を含む dict。output_json_path を渡すと同じ内容を保存する。
@@ -539,6 +557,12 @@ def refine_midi_instruments(
     if not audio_file.is_file() or not midi_file.is_file():
         raise FileNotFoundError("audio and MIDI paths must both exist")
     target_device = resolve_device(device)
+    amp_enabled = bool(amp and is_amp_supported(target_device))
+    resolved_amp_dtype = (
+        amp_dtype
+        if isinstance(amp_dtype, torch.dtype)
+        else resolve_amp_dtype(target_device, amp_dtype)
+    )
 
     # 1. モデルを用意する。ステムごとに呼ばれる用途では読み込み済みモデルを受け取る。
     model, config = _resolve_model(checkpoint_path, preloaded_model, preloaded_config, device=target_device)
@@ -570,6 +594,8 @@ def refine_midi_instruments(
         window_batch_size=int(window_batch_size),
         device=target_device,
         disable_tqdm=disable_tqdm,
+        amp_enabled=amp_enabled,
+        amp_dtype=resolved_amp_dtype,
     )
 
     # 4. 音色埋め込みでノートをまとめる。single モードでは全ノートを 1 クラスタ扱い。

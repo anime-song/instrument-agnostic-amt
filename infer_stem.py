@@ -454,6 +454,8 @@ def refine_stem_instrument_midis(
     window_batch_size: int = 1,
     disable_tqdm: bool = True,
     waveform_loader: _WaveformLoader | None = None,
+    amp: bool = False,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, Path]:
     """ステム音声を使って各ステム MIDI の楽器ラベルを付け直す。
 
@@ -521,6 +523,8 @@ def refine_stem_instrument_midis(
             preloaded_model=refinement_model,
             preloaded_config=refinement_config,
             preloaded_waveform=preloaded_waveform,
+            amp=amp,
+            amp_dtype=amp_dtype,
         )
         refined_midi_paths[stem_name] = refined_midi
 
@@ -584,7 +588,14 @@ def run_stem_separated_transcription(
     compile_mode: str = "default",
     semi_crf_backend: str = "torch",
 ) -> dict[str, object]:
-    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。"""
+    """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
+
+    amp は AMT・楽器再ラベリング・Velocity の 3 段の backbone に共通で効く。
+    どの段も窓ごとの backbone が支配項で、AMP の有無で 2〜3 割変わる。
+    Beat/Chord だけは FP32 のままにしている。こちらは推論時間の大半が
+    Python 側のビート格子 DP で、backbone を速くしても全体はほとんど動かない
+    一方、確率がそのまま離散的なメーター判定に入るため。
+    """
     audio_file = Path(audio_path)
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
@@ -770,6 +781,8 @@ def run_stem_separated_transcription(
                 window_batch_size=window_batch_size,
                 disable_tqdm=True,
                 waveform_loader=load_run_waveform,
+                amp=amt_amp_enabled,
+                amp_dtype=amt_amp_dtype,
             )
             if refined_midi_paths:
                 stem_midi_paths.update(refined_midi_paths)
@@ -834,6 +847,8 @@ def run_stem_separated_transcription(
                 preloaded_config=velocity_config,
                 preloaded_forward=velocity_forward,
                 preloaded_waveforms=preloaded_velocity_waveforms,
+                amp=amt_amp_enabled,
+                amp_dtype=amt_amp_dtype,
             )
             merged_midi_path = velocity_midi_path
             print("Updated merged MIDI with predicted velocities:", merged_midi_path)
