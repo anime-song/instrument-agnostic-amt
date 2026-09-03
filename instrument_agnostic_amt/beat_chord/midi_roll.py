@@ -18,10 +18,7 @@ def _normalize_instrument_name(name: str) -> str:
     return name.strip().lower().replace("-", "_").replace(" ", "_")
 
 
-_CLASS_NAME_TO_ID = {
-    _normalize_instrument_name(class_name): idx
-    for idx, class_name in enumerate(INSTRUMENT_CLASSES)
-}
+_CLASS_NAME_TO_ID = {_normalize_instrument_name(class_name): idx for idx, class_name in enumerate(INSTRUMENT_CLASSES)}
 
 
 class MidiReadError(RuntimeError):
@@ -58,12 +55,7 @@ def _build_tempo_seconds(
     for tick, tempo in tempo_events:
         tick = int(tick)
         tempo = int(tempo)
-        current_seconds += (
-            float(tick - previous_tick)
-            * float(previous_tempo)
-            / 1_000_000.0
-            / float(ticks_per_beat)
-        )
+        current_seconds += float(tick - previous_tick) * float(previous_tempo) / 1_000_000.0 / float(ticks_per_beat)
         start_ticks.append(tick)
         start_seconds.append(current_seconds)
         tempos.append(tempo)
@@ -84,10 +76,7 @@ def _tick_to_seconds(
 
     index = max(0, bisect_right(start_ticks, int(tick)) - 1)
     return float(start_seconds[index]) + (
-        float(int(tick) - int(start_ticks[index]))
-        * float(tempos[index])
-        / 1_000_000.0
-        / float(ticks_per_beat)
+        float(int(tick) - int(start_ticks[index])) * float(tempos[index]) / 1_000_000.0 / float(ticks_per_beat)
     )
 
 
@@ -124,9 +113,7 @@ def _load_midi_events_with_mido(
             key = (channel, pitch)
             is_note_on = message.type == "note_on" and int(message.velocity) > 0
             if is_note_on:
-                active_notes.setdefault(key, []).append(
-                    (tick, int(program_by_channel.get(channel, 0)), channel == 9)
-                )
+                active_notes.setdefault(key, []).append((tick, int(program_by_channel.get(channel, 0)), channel == 9))
                 continue
 
             starts = active_notes.get(key)
@@ -171,9 +158,7 @@ def _load_midi_events_with_symusic(
     from symusic import Score
 
     score = Score(midi_path_str)
-    tempo_events = _dedupe_tempo_events(
-        [(int(tempo.time), int(tempo.mspq)) for tempo in score.tempos]
-    )
+    tempo_events = _dedupe_tempo_events([(int(tempo.time), int(tempo.mspq)) for tempo in score.tempos])
     start_ticks, start_seconds, tempos = _build_tempo_seconds(
         tempo_events=tempo_events,
         ticks_per_beat=int(score.tpq),
@@ -209,9 +194,7 @@ def _load_midi_events_with_symusic(
                 tempos=tempos,
             )
             if note_end > note_start:
-                events.append(
-                    (int(class_id), int(note.pitch), float(note_start), float(note_end))
-                )
+                events.append((int(class_id), int(note.pitch), float(note_start), float(note_end)))
     return tuple(events)
 
 
@@ -286,9 +269,7 @@ def _load_midi_events(midi_path_str: str) -> tuple[tuple[int, int, float, float]
             errors.append(f"{reader_name}: {type(exc).__name__}: {exc}")
         except Exception as exc:
             errors.append(f"{reader_name}: {type(exc).__name__}: {exc}")
-    raise MidiReadError(
-        f"Failed to read MIDI note events: {midi_path_str}; " + " | ".join(errors)
-    )
+    raise MidiReadError(f"Failed to read MIDI note events: {midi_path_str}; " + " | ".join(errors))
 
 
 class MidiFrameLoader:
@@ -300,9 +281,7 @@ class MidiFrameLoader:
             midi_path = self.config.midi_dir / f"{song_name}{suffix}"
             if midi_path.exists():
                 return midi_path
-        raise FileNotFoundError(
-            f"MIDI not found for {song_name}: {self.config.midi_dir}"
-        )
+        raise FileNotFoundError(f"MIDI not found for {song_name}: {self.config.midi_dir}")
 
     def load_window(
         self,
@@ -325,9 +304,7 @@ class MidiFrameLoader:
             dtype=torch.float32,
         )
         window_end_sec = float(window_start_sec) + (
-            float(num_frames)
-            * float(self.config.hop_length)
-            / float(self.config.sample_rate)
+            float(num_frames) * float(self.config.hop_length) / float(self.config.sample_rate)
         )
 
         class_channels = self.config.num_channels // 2

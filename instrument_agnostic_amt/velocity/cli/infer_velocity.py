@@ -20,9 +20,7 @@ from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
 from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
 
-HF_CHECKPOINT_BASE_URL = (
-    "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
-)
+HF_CHECKPOINT_BASE_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
 DEFAULT_VELOCITY_CHECKPOINT_FILENAME = "best_velocity_model.pth"
 
 
@@ -57,15 +55,14 @@ def _pop_unused_assignment(
 
 
 def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
-    '''CC7/CC11を各演奏チャンネルのtick 0へ1件ずつ設定する。'''
+    """CC7/CC11を各演奏チャンネルのtick 0へ1件ずつ設定する。"""
 
     for track in midi.tracks:
         channels = sorted(
             {
                 int(message.channel)
                 for message in track
-                if hasattr(message, 'channel')
-                and message.type in {'program_change', 'note_on', 'note_off'}
+                if hasattr(message, "channel") and message.type in {"program_change", "note_on", "note_off"}
             }
         )
         if not channels:
@@ -74,15 +71,10 @@ def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
         rebuilt_track = mido.MidiTrack()
         carried_delta = 0
         for message in track:
-            if (
-                message.type == 'control_change'
-                and int(message.control) in (7, 11)
-            ):
+            if message.type == "control_change" and int(message.control) in (7, 11):
                 carried_delta += int(message.time)
                 continue
-            rebuilt_track.append(
-                message.copy(time=int(message.time) + carried_delta)
-            )
+            rebuilt_track.append(message.copy(time=int(message.time) + carried_delta))
             carried_delta = 0
 
         insert_at = 0
@@ -90,7 +82,7 @@ def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
             insert_at += 1
         fixed_controls = [
             mido.Message(
-                'control_change',
+                "control_change",
                 channel=channel,
                 control=control,
                 value=127,
@@ -110,20 +102,16 @@ def _write_velocity_template_midi(
     *,
     set_fixed_loudness_controls: bool,
 ) -> Path:
-    '''テンプレートのNote On velocityだけを更新し、ノート構造を維持する。'''
+    """テンプレートのNote On velocityだけを更新し、ノート構造を維持する。"""
 
     template_path = Path(template_midi_path)
     if not template_path.exists():
-        raise FileNotFoundError(f'Template MIDI file not found: {template_path}')
+        raise FileNotFoundError(f"Template MIDI file not found: {template_path}")
 
     template_pm = pretty_midi.PrettyMIDI(str(template_path))
     template_midi = mido.MidiFile(str(template_path))
-    exact_assignments: dict[
-        tuple[str, int, bool, int, int], deque[int]
-    ] = defaultdict(deque)
-    program_assignments: dict[
-        tuple[int, bool, int, int], deque[int]
-    ] = defaultdict(deque)
+    exact_assignments: dict[tuple[str, int, bool, int, int], deque[int]] = defaultdict(deque)
+    program_assignments: dict[tuple[int, bool, int, int], deque[int]] = defaultdict(deque)
     global_assignments: dict[tuple[int, int], deque[int]] = defaultdict(deque)
 
     for assignment_index, record in enumerate(note_records):
@@ -146,21 +134,15 @@ def _write_velocity_template_midi(
                 start_tick,
             )
         ].append(assignment_index)
-        global_assignments[(int(record.note.pitch), start_tick)].append(
-            assignment_index
-        )
+        global_assignments[(int(record.note.pitch), start_tick)].append(assignment_index)
 
     used_assignments: set[int] = set()
     unmatched_note_ons: list[tuple[int, str, int, int]] = []
 
     for track_index, track in enumerate(template_midi.tracks):
         track_name = next(
-            (
-                message.name
-                for message in track
-                if message.type == 'track_name'
-            ),
-            '',
+            (message.name for message in track if message.type == "track_name"),
+            "",
         )
         normalized_track_name = _normalized_instrument_name(track_name)
         program_by_channel: dict[int, int] = {}
@@ -168,10 +150,10 @@ def _write_velocity_template_midi(
 
         for message in track:
             absolute_tick += int(message.time)
-            if message.type == 'program_change':
+            if message.type == "program_change":
                 program_by_channel[int(message.channel)] = int(message.program)
                 continue
-            if message.type != 'note_on' or int(message.velocity) <= 0:
+            if message.type != "note_on" or int(message.velocity) <= 0:
                 continue
 
             channel = int(message.channel)
@@ -197,9 +179,7 @@ def _write_velocity_template_midi(
                 if assignment_index is not None:
                     break
                 assignment_index = _pop_unused_assignment(
-                    program_assignments.get(
-                        (program, is_drum, pitch, candidate_tick)
-                    ),
+                    program_assignments.get((program, is_drum, pitch, candidate_tick)),
                     used=used_assignments,
                 )
                 if assignment_index is not None:
@@ -212,20 +192,17 @@ def _write_velocity_template_midi(
                     break
 
             if assignment_index is None:
-                unmatched_note_ons.append(
-                    (track_index, track_name, pitch, absolute_tick)
-                )
+                unmatched_note_ons.append((track_index, track_name, pitch, absolute_tick))
                 continue
             message.velocity = int(note_records[assignment_index].note.velocity)
 
     if unmatched_note_ons:
-        preview = ', '.join(
-            f'track={track_index} name={track_name!r} pitch={pitch} tick={tick}'
+        preview = ", ".join(
+            f"track={track_index} name={track_name!r} pitch={pitch} tick={tick}"
             for track_index, track_name, pitch, tick in unmatched_note_ons[:5]
         )
         raise ValueError(
-            'Velocity predictions could not be matched to '
-            f'{len(unmatched_note_ons)} template Note On events. {preview}'
+            f"Velocity predictions could not be matched to {len(unmatched_note_ons)} template Note On events. {preview}"
         )
 
     if set_fixed_loudness_controls:
@@ -297,9 +274,7 @@ def _load_and_preprocess_audio(
     if not audio_file.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
 
-    waveform_np, source_sample_rate = sf.read(
-        str(audio_file), dtype="float32", always_2d=True
-    )
+    waveform_np, source_sample_rate = sf.read(str(audio_file), dtype="float32", always_2d=True)
     if waveform_np.shape[1] > 2:
         waveform_np = waveform_np[:, :2]
     elif waveform_np.shape[1] == 1:
@@ -307,9 +282,7 @@ def _load_and_preprocess_audio(
 
     waveform = torch.from_numpy(waveform_np.T.copy())
     if int(source_sample_rate) != int(target_sample_rate):
-        waveform = audio_functional.resample(
-            waveform, int(source_sample_rate), int(target_sample_rate)
-        )
+        waveform = audio_functional.resample(waveform, int(source_sample_rate), int(target_sample_rate))
 
     return waveform.numpy().astype(np.float32)
 
@@ -361,9 +334,7 @@ def _set_fixed_loudness_controls(
 ) -> None:
     for instrument in instruments:
         instrument.control_changes = [
-            control
-            for control in instrument.control_changes
-            if int(control.number) not in (7, 11)
+            control for control in instrument.control_changes if int(control.number) not in (7, 11)
         ]
         instrument.control_changes.extend(
             [
@@ -462,20 +433,14 @@ def predict_velocity_for_stem_midis(
         raise ValueError("window_seconds must be positive")
 
     if template_midi_path is not None and output_midi_path is None:
-        raise ValueError('template_midi_path requires output_midi_path')
+        raise ValueError("template_midi_path requires output_midi_path")
     if template_midi_path is not None and apply_stem_gain_to_cc7:
-        raise ValueError(
-            'template_midi_path is not compatible with legacy stem-gain CC7 output'
-        )
+        raise ValueError("template_midi_path is not compatible with legacy stem-gain CC7 output")
 
     if (preloaded_model is None) != (preloaded_config is None):
-        raise ValueError(
-            "preloaded_model and preloaded_config must be provided together"
-        )
+        raise ValueError("preloaded_model and preloaded_config must be provided together")
     if preloaded_forward is not None and preloaded_model is None:
-        raise ValueError(
-            "preloaded_forward requires preloaded_model and preloaded_config"
-        )
+        raise ValueError("preloaded_forward requires preloaded_model and preloaded_config")
     if preloaded_model is None or preloaded_config is None:
         model, config = load_velocity_model(checkpoint_path, device=target_device)
     else:
@@ -492,13 +457,9 @@ def predict_velocity_for_stem_midis(
             mode=str(compile_mode),
         )
     )
-    configure_stem_gain = (
-        isinstance(model, VelocityPredictionModel) and forward_model is model
-    )
+    configure_stem_gain = isinstance(model, VelocityPredictionModel) and forward_model is model
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
-        raise ValueError(
-            "This velocity checkpoint does not contain a stem-gain prediction head"
-        )
+        raise ValueError("This velocity checkpoint does not contain a stem-gain prediction head")
     resolved_audios = _resolve_stem_files(stem_audios)
     resolved_midis: dict[str, Path] = {}
     for key, val in stem_midis.items():
@@ -537,37 +498,22 @@ def predict_velocity_for_stem_midis(
         return list(resolved_midis.values())[0]
 
     select_note_stems_only = bool(
-        not apply_stem_gain_to_cc7
-        and isinstance(model, VelocityPredictionModel)
-        and forward_model is model
+        not apply_stem_gain_to_cc7 and isinstance(model, VelocityPredictionModel) and forward_model is model
     )
     if select_note_stems_only:
         active_stem_names = sorted({record.stem_name for record in flat_notes})
-        skipped_stem_names = sorted(
-            (set(resolved_audios) | set(resolved_midis)) - set(active_stem_names)
-        )
+        skipped_stem_names = sorted((set(resolved_audios) | set(resolved_midis)) - set(active_stem_names))
         if skipped_stem_names:
-            print(
-                "Skipping velocity backbone for stems without notes: "
-                f"{skipped_stem_names}"
-            )
+            print(f"Skipping velocity backbone for stems without notes: {skipped_stem_names}")
     else:
         # Legacy stem-gain予測はstem間の相対レベルを使うため、全stemが必要。
-        active_stem_names = sorted(
-            set(resolved_audios.keys()) | set(resolved_midis.keys())
-        )
+        active_stem_names = sorted(set(resolved_audios.keys()) | set(resolved_midis.keys()))
 
-    stem_index_by_name = {
-        stem_name: stem_index
-        for stem_index, stem_name in enumerate(active_stem_names)
-    }
+    stem_index_by_name = {stem_name: stem_index for stem_index, stem_name in enumerate(active_stem_names)}
     for record in flat_notes:
         record.stem_index = stem_index_by_name[record.stem_name]
 
-    cached_waveforms = {
-        str(name).lower(): waveform
-        for name, waveform in (preloaded_waveforms or {}).items()
-    }
+    cached_waveforms = {str(name).lower(): waveform for name, waveform in (preloaded_waveforms or {}).items()}
 
     def resolve_waveform(name: str, path: Path) -> np.ndarray:
         cached = cached_waveforms.get(name.lower())
@@ -606,15 +552,9 @@ def predict_velocity_for_stem_midis(
         padded_waveforms.append(wave)
 
     audio_tensor = (
-        torch.from_numpy(np.stack(padded_waveforms, axis=0))
-        .unsqueeze(0)
-        .to(device=target_device, dtype=torch.float32)
+        torch.from_numpy(np.stack(padded_waveforms, axis=0)).unsqueeze(0).to(device=target_device, dtype=torch.float32)
     )
-    stem_class_tensor = (
-        torch.tensor(stem_class_ids, dtype=torch.long)
-        .unsqueeze(0)
-        .to(device=target_device)
-    )
+    stem_class_tensor = torch.tensor(stem_class_ids, dtype=torch.long).unsqueeze(0).to(device=target_device)
 
     starts = np.array([item.note.start for item in flat_notes], dtype=np.float32)
     ends = np.array([item.note.end for item in flat_notes], dtype=np.float32)
@@ -656,16 +596,12 @@ def predict_velocity_for_stem_midis(
                 # stem-gainを使わない経路では、当該窓にノートがあるstemだけをbackboneへ
                 # 通す。stem indexは選択後の局所indexへ詰め直す。
                 selected_stem_indices = np.unique(window_stem_indices)
-                sub_audio = audio_tensor[
-                    :, selected_stem_indices.tolist(), :, sample_start:sample_end
-                ]
+                sub_audio = audio_tensor[:, selected_stem_indices.tolist(), :, sample_start:sample_end]
                 local_stem_indices = np.searchsorted(
                     selected_stem_indices,
                     window_stem_indices,
                 )
-                window_stem_class_tensor = stem_class_tensor[
-                    :, selected_stem_indices.tolist()
-                ]
+                window_stem_class_tensor = stem_class_tensor[:, selected_stem_indices.tolist()]
             else:
                 sub_audio = audio_tensor[:, :, :, sample_start:sample_end]
                 local_stem_indices = window_stem_indices
@@ -674,24 +610,12 @@ def predict_velocity_for_stem_midis(
             win_starts = (starts[indices_in_win] - win_start).astype(np.float32)
             win_ends = (ends[indices_in_win] - win_start).astype(np.float32)
 
-            note_start_tensor = (
-                torch.from_numpy(win_starts).unsqueeze(0).to(device=target_device, dtype=torch.float32)
-            )
-            note_end_tensor = (
-                torch.from_numpy(win_ends).unsqueeze(0).to(device=target_device, dtype=torch.float32)
-            )
-            note_pitch_tensor = (
-                torch.from_numpy(pitches[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_program_tensor = (
-                torch.from_numpy(programs[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_is_drum_tensor = (
-                torch.from_numpy(is_drums[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_stem_index_tensor = (
-                torch.from_numpy(local_stem_indices).unsqueeze(0).to(device=target_device)
-            )
+            note_start_tensor = torch.from_numpy(win_starts).unsqueeze(0).to(device=target_device, dtype=torch.float32)
+            note_end_tensor = torch.from_numpy(win_ends).unsqueeze(0).to(device=target_device, dtype=torch.float32)
+            note_pitch_tensor = torch.from_numpy(pitches[indices_in_win]).unsqueeze(0).to(device=target_device)
+            note_program_tensor = torch.from_numpy(programs[indices_in_win]).unsqueeze(0).to(device=target_device)
+            note_is_drum_tensor = torch.from_numpy(is_drums[indices_in_win]).unsqueeze(0).to(device=target_device)
+            note_stem_index_tensor = torch.from_numpy(local_stem_indices).unsqueeze(0).to(device=target_device)
 
             forward_kwargs: dict[str, Any] = {
                 "note_start_seconds": note_start_tensor,
@@ -703,9 +627,7 @@ def predict_velocity_for_stem_midis(
                 "stem_class_id": window_stem_class_tensor,
             }
             if configure_stem_gain:
-                forward_kwargs["include_stem_gain"] = bool(
-                    apply_stem_gain_to_cc7
-                )
+                forward_kwargs["include_stem_gain"] = bool(apply_stem_gain_to_cc7)
             outputs = forward_model(sub_audio, **forward_kwargs)
 
             velocity_expected = outputs["velocity_expected"].squeeze(0).cpu().numpy()
@@ -745,9 +667,7 @@ def predict_velocity_for_stem_midis(
                 else:
                     base_val = 100
                     updated_val = int(np.clip(round(base_val * linear_scale), 1, 127))
-                    inst.control_changes.append(
-                        pretty_midi.ControlChange(number=7, value=updated_val, time=0.0)
-                    )
+                    inst.control_changes.append(pretty_midi.ControlChange(number=7, value=updated_val, time=0.0))
 
     if output_midi_path is not None and template_midi_path is not None:
         return _write_velocity_template_midi(
@@ -825,9 +745,7 @@ def predict_velocity_for_midi(
         stem_midis=stem_midis,
         stem_audios=resolved_audios,
         output_midi_path=output_midi_path or (midi_file_path.parent / f"{midi_file_path.stem}_velocity.mid"),
-        template_midi_path=(
-            midi_file_path if not apply_stem_gain_to_cc7 else None
-        ),
+        template_midi_path=(midi_file_path if not apply_stem_gain_to_cc7 else None),
         checkpoint_path=checkpoint_path,
         device=device,
         window_seconds=window_seconds,
@@ -846,9 +764,7 @@ def predict_velocity_for_midi(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Predict MIDI note velocity from separated stem audio files."
-    )
+    parser = argparse.ArgumentParser(description="Predict MIDI note velocity from separated stem audio files.")
     parser.add_argument("--midi", type=Path, required=True, help="Input MIDI file path")
     parser.add_argument(
         "--stems-dir",

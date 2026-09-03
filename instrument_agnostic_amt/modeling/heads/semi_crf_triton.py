@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 IntervalBatch = list[list[tuple[int, int]]]
 
 
@@ -26,9 +25,7 @@ def _viterbi_backward_kernel(
 
     # 1. 最終時刻のsingleton scoreをDPの初期値にする。
     last = time_steps - 1
-    last_diag = tl.load(
-        score_by_track_begin_end + score_track_offset + last * time_steps + last
-    )
+    last_diag = tl.load(score_by_track_begin_end + score_track_offset + last * time_steps + last)
     tl.store(q + q_track_offset + last, last_diag * (last_diag > 0.0))
     tl.debug_barrier()
 
@@ -42,10 +39,7 @@ def _viterbi_backward_kernel(
             other=-float("inf"),
         )
         interval_score = tl.load(
-            score_by_track_begin_end
-            + score_track_offset
-            + begin * time_steps
-            + end_offsets,
+            score_by_track_begin_end + score_track_offset + begin * time_steps + end_offsets,
             mask=valid_end,
             other=-float("inf"),
         )
@@ -56,9 +50,7 @@ def _viterbi_backward_kernel(
             axis=0,
             tie_break_left=True,
         )
-        skip_value = tl.load(q + q_track_offset + begin + 1) + tl.load(
-            noise_by_track + noise_track_offset + begin
-        )
+        skip_value = tl.load(q + q_track_offset + begin + 1) + tl.load(noise_by_track + noise_track_offset + begin)
 
         # torch版はskipを先頭候補としていたため、同点時はskipを維持する。
         use_interval = best_interval_value > skip_value
@@ -67,12 +59,7 @@ def _viterbi_backward_kernel(
             tl.where(use_interval, best_interval_end, -1),
         )
 
-        diag = tl.load(
-            score_by_track_begin_end
-            + score_track_offset
-            + begin * time_steps
-            + begin
-        )
+        diag = tl.load(score_by_track_begin_end + score_track_offset + begin * time_steps + begin)
         best_value = tl.where(use_interval, best_interval_value, skip_value)
         tl.store(
             q + q_track_offset + begin,
@@ -165,9 +152,12 @@ def viterbi_backward_triton(
         )
 
         # 3. singletonの採否とpointerだけをCPUへ転送してtracebackする。
-        diag_inclusion = torch.diagonal(
-            score_by_track_begin_end,
-            dim1=1,
-            dim2=2,
-        ) > 0
+        diag_inclusion = (
+            torch.diagonal(
+                score_by_track_begin_end,
+                dim1=1,
+                dim2=2,
+            )
+            > 0
+        )
     return _traceback(pointer_end, diag_inclusion, forced_start_pos)

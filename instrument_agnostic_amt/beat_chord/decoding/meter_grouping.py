@@ -10,7 +10,6 @@ from ..meter_grouping import (
     grouping_spec_for_meter,
 )
 
-
 _LOGIT_PROBABILITY_EPSILON = 1e-6
 
 
@@ -51,19 +50,14 @@ def score_major_groupings(
     """Score the best major-group pattern independently for each bar."""
 
     spec = grouping_spec_for_meter(meter_num, meter_den)
-    if spec is None or (
-        group_boundary_probabilities is None and group_boundary_log_odds is None
-    ):
+    if spec is None or (group_boundary_probabilities is None and group_boundary_log_odds is None):
         return 0.0, ()
     if false_boundary_weight < 0.0:
         raise ValueError("false_boundary_weight must be non-negative")
 
     # patternごとの境界位置は全barで共通。一度だけsetへ変換し、内側ループで
     # grouping_boundary_offsetsとsetを作り直さない。
-    pattern_offsets = tuple(
-        (pattern, frozenset(grouping_boundary_offsets(pattern)))
-        for pattern in spec.patterns
-    )
+    pattern_offsets = tuple((pattern, frozenset(grouping_boundary_offsets(pattern))) for pattern in spec.patterns)
     total_score = 0.0
     selected_patterns: list[GroupingPattern] = []
     for bar_index in range(int(bar_count)):
@@ -76,10 +70,7 @@ def score_major_groupings(
         internal_logits = (
             [float(group_boundary_log_odds[int(frame)]) for frame in internal_frames]
             if group_boundary_log_odds is not None
-            else [
-                _logit(float(group_boundary_probabilities[int(frame)]))
-                for frame in internal_frames
-            ]
+            else [_logit(float(group_boundary_probabilities[int(frame)])) for frame in internal_frames]
         )
         best_pattern: GroupingPattern | None = None
         best_score = -float("inf")
