@@ -72,9 +72,7 @@ def _allowed_class_ids(stem_name: str | None, *, use_stem_mask: bool) -> tuple[i
     """
     drum_id = get_instrument_class_id_by_name("drums")
     stem_class_ids = (
-        resolve_stem_instrument_class_ids(inference_stem_group(stem_name))
-        if use_stem_mask and stem_name
-        else None
+        resolve_stem_instrument_class_ids(inference_stem_group(stem_name)) if use_stem_mask and stem_name else None
     )
     candidate_ids = stem_class_ids or tuple(range(len(INSTRUMENT_CLASSES)))
     if stem_class_ids is not None:
@@ -145,6 +143,7 @@ def _scan_windows(
     stride_frames = int(round(stride_seconds * config.sample_rate))
     starts = _window_starts(total_frames, window_frames, stride_frames)
 
+    scanned_starts: list[int] = []
     window_logits: list[np.ndarray] = []
     window_embeddings: list[np.ndarray] = []
     window_note_counts: list[int] = []
@@ -156,8 +155,7 @@ def _scan_windows(
         raise ValueError("window_batch_size must be positive")
 
     start_batches = [
-        starts[offset : offset + int(window_batch_size)]
-        for offset in range(0, len(starts), int(window_batch_size))
+        starts[offset : offset + int(window_batch_size)] for offset in range(0, len(starts), int(window_batch_size))
     ]
     for batch_starts in tqdm(
         start_batches,
@@ -181,20 +179,17 @@ def _scan_windows(
                 )
             start_seconds = float(sample_start) / float(config.sample_rate)
             end_seconds = start_seconds + window_seconds
-            active = (notes.start_seconds >= start_seconds) & (
-                notes.start_seconds < end_seconds
-            )
+            active = (notes.start_seconds >= start_seconds) & (notes.start_seconds < end_seconds)
             indices = np.flatnonzero(active)
             windows.append(window)
             valid_frames_batch.append(valid_frames)
             indices_batch.append(indices)
-            relative_starts.append(
-                torch.from_numpy(notes.start_seconds[indices] - start_seconds)
-            )
-            relative_ends.append(
-                torch.from_numpy(notes.end_seconds[indices] - start_seconds)
-            )
+            relative_starts.append(torch.from_numpy(notes.start_seconds[indices] - start_seconds))
+            relative_ends.append(torch.from_numpy(notes.end_seconds[indices] - start_seconds))
             pitches.append(torch.from_numpy(notes.pitch[indices]))
+
+        if not any(len(indices) for indices in indices_batch):
+            continue
 
         note_start_batch = torch.nn.utils.rnn.pad_sequence(
             relative_starts,
@@ -266,9 +261,8 @@ def _scan_windows(
         note_logits_batch = note_logits_tensor.numpy()
         note_embeddings_batch = note_embeddings_tensor.numpy()
         for batch_index, indices in enumerate(indices_batch):
-            window_logits.append(
-                _mask_logits(window_logits_batch[batch_index], allowed)
-            )
+            scanned_starts.append(batch_starts[batch_index])
+            window_logits.append(_mask_logits(window_logits_batch[batch_index], allowed))
             window_embeddings.append(window_embeddings_batch[batch_index])
             window_note_counts.append(len(indices))
             if len(indices):
@@ -283,6 +277,19 @@ def _scan_windows(
                 note_observations[indices] += 1
 
     # 曲全体の傾向は、ノートが多い窓ほど重く見る。
+    if not window_logits:
+        return _WindowScan(
+            starts=[],
+            window_logits=np.zeros(
+                (0, config.num_instrument_classes),
+                dtype=np.float64,
+            ),
+            window_note_counts=[],
+            global_logits=np.zeros(config.num_instrument_classes, dtype=np.float64),
+            note_logits=note_logit_sums,
+            note_embeddings=note_embedding_sums,
+        )
+
     stacked = np.stack(window_logits)
     weights = np.asarray(window_note_counts, dtype=np.float64) + 1.0
     global_logits = np.average(stacked, axis=0, weights=weights)
@@ -294,7 +301,7 @@ def _scan_windows(
         note_logits[missing] = global_logits
         note_embeddings[missing] = np.average(np.stack(window_embeddings), axis=0, weights=weights)
     return _WindowScan(
-        starts=starts,
+        starts=scanned_starts,
         window_logits=stacked,
         window_note_counts=window_note_counts,
         global_logits=global_logits,
@@ -534,9 +541,7 @@ def refine_midi_instruments(
     target_device = resolve_device(device)
 
     # 1. モデルを用意する。ステムごとに呼ばれる用途では読み込み済みモデルを受け取る。
-    model, config = _resolve_model(
-        checkpoint_path, preloaded_model, preloaded_config, device=target_device
-    )
+    model, config = _resolve_model(checkpoint_path, preloaded_model, preloaded_config, device=target_device)
 
     # 2. 音声と MIDI を読み、楽器の候補集合を決める。
     if preloaded_waveform is None:
