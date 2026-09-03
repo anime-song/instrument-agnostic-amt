@@ -76,20 +76,30 @@ def _traceback(
     forced_start_pos: list[int] | None,
 ) -> IntervalBatch:
     """GPUから一括転送した絶対終了位置を区間列へ戻す。"""
-    pointer_values = pointer_end.cpu().tolist()
-    diag_values = diag_inclusion.cpu().tolist()
     track_count = int(pointer_end.shape[0])
     time_steps = int(pointer_end.shape[1])
     if forced_start_pos is None:
         forced_start_pos = [0] * track_count
 
-    result: IntervalBatch = []
-    for track in range(track_count):
+    # 1. 区間を持ち得ないトラックをGPU上で落としてから転送する。実音源の1窓で
+    #    鳴っているpitchは全トラックの2割程度しかなく、残りは空listになるだけの
+    #    ためにT個のPython intを作ることになる。pointer_endの最終列はkernelが
+    #    書かない未初期化値なので、活性判定からは外す。
+    active_tracks = (pointer_end[:, : time_steps - 1] >= 0).any(dim=1)
+    active_tracks |= diag_inclusion.any(dim=1)
+    active_index = active_tracks.nonzero().flatten()
+    pointer_values = pointer_end.index_select(0, active_index).cpu().tolist()
+    diag_values = diag_inclusion.index_select(0, active_index).cpu().tolist()
+
+    # 2. 残したトラックだけを走査し、落としたトラックは空区間のまま返す。
+    result: IntervalBatch = [[] for _ in range(track_count)]
+    for row_index, track in enumerate(active_index.tolist()):
         position = int(forced_start_pos[track])
         track_result: list[tuple[int, int]] = []
-        current_diag = diag_values[track]
+        pointer_row = pointer_values[row_index]
+        current_diag = diag_values[row_index]
         while position < time_steps - 1:
-            end = int(pointer_values[track][position])
+            end = int(pointer_row[position])
             if bool(current_diag[position]):
                 track_result.append((position, position))
             if end < 0:
@@ -99,7 +109,7 @@ def _traceback(
                 position = end
         if bool(current_diag[time_steps - 1]):
             track_result.append((time_steps - 1, time_steps - 1))
-        result.append(track_result)
+        result[track] = track_result
     return result
 
 

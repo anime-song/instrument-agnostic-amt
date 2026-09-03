@@ -122,20 +122,26 @@ def viterbiBackward(
     track_count = int(score.shape[2])
 
     # TensorのCPUスカラー参照は高コストなため、一括転送後はPython list上を辿る。
-    pointer_values = pointers.cpu().tolist()
-    diag_values = diag_inclusion.cpu().tolist()
+    # 区間を持ち得ないトラックはGPU上で落としておく。実音源の1窓で鳴っている
+    # pitchは全トラックの2割程度で、残りは空listになるだけのためにT個の
+    # Python intを作ることになる。
+    active_tracks = (pointers >= 0).any(dim=1) | diag_inclusion.any(dim=1)
+    active_index = active_tracks.nonzero().flatten()
+    pointer_values = pointers.index_select(0, active_index).cpu().tolist()
+    diag_values = diag_inclusion.index_select(0, active_index).cpu().tolist()
 
     if forcedStartPos is None:
         forcedStartPos = [0] * track_count
 
-    result: IntervalBatch = []
-    for track in range(track_count):
+    result: IntervalBatch = [[] for _ in range(track_count)]
+    for row_index, track in enumerate(active_index.tolist()):
         position = forcedStartPos[track]
         track_result: List[Interval] = []
-        current_diag = diag_values[track]
+        pointer_row = pointer_values[row_index]
+        current_diag = diag_values[row_index]
 
         while position < time_steps - 1:
-            selection = int(pointer_values[track][time_steps - position - 2])
+            selection = int(pointer_row[time_steps - position - 2])
 
             if bool(current_diag[position]):
                 track_result.append((position, position))
@@ -150,7 +156,7 @@ def viterbiBackward(
         if bool(current_diag[time_steps - 1]):
             track_result.append((time_steps - 1, time_steps - 1))
 
-        result.append(track_result)
+        result[track] = track_result
 
     return result
 

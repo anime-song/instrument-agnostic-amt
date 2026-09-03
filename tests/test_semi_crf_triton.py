@@ -184,3 +184,59 @@ def test_triton_viterbi_matches_torch_for_random_and_tied_scores() -> None:
         score,
         noise_score,
     )
+
+
+def _mostly_silent_scores() -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...], list[int]]:
+    """大半のtrackに区間が立たない、実音源の1窓に近いスコアを作る。"""
+    generator = torch.Generator().manual_seed(7)
+    time_steps, track_count = 12, 9
+    # 既定は区間もsingletonも採用されない負のスコア。3 trackだけ乱数にする。
+    score = torch.full((time_steps, time_steps, track_count), -5.0)
+    noise_score = torch.zeros(time_steps - 1, track_count)
+    active_tracks = (1, 4, 8)
+    for track in active_tracks:
+        score[:, :, track] = torch.randn(
+            time_steps,
+            time_steps,
+            generator=generator,
+        )
+    forced_start_pos = [track % 3 for track in range(track_count)]
+    return score, noise_score, active_tracks, forced_start_pos
+
+
+def test_backward_decoding_keeps_track_order_when_most_tracks_are_silent() -> None:
+    """空のtrackを転送から外しても、track indexと区間が単独デコードと一致する。"""
+    score, noise_score, active_tracks, forced_start_pos = _mostly_silent_scores()
+
+    decoded = viterbiBackward(score, noise_score, forced_start_pos)
+
+    assert len(decoded) == int(score.shape[2])
+    assert all(
+        not decoded[track]
+        for track in range(int(score.shape[2]))
+        if track not in active_tracks
+    )
+    for track in active_tracks:
+        assert decoded[track]
+        single_track = viterbiBackward(
+            score[:, :, track : track + 1],
+            noise_score[:, track : track + 1],
+            [forced_start_pos[track]],
+        )
+        assert decoded[track] == single_track[0]
+
+
+@pytest.mark.skipif(
+    not TRITON_CUDA_AVAILABLE,
+    reason="Triton CUDA backend is not available",
+)
+def test_triton_backward_keeps_track_order_when_most_tracks_are_silent() -> None:
+    score, noise_score, _, forced_start_pos = _mostly_silent_scores()
+    device = torch.device("cuda")
+
+    assert viterbiBackward(
+        score.to(device),
+        noise_score.to(device),
+        forced_start_pos,
+        backend="triton",
+    ) == viterbiBackward(score, noise_score, forced_start_pos)
