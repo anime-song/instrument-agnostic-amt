@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -37,6 +38,22 @@ def group_boundary_log_odds_array(probabilities: np.ndarray) -> np.ndarray:
     return np.log(clipped / (1.0 - clipped))
 
 
+@lru_cache(maxsize=64)
+def _pattern_boundary_offsets(
+    meter_num: int, meter_den: int
+) -> tuple[tuple[GroupingPattern, frozenset[int]], ...] | None:
+    """meterごとのmajor group境界位置。値はmeterだけで決まる。
+
+    bar lattice DP は 1 曲で数万本の edge を評価し、そのたびにこの関数を呼ぶ。
+    spec の探索と frozenset の再構築を edge ごとに繰り返さないようキャッシュする。
+    """
+
+    spec = grouping_spec_for_meter(meter_num, meter_den)
+    if spec is None:
+        return None
+    return tuple((pattern, frozenset(grouping_boundary_offsets(pattern))) for pattern in spec.patterns)
+
+
 def score_major_groupings(
     *,
     grid_frames: tuple[int, ...],
@@ -49,15 +66,13 @@ def score_major_groupings(
 ) -> tuple[float, tuple[GroupingPattern, ...]]:
     """Score the best major-group pattern independently for each bar."""
 
-    spec = grouping_spec_for_meter(meter_num, meter_den)
-    if spec is None or (group_boundary_probabilities is None and group_boundary_log_odds is None):
+    # patternごとの境界位置は全barで共通。meter単位でキャッシュ済みのものを使い、
+    # 内側ループでgrouping_boundary_offsetsとsetを作り直さない。
+    pattern_offsets = _pattern_boundary_offsets(int(meter_num), int(meter_den))
+    if pattern_offsets is None or (group_boundary_probabilities is None and group_boundary_log_odds is None):
         return 0.0, ()
     if false_boundary_weight < 0.0:
         raise ValueError("false_boundary_weight must be non-negative")
-
-    # patternごとの境界位置は全barで共通。一度だけsetへ変換し、内側ループで
-    # grouping_boundary_offsetsとsetを作り直さない。
-    pattern_offsets = tuple((pattern, frozenset(grouping_boundary_offsets(pattern))) for pattern in spec.patterns)
     total_score = 0.0
     selected_patterns: list[GroupingPattern] = []
     for bar_index in range(int(bar_count)):
@@ -67,11 +82,16 @@ def score_major_groupings(
             return 0.0, ()
 
         internal_frames = bar_frames[1:]
+        # arr.item(i) は float(arr[i]) と同じ double を中間の numpy scalar なしで返す。
         internal_logits = (
-            [float(group_boundary_log_odds[int(frame)]) for frame in internal_frames]
+            [group_boundary_log_odds.item(int(frame)) for frame in internal_frames]
             if group_boundary_log_odds is not None
-            else [_logit(float(group_boundary_probabilities[int(frame)])) for frame in internal_frames]
+            else [_logit(group_boundary_probabilities.item(int(frame))) for frame in internal_frames]
         )
+        # 非境界位置のペナルティはpatternに依らないので、pattern loopの外で1度だけ出す。
+        false_boundary_penalties = [
+            float(false_boundary_weight) * max(0.0, boundary_logit) for boundary_logit in internal_logits
+        ]
         best_pattern: GroupingPattern | None = None
         best_score = -float("inf")
         for pattern, expected_offsets in pattern_offsets:
@@ -80,10 +100,7 @@ def score_major_groupings(
                 if offset in expected_offsets:
                     pattern_score += boundary_logit
                 else:
-                    pattern_score -= float(false_boundary_weight) * max(
-                        0.0,
-                        boundary_logit,
-                    )
+                    pattern_score -= false_boundary_penalties[offset - 1]
             if pattern_score > best_score:
                 best_score = float(pattern_score)
                 best_pattern = pattern

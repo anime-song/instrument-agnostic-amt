@@ -127,4 +127,6 @@ def build_regularized_grid_jit(
         int(tolerance_frames),
         float(snap_penalty),
     )
-    return tuple(int(frame) for frame in grid)
+    # tolist() は int64 配列を Python int の list へ一括変換する。要素ごとに
+    # numpy scalar を作る generator より速く、値は同じ。
+    return tuple(grid.tolist())

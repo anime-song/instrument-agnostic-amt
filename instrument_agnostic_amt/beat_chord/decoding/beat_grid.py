@@ -538,7 +538,9 @@ def _score_grid_edge(
     if len(grid_frames) != beat_count:
         return None
 
-    beat_score = float(config.beat_score_weight) * sum(float(beat_log_odds[frame]) for frame in grid_frames)
+    # numpyのfancy scalar取り出し(float(arr[i]))は中間のnumpy scalarを作る。
+    # arr.item(i)は同じdoubleをPython floatで直接返すので、値は変えずに済む。
+    beat_score = float(config.beat_score_weight) * sum(beat_log_odds.item(frame) for frame in grid_frames)
     interval_peaks = beat_peak_frames[
         int(beat_peak_frames.searchsorted(start_frame, side="left")) : int(
             beat_peak_frames.searchsorted(end_frame, side="left")
@@ -549,24 +551,29 @@ def _score_grid_edge(
     extra_peak_log_odds = 0.0
     grid_index = 0
     tolerance_frames = int(config.tolerance_frames)
-    for peak_frame_value in interval_peaks:
+    grid_frame_count = len(grid_frames)
+    for peak_frame_value in interval_peaks.tolist():
         peak_frame = int(peak_frame_value)
-        while grid_index < len(grid_frames) and int(grid_frames[grid_index]) < peak_frame - tolerance_frames:
+        while grid_index < grid_frame_count and int(grid_frames[grid_index]) < peak_frame - tolerance_frames:
             grid_index += 1
-        if grid_index >= len(grid_frames) or abs(int(grid_frames[grid_index]) - peak_frame) > tolerance_frames:
-            extra_peak_log_odds += max(0.0, float(beat_log_odds[peak_frame]))
+        if grid_index >= grid_frame_count or abs(int(grid_frames[grid_index]) - peak_frame) > tolerance_frames:
+            extra_peak_log_odds += max(0.0, beat_log_odds.item(peak_frame))
     extra_peak_score = -float(config.offbeat_peak_weight) * extra_peak_log_odds
 
     downbeat_score = 0.0
     false_downbeat_score = 0.0
     mapped_downbeats: list[int] = []
+    # 重みとmeterはedge内で不変。1拍ごとにfloat()/int()へ通し直さない。
+    beats_per_bar = int(meter_num)
+    downbeat_weight = float(config.downbeat_score_weight)
+    false_downbeat_weight = float(config.false_downbeat_weight)
     for beat_index, frame in enumerate(grid_frames):
-        downbeat_logit = float(downbeat_log_odds[frame])
-        if beat_index % int(meter_num) == 0:
+        downbeat_logit = downbeat_log_odds.item(frame)
+        if beat_index % beats_per_bar == 0:
             mapped_downbeats.append(int(frame))
-            downbeat_score += float(config.downbeat_score_weight) * downbeat_logit
+            downbeat_score += downbeat_weight * downbeat_logit
         else:
-            false_downbeat_score -= float(config.false_downbeat_weight) * max(0.0, downbeat_logit)
+            false_downbeat_score -= false_downbeat_weight * max(0.0, downbeat_logit)
 
     meter_score = float(config.meter_score_weight) * float(meter_mean_log_prob) * float(beat_count)
     raw_grouping_score, major_groupings = score_major_groupings(
@@ -632,10 +639,13 @@ def _with_meter_score_weight(
 ) -> GridEdgeHypothesis:
     """Rescore a cached edge without rebuilding its regularized beat grid."""
 
+    meter_score = float(meter_score_weight) * float(edge.meter_mean_log_prob) * float(edge.meter_num * edge.bar_count)
+    # DPは同じedgeを2 pass目でも引く。weightが変わっていなければ結果は完全に同じで、
+    # dictの複製とdataclasses.replaceだけが残る。frozen dataclassなのでそのまま返せる。
+    if meter_score == edge.score_components.get("meter"):
+        return edge
     score_components = dict(edge.score_components)
-    score_components["meter"] = (
-        float(meter_score_weight) * float(edge.meter_mean_log_prob) * float(edge.meter_num * edge.bar_count)
-    )
+    score_components["meter"] = meter_score
     return replace(
         edge,
         score=float(sum(score_components.values())),

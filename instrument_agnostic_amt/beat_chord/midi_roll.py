@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from instrument_agnostic_amt.taxonomy.instrument_classes import (
@@ -297,11 +298,16 @@ class MidiFrameLoader:
             raise ValueError("num_frames must be positive")
 
         midi_path = self.resolve_path(song_name)
-        roll = torch.zeros(
-            self.config.num_channels,
-            int(num_frames),
-            self.config.num_pitch_bins,
-            dtype=torch.float32,
+        # ノートごとの書き込みはtorchのslice代入だと1音につき数回のkernel launchに
+        # なる。1窓あたり数百音を曲全体で繰り返すため、numpy上で組み立ててから
+        # 最後に一度だけTensor化する。
+        roll_array = np.zeros(
+            (
+                self.config.num_channels,
+                int(num_frames),
+                self.config.num_pitch_bins,
+            ),
+            dtype=np.float32,
         )
         window_end_sec = float(window_start_sec) + (
             float(num_frames) * float(self.config.hop_length) / float(self.config.sample_rate)
@@ -353,12 +359,10 @@ class MidiFrameLoader:
                 continue
 
             pitch_index = int(pitch - self.config.pitch_min)
-            current = roll[class_id, frame_start:frame_end, pitch_index]
             # AMT 由来 MIDI の velocity は信頼しにくいため、入力は発音有無だけにする。
-            roll[class_id, frame_start:frame_end, pitch_index] = torch.maximum(
-                current,
-                torch.ones_like(current),
-            )
+            # 書き込む値は常に 1.0 で、既存値は 0.0 か 1.0 しか取らないため、
+            # 以前の max(既存, 1.0) と代入は同じ結果になる。
+            roll_array[class_id, frame_start:frame_end, pitch_index] = 1.0
 
             # Onset の書き込み (発音開始の瞬間のフレームのみ 1.0 にする)
             if window_start_sec <= note_start < window_end_sec:
@@ -370,6 +374,6 @@ class MidiFrameLoader:
                     )
                 )
                 if 0 <= onset_frame < num_frames:
-                    roll[class_id + class_channels, onset_frame, pitch_index] = 1.0
+                    roll_array[class_id + class_channels, onset_frame, pitch_index] = 1.0
 
-        return roll
+        return torch.from_numpy(roll_array)
