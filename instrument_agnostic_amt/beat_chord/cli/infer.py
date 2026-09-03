@@ -145,8 +145,8 @@ class BeatChordInferenceConfig:
     beat_grid_score_weight: float = 1.0
     grid_downbeat_candidate_threshold: float = 0.15
     grid_beat_candidate_threshold: float = 0.35
-    grid_max_bar_count: int = 4
-    grid_beam_size: int = 24
+    grid_max_bar_count: int = 2
+    grid_beam_size: int = 8
     grid_jit: bool = False
     group_boundary_score_weight: float = 0.5
     grid_false_group_boundary_weight: float = 0.25
@@ -221,6 +221,7 @@ def _load_audio_tempo_evidence(
     hop_length: int,
     frame_count: int,
     tempo_prior_config: TempoPriorConfig,
+    device: torch.device | None = None,
 ):
     """Read the source audio at the beat model's rate and analyse its tempo."""
 
@@ -242,6 +243,7 @@ def _load_audio_tempo_evidence(
         hop_length=int(hop_length),
         frame_count=int(frame_count),
         config=tempo_prior_config,
+        device=device,
     )
 
 
@@ -486,6 +488,7 @@ def run_beat_chord_inference(
                     hop_length=hop_length,
                     frame_count=total_frames,
                     tempo_prior_config=config.tempo_prior_config,
+                    device=device,
                 )
             except Exception as error:  # noqa: BLE001 - audio is an optional aid
                 print(f"Warning: audio tempo analysis skipped: {error}")
@@ -1394,8 +1397,8 @@ def main() -> None:
     parser.add_argument("--beat_grid_score_weight", type=float, default=1.0)
     parser.add_argument("--grid_downbeat_candidate_threshold", type=float, default=0.15)
     parser.add_argument("--grid_beat_candidate_threshold", type=float, default=0.35)
-    parser.add_argument("--grid_max_bar_count", type=int, default=4)
-    parser.add_argument("--grid_beam_size", type=int, default=24)
+    parser.add_argument("--grid_max_bar_count", type=int, default=2)
+    parser.add_argument("--grid_beam_size", type=int, default=8)
     parser.add_argument("--grid_jit", action="store_true")
     parser.add_argument("--group_boundary_score_weight", type=float, default=0.5)
     parser.add_argument("--grid_false_group_boundary_weight", type=float, default=0.25)

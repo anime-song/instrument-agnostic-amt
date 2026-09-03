@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 import pytest
+import torch
 
 from instrument_agnostic_amt.beat_chord.decoding.audio_refinement import (
     rescale_decode_to_level,
@@ -13,6 +14,8 @@ from instrument_agnostic_amt.beat_chord.decoding.audio_refinement import (
 from instrument_agnostic_amt.beat_chord.decoding.audio_tempo import (
     TempoPrior,
     TempoPriorConfig,
+    _resolve_tempogram_stride,
+    compute_onset_envelopes,
     compute_pulse_curve,
     compute_tempo_prior,
 )
@@ -127,6 +130,150 @@ class TestTempoPrior:
         assert hop_seconds == pytest.approx(config.onset_hop_length / SAMPLE_RATE)
         assert hop_seconds < SECONDS_PER_FRAME
         assert pulse.size > int(10.0 / hop_seconds) * 0.9
+
+    def test_default_stride_matches_the_target_frame_grid(self) -> None:
+        config = TempoPriorConfig()
+        assert _resolve_tempogram_stride(config, target_hop_length=HOP_LENGTH) == (
+            HOP_LENGTH // config.onset_hop_length
+        )
+        assert _resolve_tempogram_stride(
+            TempoPriorConfig(tempogram_stride=3), target_hop_length=HOP_LENGTH
+        ) == 3
+        # A target grid finer than the onset hop still asks for every column.
+        assert _resolve_tempogram_stride(config, target_hop_length=64) == 1
+
+    def test_strided_tempogram_matches_the_dense_one(self) -> None:
+        """The columns the stride skips are recovered by the resampling.
+
+        The analysis window is eight seconds wide, so columns 5.8 ms apart are
+        near-duplicates; the surface is resampled onto the model's own frame
+        grid regardless, which is exactly what the default stride computes.
+        """
+
+        audio = _click_track(120.0, duration_seconds=25.0)
+        frames = len(audio) // HOP_LENGTH
+        arguments = dict(
+            sample_rate=SAMPLE_RATE,
+            target_hop_length=HOP_LENGTH,
+            target_frame_count=frames,
+        )
+        dense = compute_tempo_prior(
+            audio, config=TempoPriorConfig(tempogram_stride=1), **arguments
+        )
+        strided = compute_tempo_prior(audio, config=TempoPriorConfig(), **arguments)
+        assert np.allclose(dense.prefix, strided.prefix, atol=1e-6)
+
+    def test_reuses_precomputed_onset_bands(self) -> None:
+        audio = _click_track(120.0, duration_seconds=12.0)
+        frames = len(audio) // HOP_LENGTH
+        bands, _mixed = compute_onset_envelopes(
+            audio, sample_rate=SAMPLE_RATE, config=TempoPriorConfig()
+        )
+        arguments = dict(
+            sample_rate=SAMPLE_RATE,
+            target_hop_length=HOP_LENGTH,
+            target_frame_count=frames,
+            config=TempoPriorConfig(),
+        )
+        assert np.array_equal(
+            compute_tempo_prior(audio, **arguments).prefix,
+            compute_tempo_prior(onset_bands=bands, **arguments).prefix,
+        )
+
+    def test_requires_a_waveform_or_precomputed_envelope(self) -> None:
+        with pytest.raises(ValueError):
+            compute_tempo_prior(
+                sample_rate=SAMPLE_RATE, target_hop_length=HOP_LENGTH,
+                target_frame_count=4,
+            )
+        with pytest.raises(ValueError):
+            compute_pulse_curve(sample_rate=SAMPLE_RATE)
+
+    def test_analyze_audio_builds_the_onset_envelope_once(self, monkeypatch) -> None:
+        """Both passes read the same envelopes; building them twice is waste."""
+
+        from instrument_agnostic_amt.beat_chord.decoding import audio_refinement
+
+        calls = 0
+        original = audio_refinement.compute_onset_envelopes
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(audio_refinement, "compute_onset_envelopes", counted)
+        audio = _click_track(120.0, duration_seconds=12.0)
+        audio_refinement.analyze_audio(
+            audio,
+            sample_rate=SAMPLE_RATE,
+            hop_length=HOP_LENGTH,
+            frame_count=len(audio) // HOP_LENGTH,
+        )
+        assert calls == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the accelerated path needs CUDA"
+)
+class TestAcceleratedTempoFrontEnd:
+    """The torch path must agree with the NumPy one it replaces."""
+
+    def test_tempo_prior_matches_the_numpy_path(self) -> None:
+        audio = _click_track(132.0, duration_seconds=30.0)
+        frames = len(audio) // HOP_LENGTH
+        arguments = dict(
+            sample_rate=SAMPLE_RATE,
+            target_hop_length=HOP_LENGTH,
+            target_frame_count=frames,
+            config=TempoPriorConfig(),
+        )
+        reference = compute_tempo_prior(audio, **arguments)
+        accelerated = compute_tempo_prior(audio, device="cuda", **arguments)
+        assert np.allclose(reference.prefix, accelerated.prefix, atol=1e-6)
+
+    def test_pulse_curve_matches_the_librosa_path(self) -> None:
+        audio = _click_track(132.0, duration_seconds=30.0)
+        config = TempoPriorConfig()
+        reference, hop_seconds = compute_pulse_curve(
+            audio, sample_rate=SAMPLE_RATE, config=config
+        )
+        accelerated, accelerated_hop = compute_pulse_curve(
+            audio, sample_rate=SAMPLE_RATE, config=config, device="cuda"
+        )
+        assert accelerated_hop == pytest.approx(hop_seconds)
+        assert np.allclose(reference, accelerated, atol=1e-9)
+
+    def test_chunking_does_not_change_the_result(self) -> None:
+        audio = _click_track(132.0, duration_seconds=30.0)
+        frames = len(audio) // HOP_LENGTH
+        arguments = dict(
+            sample_rate=SAMPLE_RATE,
+            target_hop_length=HOP_LENGTH,
+            target_frame_count=frames,
+            device="cuda",
+        )
+        whole = compute_tempo_prior(
+            audio, config=TempoPriorConfig(torch_chunk_frames=1 << 20), **arguments
+        )
+        chunked = compute_tempo_prior(
+            audio, config=TempoPriorConfig(torch_chunk_frames=64), **arguments
+        )
+        assert np.allclose(whole.prefix, chunked.prefix, atol=1e-9)
+
+    def test_cpu_and_mps_devices_stay_on_the_numpy_path(self) -> None:
+        audio = _click_track(120.0, duration_seconds=12.0)
+        frames = len(audio) // HOP_LENGTH
+        arguments = dict(
+            sample_rate=SAMPLE_RATE,
+            target_hop_length=HOP_LENGTH,
+            target_frame_count=frames,
+            config=TempoPriorConfig(),
+        )
+        reference = compute_tempo_prior(audio, **arguments)
+        assert np.array_equal(
+            reference.prefix, compute_tempo_prior(audio, device="cpu", **arguments).prefix
+        )
 
 
 class TestSnapToCurve:

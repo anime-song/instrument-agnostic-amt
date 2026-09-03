@@ -30,13 +30,14 @@ import numpy as np
 from .audio_tempo import (
     TempoPrior,
     TempoPriorConfig,
+    compute_onset_envelopes,
     compute_pulse_curve,
     compute_tempo_prior,
     focused_tempo_prior,
 )
 from .beat_grid import (
-    BeatGridDPConfig,
     BeatGridDecodeResult,
+    BeatGridDPConfig,
     MeterGridSegment,
     decode_beats_with_meter_grid_dp,
 )
@@ -44,16 +45,14 @@ from .beat_refine import (
     DEFAULT_LEVEL_RATIOS,
     beat_to_quarter_ratio,
     fit_piecewise_constant_tempo,
-    rescale_meter,
     resample_metrical_level,
+    rescale_meter,
     select_metrical_level,
     snap_to_curve,
 )
 
 
-def rescale_decode_to_level(
-    decode: BeatGridDecodeResult, ratio: float
-) -> BeatGridDecodeResult | None:
+def rescale_decode_to_level(decode: BeatGridDecodeResult, ratio: float) -> BeatGridDecodeResult | None:
     """Restate a decode at ``ratio`` times its pulse rate, meter included.
 
     Bar boundaries and quarter-note tempo are invariant under this change -- a
@@ -70,9 +69,7 @@ def rescale_decode_to_level(
         if meter is None:
             return None
         numerator, denominator = meter
-        rescaled.append(
-            replace(segment, meter_num=numerator, meter_den=denominator)
-        )
+        rescaled.append(replace(segment, meter_num=numerator, meter_den=denominator))
 
     beats = np.asarray(decode.beat_frames, dtype=np.float64)
     resampled = resample_metrical_level(beats, ratio)
@@ -194,27 +191,33 @@ def analyze_audio(
     hop_length: int,
     frame_count: int,
     config: TempoPriorConfig = TempoPriorConfig(),
+    device: object | None = None,
 ) -> AudioTempoEvidence:
-    """Derive the tempo prior and pulse curve for one track."""
+    """Derive the tempo prior and pulse curve for one track.
 
+    Both passes read the same onset envelopes, so they are built once here and
+    handed to each; ``device`` runs the transforms on an accelerator.
+    """
+
+    bands, mixed = compute_onset_envelopes(waveform, sample_rate=sample_rate, config=config)
     prior = compute_tempo_prior(
-        waveform,
         sample_rate=sample_rate,
         target_hop_length=hop_length,
         target_frame_count=frame_count,
         config=config,
+        onset_bands=bands,
+        device=device,
     )
     pulse, pulse_hop_seconds = compute_pulse_curve(
-        waveform, sample_rate=sample_rate, config=config
+        sample_rate=sample_rate,
+        config=config,
+        onset_envelope=mixed,
+        device=device,
     )
-    return AudioTempoEvidence(
-        tempo_prior=prior, pulse_curve=pulse, pulse_hop_seconds=pulse_hop_seconds
-    )
+    return AudioTempoEvidence(tempo_prior=prior, pulse_curve=pulse, pulse_hop_seconds=pulse_hop_seconds)
 
 
-def build_time_warp(
-    original_seconds: np.ndarray, refined_seconds: np.ndarray
-) -> Callable[[float], float]:
+def build_time_warp(original_seconds: np.ndarray, refined_seconds: np.ndarray) -> Callable[[float], float]:
     """Monotonic map from pre-refinement times to post-refinement times.
 
     Anchored on the beats themselves and linear in between, so any other time in
@@ -278,9 +281,7 @@ def decode_beats_with_audio(
     prior = None if evidence is None else evidence.tempo_prior
     active_config = config
     if prior is not None and refinement.tempo_prior_weight > 0.0:
-        active_config = replace(
-            config, tempo_prior_weight=float(refinement.tempo_prior_weight)
-        )
+        active_config = replace(config, tempo_prior_weight=float(refinement.tempo_prior_weight))
 
     decode = decode_beats_with_meter_grid_dp(
         beat_probabilities=beat_probabilities,
@@ -308,11 +309,7 @@ def decode_beats_with_audio(
         and refinement.select_metrical_level
         and meter_denominator <= refinement.max_level_meter_denominator
     ):
-        beat_to_quarter = (
-            beat_to_quarter_ratio(meter_denominator)
-            if refinement.level_uses_quarter_period
-            else 1.0
-        )
+        beat_to_quarter = beat_to_quarter_ratio(meter_denominator) if refinement.level_uses_quarter_period else 1.0
         _candidate, level_ratio = select_metrical_level(
             beats,
             tempo_prior=prior,
@@ -324,11 +321,7 @@ def decode_beats_with_audio(
             min_quarter_bpm=float(config.min_quarter_bpm),
             max_quarter_bpm=float(config.max_quarter_bpm),
         )
-        rescaled = (
-            None
-            if abs(level_ratio - 1.0) <= 1e-9
-            else rescale_decode_to_level(decode, level_ratio)
-        )
+        rescaled = None if abs(level_ratio - 1.0) <= 1e-9 else rescale_decode_to_level(decode, level_ratio)
         if rescaled is not None:
             # The rescaled decode stores integer frames for the meter segments,
             # but the beat grid itself keeps the unrounded resampled times: a
@@ -358,16 +351,11 @@ def decode_beats_with_audio(
                         # The prior is indexed by quarter-note period, so beat
                         # spacing is converted before it becomes a target: in
                         # 7/8 a beat is half a quarter note.
-                        (median_period / level_ratio)
-                        * beat_to_quarter
-                        / seconds_per_frame,
+                        (median_period / level_ratio) * beat_to_quarter / seconds_per_frame,
                         sigma_octaves=float(refinement.redecode_sigma_octaves),
                     ),
                 )
-                retried_beats = (
-                    np.asarray(retried.beat_frames, dtype=np.float64)
-                    * seconds_per_frame
-                )
+                retried_beats = np.asarray(retried.beat_frames, dtype=np.float64) * seconds_per_frame
                 if retried_beats.size >= 2:
                     decode, beats = retried, retried_beats
                 else:
