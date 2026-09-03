@@ -71,6 +71,16 @@ def extract_training_args(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     return dict(args) if isinstance(args, Mapping) else {}
 
 
+def extract_inference_args(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Return inference defaults, preferring distilled checkpoint metadata."""
+
+    values = extract_training_args(checkpoint)
+    inference_config = checkpoint.get("inference_config")
+    if isinstance(inference_config, Mapping):
+        values.update(inference_config)
+    return values
+
+
 def coerce_model_config(
     raw_config: Mapping[str, Any],
     *,
@@ -156,4 +166,43 @@ def load_compatible_weights(
     )
 
 
+def require_complete_inference_head(
+    model: AudioSemiCRFTransformer,
+    report: CheckpointLoadReport,
+) -> None:
+    """Reject checkpoints that would run a required decoder module at random init."""
+
+    target_keys = set(model.state_dict())
+    loaded_keys = set(report.loaded_keys)
+
+    def module_keys(prefix: str) -> set[str]:
+        return {key for key in target_keys if key.startswith(prefix)}
+
+    required_keys = module_keys("head.interval_adapter.")
+    required_keys.update(module_keys("head.interval_scorer."))
+    required_keys.update(module_keys("head.interval_boundary_predictor."))
+
+    if model.semi_crf_version == "v1":
+        required_keys.update(module_keys("head.instrument_adapter."))
+        if int(model.config.num_pitch_slots) > 1:
+            required_keys.update(module_keys("head.slot_embedding."))
+
+        interval_instrument_keys = module_keys(
+            "head.interval_instrument_predictor."
+        )
+        if interval_instrument_keys & loaded_keys:
+            required_keys.update(interval_instrument_keys)
+        else:
+            required_keys.update(module_keys("head.instrument_classifier."))
+    else:
+        required_keys.update(module_keys("head.instrument_embedding."))
+        required_keys.update(module_keys("head.pair_gate."))
+
+    missing_required = sorted(required_keys - loaded_keys)
+    if not missing_required:
+        return
+    details = ", ".join(missing_required[:8])
+    if len(missing_required) > 8:
+        details += f", ... (+{len(missing_required) - 8})"
+    raise ValueError(f"Checkpoint inference head is incomplete; missing: {details}")
 

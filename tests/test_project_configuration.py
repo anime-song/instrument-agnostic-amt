@@ -79,11 +79,24 @@ def test_project_groups_dependencies_by_workflow() -> None:
     }
 
 
+def test_project_configures_hatch_distribution() -> None:
+    configuration = _load_configuration()
+
+    assert configuration["build-system"] == {
+        "requires": ["hatchling"],
+        "build-backend": "hatchling.build",
+    }
+    assert configuration["tool"]["uv"]["package"] is True
+    assert configuration["tool"]["hatch"]["build"]["targets"]["wheel"] == {
+        "packages": ["instrument_agnostic_amt"],
+        "exclude": ["**/.DS_Store"],
+    }
+
+
 def test_uv_uses_cuda_index_on_supported_desktop_platforms() -> None:
     configuration = _load_configuration()
     cuda_platform_marker = "sys_platform == 'linux' or sys_platform == 'win32'"
 
-    assert configuration["tool"]["uv"]["package"] is False
     assert configuration["tool"]["uv"]["sources"] == {
         "torch": [
             {"index": "pytorch-cu130", "marker": cuda_platform_marker}
@@ -165,6 +178,7 @@ def test_colab_setup_installs_locked_dependency_sources_with_hashes() -> None:
 
     assert all(isinstance(cell["source"], list) for cell in notebook["cells"])
     assert '"--format", "pylock.toml"' in setup_source
+    assert '"--no-emit-project"' in setup_source
     assert 'PYLOCK_PATH = Path("/content/pylock.' in setup_source
     assert '"--output-file", str(PYLOCK_PATH)' in setup_source
     assert '"uv", "pip", "install", "--system"' in setup_source

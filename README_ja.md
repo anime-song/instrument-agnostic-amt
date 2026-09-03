@@ -58,12 +58,14 @@ uv run python infer.py --audio input_song.wav
 - 🎚️ **ノート単位のベロシティ** — 専用の後処理モデルが分離ステムから強弱を推定
 - 🎯 **ビート、コード、キー** — 任意で使用できる MIDI フレームモデル（デフォルトでは無効）
 - 🧪 **［実験的］楽器分類** — 楽器別 MIDI トラックを出力する 36 クラスのヘッド
+- 🐍 **Python API** — チェックポイントを一度だけ読み込み、ファイルやメモリ上の音声を自分のコードから採譜できる `Transcriber`
 
 <details>
 <summary><b>更新履歴</b></summary>
 
 | 日付 | 更新内容 |
 | --- | --- |
+| 2026-09-02 | 🐍 別の Python プロジェクトへ依存パッケージとしてインストールできるように変更。チェックポイントを一度だけ読み込み、モデルを呼び出し間で再利用する `Transcriber` を追加。 |
 | 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
 | 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
 | 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
@@ -116,7 +118,7 @@ uv sync --locked --extra evaluation  # 評価スクリプト
 uv sync --locked --extra training    # 学習
 ```
 
-`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、コマンドの前に `uv run` を付けてください。
+`uv sync` は `.venv/` を作成し、クローンしたリポジトリを編集可能な形でそこへインストールします。`source .venv/bin/activate` で有効化するか、コマンドの前に `uv run` を付けてください。
 
 `.python-version` は開発時のデフォルトとして Python 3.12 を選択しますが、サポート範囲は 3.10～3.14 のままです。3.12 がない場合、ダウンロードが無効化されているかオフラインでない限り、uv が管理対象の CPython をダウンロードします。
 
@@ -135,6 +137,20 @@ MPS が利用できない環境では MPS 固有のテストをスキップし�
 RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 ```
 
+### 別のプロジェクトへインストールする
+
+tsumugi は PyPI には公開していません。別のプロジェクトから使う場合は、ローカルにクローンしたリポジトリか、コミットを固定した Git の参照を依存関係として追加してください。配布名は `instrument-agnostic-amt`、インポート名は `instrument_agnostic_amt` です。
+
+```bash
+# ローカルのクローンを編集可能な形で追加
+uv add --editable /path/to/tsumugi
+
+# コミットを固定した Git 依存として追加
+uv add git+https://github.com/anime-song/tsumugi.git --rev <commit>
+```
+
+パッケージに含まれるのは、`instrument_agnostic_amt` のモジュールと、同梱するデータ（楽器 taxonomy の JSON ファイル）です。リポジトリ直下の `infer.py` などのスクリプト、ノートブック、テスト、モデルのチェックポイントは含まれません。パッケージ化された CLI は `python -m instrument_agnostic_amt.cli.infer` として実行できます。依存関係のバージョンは利用側のプロジェクトが解決して lock します。このリポジトリの `uv.lock` は再利用されません。path または Git の依存として追加した場合、uv はこのリポジトリの `[tool.uv.sources]` と `[[tool.uv.index]]` も読むので、Linux と Windows ではこのリポジトリと同じく PyTorch を CUDA 13.0 用の取得先から解決します。ビルド済み wheel を pip や `uv pip` で入れる場合はこの設定が引き継がれないため、PyTorch の取得先は利用側で設定してください。インストールしたパッケージからは、[推論](#python-api) の節にある Python API を利用できます。
+
 ---
 
 ## 推論
@@ -144,6 +160,41 @@ python infer.py --audio input_song.wav
 ```
 
 `--checkpoint` を指定しない場合、モデルは Hugging Face からダウンロードされます。
+
+### Python API
+
+同じ推論を、Python からは `Transcriber` として利用できます。1 つのインスタンスが 1 つのチェックポイントを読み込み、そのモデルを呼び出しのたびに再利用します。`from_checkpoint()` に渡すのは、信頼できる既存のローカルチェックポイントです。ダウンロードは行わないので、先に CLI を一度実行するか、Hugging Face からファイルを取得しておいてください。
+
+```python
+from pathlib import Path
+
+from instrument_agnostic_amt import Transcriber, TranscriptionOptions
+
+transcriber = Transcriber.from_checkpoint("checkpoints/best_model.pth")
+result = transcriber.transcribe(
+    "input_song.wav",
+    options=TranscriptionOptions(allowed_instruments=("piano", "electric_piano", "plucked_keyboard")),
+)
+Path("input_song.mid").write_bytes(result.midi_bytes)
+```
+
+`from_checkpoint()` には `device`、`amp`、`amp_dtype`、`compile`、`compile_mode` も渡せます。デコードと MIDI 書き出しの引数は、[主な引数](#主な引数) に対応する `TranscriptionOptions` と `MidiExportOptions` で指定します。CLI と既定値が異なるのは 2 点です。`instrument_volumes` を渡さない限り CC7 のボリュームイベントを書き込まないことと、`show_progress=True` にしない限り進捗バーを表示しないことです。
+
+`transcribe()` には、SoundFile が読めるファイルのパスか、自分でデコードした音声を包む `DecodedAudio(samples, sample_rate)` を渡します。後者は、libsndfile が開けない M4A などを扱うときに使います。`samples` は CPU 上の `float32` テンソルで、形状は `[channels, frames]`、チャンネル数は 1 または 2、値は ±1.0 の範囲です。モノラルはステレオに複製され、サンプルレートはチェックポイントに合わせてリサンプリングされます。
+
+正式な出力は `result.midi_bytes` です。`result.notes` はデコーダの出力で、ドラムのピッチ別名、トラック数の制限、最短ノート長といった MIDI 書き出し時の処理を適用する前の値です。
+
+1 つのインスタンスが同時に処理する呼び出しは 1 件で、処理中に呼ぶと待たずに `TranscriberBusyError` を送出します。
+
+モデルを使い終わったら `close()` を呼ぶか、`with` 文で使ってください。どちらも、処理中の呼び出しがあれば終わるのを待ち、モデルを捨てて GPU/MPS のキャッシュを解放します。閉じたあとの呼び出しは `RuntimeError` になりますが、`model_info` は読めます。
+
+```python
+with Transcriber.from_checkpoint("checkpoints/best_model.pth") as transcriber:
+    for audio_path in audio_paths:
+        result = transcriber.transcribe(audio_path)
+        Path(audio_path).with_suffix(".mid").write_bytes(result.midi_bytes)
+# ここでモデルが捨てられ、GPU/MPS のキャッシュが解放される
+```
 
 ### デバイス選択
 
