@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 
@@ -12,7 +13,7 @@ from ...modeling.checkpoints import (
     select_state_dict,
 )
 from ...modeling.model import remap_legacy_v1_state_dict
-from .model import VelocityPredictionModel
+from .model import VelocityModelConfig, VelocityPredictionModel
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,109 @@ class BackboneLoadReport:
     loaded_keys: tuple[str, ...]
     missing_keys: tuple[str, ...]
     shape_mismatches: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VelocityCheckpointLoadReport:
+    loaded_keys: tuple[str, ...]
+    missing_keys: tuple[str, ...]
+    unexpected_keys: tuple[str, ...]
+    shape_mismatches: tuple[str, ...]
+
+
+def _coerce_velocity_config(raw_config: object) -> VelocityModelConfig:
+    if isinstance(raw_config, VelocityModelConfig):
+        return raw_config
+    if raw_config is None:
+        return VelocityModelConfig()
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("Velocity checkpoint config must be a mapping")
+    allowed = {field.name for field in fields(VelocityModelConfig)}
+    unknown = sorted(set(raw_config) - allowed)
+    if unknown:
+        raise ValueError(
+            "Unknown velocity model config fields: " + ", ".join(unknown)
+        )
+    values = dict(raw_config)
+    for key in ("harmonics", "local_frame_offsets"):
+        if key in values and isinstance(values[key], list):
+            values[key] = tuple(values[key])
+    return VelocityModelConfig(**values)
+
+
+def load_velocity_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> tuple[
+    VelocityPredictionModel,
+    VelocityModelConfig,
+    VelocityCheckpointLoadReport,
+]:
+    """Load a complete velocity-only model from a trusted local checkpoint."""
+
+    checkpoint = load_checkpoint(checkpoint_path)
+    config = _coerce_velocity_config(
+        checkpoint.get("config") or checkpoint.get("model_config")
+    )
+    model = VelocityPredictionModel(config)
+    legacy_state_dict = checkpoint.get("state_dict")
+    selected_state_dict = (
+        legacy_state_dict
+        if checkpoint.get("ema_state_dict") is None
+        and checkpoint.get("model_state_dict") is None
+        and isinstance(legacy_state_dict, Mapping)
+        else select_state_dict(checkpoint, prefer_ema=True)
+    )
+    source = remap_legacy_v1_state_dict(selected_state_dict)
+    target = model.state_dict()
+    compatible: dict[str, torch.Tensor] = {}
+    unexpected: list[str] = []
+    shape_mismatches: list[str] = []
+    for key, value in source.items():
+        if key not in target or not isinstance(value, torch.Tensor):
+            unexpected.append(key)
+            continue
+        if tuple(value.shape) != tuple(target[key].shape):
+            shape_mismatches.append(
+                f"{key}: checkpoint={tuple(value.shape)}, model={tuple(target[key].shape)}"
+            )
+            continue
+        compatible[key] = value
+
+    missing = sorted(set(target) - set(compatible))
+    optional_prefixes = (
+        ()
+        if config.predict_stem_gain
+        else ("global_audio_projection.", "stem_gain_head.")
+    )
+    missing_required = [
+        key for key in missing if not key.startswith(optional_prefixes)
+    ]
+    required_shape_mismatches = [
+        mismatch
+        for mismatch in shape_mismatches
+        if not mismatch.startswith(optional_prefixes)
+    ]
+    if missing_required or required_shape_mismatches:
+        details = [
+            *required_shape_mismatches,
+            *(f"missing: {key}" for key in missing_required),
+        ]
+        preview = ", ".join(details[:8])
+        if len(details) > 8:
+            preview += f", ... (+{len(details) - 8})"
+        raise ValueError(f"Velocity checkpoint is incomplete: {preview}")
+
+    model.load_state_dict(compatible, strict=False)
+    model.to(device)
+    model.eval()
+    return model, config, VelocityCheckpointLoadReport(
+        loaded_keys=tuple(sorted(compatible)),
+        missing_keys=tuple(missing),
+        unexpected_keys=tuple(sorted(unexpected)),
+        shape_mismatches=tuple(sorted(shape_mismatches)),
+    )
 
 
 def _normalize_config_value(value: Any) -> Any:

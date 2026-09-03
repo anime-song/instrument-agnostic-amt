@@ -15,6 +15,7 @@ from instrument_agnostic_amt.velocity.cli.infer_velocity import (
     predict_velocity_for_midi,
     predict_velocity_for_stem_midis,
 )
+from instrument_agnostic_amt.velocity.midi_template import apply_loudness_controls
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
@@ -200,6 +201,25 @@ def mock_stem_midis(tmp_path: Path) -> dict[str, Path]:
     return stem_midis
 
 
+def _tiny_velocity_model() -> tuple[VelocityPredictionModel, VelocityModelConfig]:
+    config = VelocityModelConfig(
+        sample_rate=8_000,
+        hop_length=128,
+        cqt_n_bins=48,
+        cqt_bins_per_octave=12,
+        harmonics=(1.0,),
+        hidden_size=16,
+        base_ch=4,
+        encoder_num_layers=1,
+        encoder_num_heads=1,
+        dropout=0.0,
+        note_hidden_size=16,
+        predict_stem_gain=False,
+        use_gradient_checkpoint=False,
+    )
+    return VelocityPredictionModel(config).eval(), config
+
+
 def test_predict_velocity_for_stem_midis(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
@@ -237,7 +257,7 @@ def test_predict_velocity_for_stem_midis(
             assert 1 <= cc.value <= 127
 
 
-def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
+def test_velocity_compile_reuses_fixed_shape_and_back_aligns_final_window(
     mock_stem_midis: dict[str, Path],
     mock_audio_stems: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -255,6 +275,7 @@ def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
     guitar_midi.write(str(mock_stem_midis["guitar"]))
 
     compiled_audio_lengths: list[int] = []
+    compiled_note_starts: list[list[float]] = []
     compile_calls: list[tuple[object, bool, str]] = []
 
     class EagerVelocityModel:
@@ -277,6 +298,7 @@ def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
         **kwargs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         compiled_audio_lengths.append(int(audio.shape[-1]))
+        compiled_note_starts.append(kwargs["note_start_seconds"].squeeze(0).tolist())
         return {
             "velocity_expected": torch.full_like(
                 kwargs["note_start_seconds"],
@@ -322,8 +344,12 @@ def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
     assert compile_calls == [(eager_model, True, "reduce-overhead")]
     assert compiled_audio_lengths == [
         int(1.25 * config.sample_rate),
-        2 * config.sample_rate - int(1.25 * config.sample_rate),
+        int(1.25 * config.sample_rate),
     ]
+    final_audio_start = (
+        2 * config.sample_rate - int(1.25 * config.sample_rate)
+    ) / config.sample_rate
+    assert compiled_note_starts[-1] == pytest.approx([1.6 - final_audio_start])
     output = pretty_midi.PrettyMIDI(str(output_path))
     velocities_by_start = {
         round(note.start, 1): note.velocity
@@ -332,6 +358,200 @@ def test_velocity_compile_reuses_regional_forward_for_full_and_partial_windows(
     }
     assert velocities_by_start[0.1] == 91
     assert velocities_by_start[1.6] == 91
+
+
+def test_legacy_velocity_back_aligns_a_one_sample_final_window(
+    tmp_path: Path,
+) -> None:
+    model, config = _tiny_velocity_model()
+    audio_path = tmp_path / "one-sample-tail.wav"
+    midi_path = tmp_path / "one-sample-tail.mid"
+    output_path = tmp_path / "one-sample-tail-velocity.mid"
+    sf.write(
+        audio_path,
+        np.zeros((8_001, 2), dtype=np.float32),
+        config.sample_rate,
+        subtype="FLOAT",
+    )
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    midi.tracks.append(
+        mido.MidiTrack(
+            [
+                mido.MetaMessage("set_tempo", tempo=500_000, time=0),
+                mido.Message("note_on", channel=0, note=60, velocity=80, time=960),
+                mido.Message("note_off", channel=0, note=60, velocity=0, time=1),
+                mido.MetaMessage("end_of_track", time=0),
+            ]
+        )
+    )
+    midi.save(midi_path)
+
+    result = predict_velocity_for_stem_midis(
+        stem_midis={"other": midi_path},
+        stem_audios={"other": audio_path},
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=1.0,
+        disable_tqdm=True,
+        preloaded_model=model,
+        preloaded_config=config,
+    )
+
+    assert result == output_path
+    assert output_path.exists()
+    assert len(pretty_midi.PrettyMIDI(str(output_path)).instruments[0].notes) == 1
+
+
+def test_legacy_velocity_keeps_notes_in_the_last_logical_window(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    guitar_midi = pretty_midi.PrettyMIDI(str(mock_stem_midis["guitar"]))
+    guitar_midi.instruments[0].notes[0].start = 3.0
+    guitar_midi.instruments[0].notes[0].end = 3.1
+    guitar_midi.write(str(mock_stem_midis["guitar"]))
+    note_starts: list[list[float]] = []
+
+    class RecordingModel:
+        def to(self, _device: torch.device) -> RecordingModel:
+            return self
+
+        def eval(self) -> RecordingModel:
+            return self
+
+        def __call__(
+            self,
+            _audio: torch.Tensor,
+            **kwargs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            note_starts.append(kwargs["note_start_seconds"].squeeze(0).tolist())
+            return {
+                "velocity_expected": torch.full_like(
+                    kwargs["note_start_seconds"],
+                    93.0,
+                )
+            }
+
+    output_path = tmp_path / "last-logical-window.mid"
+    result = predict_velocity_for_stem_midis(
+        stem_midis={"guitar": mock_stem_midis["guitar"]},
+        stem_audios={"guitar": mock_audio_stems["guitar"]},
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=8.0,
+        disable_tqdm=True,
+        preloaded_model=RecordingModel(),  # type: ignore[arg-type]
+        preloaded_config=VelocityModelConfig(
+            sample_rate=22_050,
+            predict_stem_gain=False,
+        ),
+    )
+
+    assert result == output_path
+    assert len(note_starts) == 1
+    assert note_starts[0] == pytest.approx([3.0])
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    assert output.instruments[0].notes[0].velocity == 93
+
+
+def test_legacy_velocity_right_pads_audio_shorter_than_one_window(
+    tmp_path: Path,
+) -> None:
+    model, config = _tiny_velocity_model()
+    audio_path = tmp_path / "short.wav"
+    midi_path = tmp_path / "short.mid"
+    output_path = tmp_path / "short-velocity.mid"
+    waveform = np.linspace(0.0, 0.5, 1_000, dtype=np.float32)
+    sf.write(
+        audio_path,
+        np.column_stack((waveform, waveform)),
+        config.sample_rate,
+        subtype="FLOAT",
+    )
+    midi = pretty_midi.PrettyMIDI()
+    instrument = pretty_midi.Instrument(program=0, name="other")
+    instrument.notes.append(
+        pretty_midi.Note(velocity=80, pitch=60, start=0.05, end=0.06)
+    )
+    midi.instruments.append(instrument)
+    midi.write(str(midi_path))
+    calls: list[tuple[torch.Size, list[list[int]], torch.Tensor]] = []
+
+    def recording_forward(
+        audio: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        calls.append(
+            (
+                audio.shape,
+                kwargs["valid_audio_frames"].tolist(),
+                audio[..., 1_000:].detach().cpu(),
+            )
+        )
+        return {
+            "velocity_expected": torch.full_like(
+                kwargs["note_start_seconds"],
+                64.0,
+            )
+        }
+
+    result = predict_velocity_for_stem_midis(
+        stem_midis={"other": midi_path},
+        stem_audios={"other": audio_path},
+        output_midi_path=output_path,
+        device="cpu",
+        window_seconds=1.0,
+        disable_tqdm=True,
+        preloaded_model=model,
+        preloaded_config=config,
+        preloaded_forward=recording_forward,
+    )
+
+    assert result == output_path
+    assert len(calls) == 1
+    assert calls[0][0] == torch.Size((1, 1, 2, 8_000))
+    assert calls[0][1] == [[1_000]]
+    assert torch.count_nonzero(calls[0][2]) == 0
+
+    strict_audio_lengths: list[int] = []
+
+    def strict_forward(
+        audio: torch.Tensor,
+        *,
+        note_start_seconds: torch.Tensor,
+        note_end_seconds: torch.Tensor,
+        note_pitch: torch.Tensor,
+        note_program: torch.Tensor,
+        note_is_drum: torch.Tensor,
+        note_stem_index: torch.Tensor,
+        stem_class_id: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        _ = (
+            note_end_seconds,
+            note_pitch,
+            note_program,
+            note_is_drum,
+            note_stem_index,
+            stem_class_id,
+        )
+        strict_audio_lengths.append(int(audio.shape[-1]))
+        return {"velocity_expected": torch.full_like(note_start_seconds, 64.0)}
+
+    strict_result = predict_velocity_for_stem_midis(
+        stem_midis={"other": midi_path},
+        stem_audios={"other": audio_path},
+        output_midi_path=tmp_path / "short-strict-velocity.mid",
+        device="cpu",
+        window_seconds=1.0,
+        disable_tqdm=True,
+        preloaded_model=model,
+        preloaded_config=config,
+        preloaded_forward=strict_forward,
+    )
+
+    assert strict_result == tmp_path / "short-strict-velocity.mid"
+    assert strict_audio_lengths == [8_000]
 
 
 def test_velocity_inference_skips_unused_stem_gain_head(
@@ -404,8 +624,21 @@ def test_velocity_only_inference_runs_only_note_stems_in_each_window(
     guitar_midi.instruments[0].notes[0].start = 1.5
     guitar_midi.instruments[0].notes[0].end = 1.9
     guitar_midi.write(str(mock_stem_midis["guitar"]))
+    guitar_audio, sample_rate = sf.read(
+        mock_audio_stems["guitar"],
+        dtype="float32",
+        always_2d=True,
+    )
+    guitar_sample_count = int(1.75 * sample_rate)
+    sf.write(
+        mock_audio_stems["guitar"],
+        guitar_audio[:guitar_sample_count],
+        sample_rate,
+        subtype="FLOAT",
+    )
     stem_counts: list[int] = []
     local_stem_indices: list[list[int]] = []
+    valid_frame_counts: list[list[int] | None] = []
 
     class RecordingVelocityModel(VelocityPredictionModel):
         def __init__(self) -> None:
@@ -419,6 +652,12 @@ def test_velocity_only_inference_runs_only_note_stems_in_each_window(
             stem_counts.append(int(audio.shape[1]))
             local_stem_indices.append(
                 kwargs["note_stem_index"].squeeze(0).tolist()
+            )
+            valid_audio_frames = kwargs.get("valid_audio_frames")
+            valid_frame_counts.append(
+                None
+                if valid_audio_frames is None
+                else valid_audio_frames.squeeze(0).tolist()
             )
             selected_classes = kwargs["stem_class_id"].gather(
                 1,
@@ -449,6 +688,7 @@ def test_velocity_only_inference_runs_only_note_stems_in_each_window(
 
     assert stem_counts == [1, 1]
     assert local_stem_indices == [[0], [0]]
+    assert valid_frame_counts == [None, [guitar_sample_count - 22_050]]
     output = pretty_midi.PrettyMIDI(str(output_path))
     velocities = {
         instrument.name: instrument.notes[0].velocity
@@ -765,6 +1005,119 @@ def test_velocity_only_inference_fixes_loudness_controls_at_maximum(
     assert controls.count((11, 127, 0.0)) == instrument_count
     assert all(number not in (7, 11) or value == 127 for number, value, _ in controls)
     assert any(number == 64 for number, _, _ in controls)
+
+
+def test_velocity_inference_can_preserve_template_loudness_controls(
+    mock_stem_midis: dict[str, Path],
+    mock_audio_stems: dict[str, Path],
+    mock_velocity_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    input_path = mock_stem_midis["drums"]
+    midi = pretty_midi.PrettyMIDI(str(input_path))
+    midi.instruments[0].control_changes.extend(
+        [
+            pretty_midi.ControlChange(number=7, value=72, time=0.0),
+            pretty_midi.ControlChange(number=64, value=127, time=0.1),
+            pretty_midi.ControlChange(number=11, value=91, time=0.2),
+        ]
+    )
+    midi.write(str(input_path))
+    output_path = tmp_path / "preserved.mid"
+
+    predict_velocity_for_stem_midis(
+        stem_midis={"drums": input_path},
+        stem_audios={"drums": mock_audio_stems["drums"]},
+        output_midi_path=output_path,
+        template_midi_path=input_path,
+        checkpoint_path=mock_velocity_checkpoint,
+        device="cpu",
+        window_seconds=4.0,
+        disable_tqdm=True,
+        loudness_controls="preserve",
+    )
+
+    output = pretty_midi.PrettyMIDI(str(output_path))
+    controls = output.instruments[0].control_changes
+    assert [(control.number, control.value) for control in controls] == [
+        (7, 72),
+        (64, 127),
+        (11, 91),
+    ]
+    assert [control.time for control in controls] == pytest.approx([0.0, 0.1, 0.2])
+
+
+def test_strip_loudness_controls_preserves_other_event_ticks() -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.extend(
+        [
+            mido.Message("program_change", channel=0, program=8, time=0),
+            mido.Message("control_change", channel=0, control=7, value=72, time=10),
+            mido.Message("control_change", channel=0, control=64, value=127, time=5),
+            mido.Message("note_on", channel=0, note=60, velocity=80, time=7),
+            mido.MetaMessage("end_of_track", time=20),
+        ]
+    )
+    midi.tracks.append(track)
+
+    apply_loudness_controls(midi, "strip")
+
+    absolute_tick = 0
+    remaining_events: list[tuple[str, int, int]] = []
+    for message in midi.tracks[0]:
+        absolute_tick += int(message.time)
+        if message.type == "control_change":
+            remaining_events.append((message.type, int(message.control), absolute_tick))
+        elif message.type == "note_on":
+            remaining_events.append((message.type, int(message.note), absolute_tick))
+    assert remaining_events == [
+        ("control_change", 64, 15),
+        ("note_on", 60, 22),
+    ]
+
+
+def test_velocity_only_controls_precede_tick_zero_notes_and_strip_automation_tracks() -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    note_track = mido.MidiTrack(
+        [
+            mido.MetaMessage("track_name", name="drums", time=0),
+            mido.Message("program_change", channel=9, program=0, time=0),
+            mido.Message("note_on", channel=9, note=38, velocity=80, time=0),
+            mido.Message("note_off", channel=9, note=38, velocity=23, time=120),
+            mido.MetaMessage("end_of_track", time=0),
+        ]
+    )
+    automation_track = mido.MidiTrack(
+        [
+            mido.Message("control_change", channel=2, control=7, value=50, time=12),
+            mido.Message("control_change", channel=2, control=64, value=127, time=3),
+            mido.MetaMessage("end_of_track", time=0),
+        ]
+    )
+    midi.tracks.extend([note_track, automation_track])
+
+    apply_loudness_controls(midi, "velocity_only")
+
+    note_events = list(midi.tracks[0])
+    note_on_index = next(
+        index for index, message in enumerate(note_events) if message.type == "note_on"
+    )
+    fixed_indices = [
+        index
+        for index, message in enumerate(note_events)
+        if message.type == "control_change" and int(message.control) in (7, 11)
+    ]
+    assert fixed_indices and max(fixed_indices) < note_on_index
+    assert all(int(note_events[index].time) == 0 for index in fixed_indices)
+
+    absolute_tick = 0
+    automation_events: list[tuple[int, int]] = []
+    for message in midi.tracks[1]:
+        absolute_tick += int(message.time)
+        if message.type == "control_change":
+            automation_events.append((int(message.control), absolute_tick))
+    assert automation_events == [(64, 15)]
 
 
 def test_velocity_output_limits_melodic_tracks_and_merges_overflow(

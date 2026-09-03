@@ -7,6 +7,8 @@ import mido
 import numpy as np
 import pretty_midi
 
+from ..midi_events import remove_control_changes
+
 
 @dataclass(frozen=True)
 class MidiNoteTable:
@@ -96,21 +98,17 @@ def canonicalize_amt_midi(
         charset=source.charset,
         clip=True,
     )
-    removed = set(int(value) for value in removed_control_numbers)
+    removed_controls = {int(value) for value in removed_control_numbers}
     for source_track in source.tracks:
         target_track = mido.MidiTrack()
-        carried_time = 0
-        for message in source_track:
-            carried_time += int(message.time)
-            if message.type == "control_change" and int(message.control) in removed:
-                continue
-            copied = message.copy(time=carried_time)
-            carried_time = 0
+        for message in remove_control_changes(
+            source_track,
+            control_numbers=removed_controls,
+        ):
+            copied = message.copy()
             if copied.type == "note_on" and int(copied.velocity) > 0:
                 copied = copied.copy(velocity=int(canonical_velocity))
             target_track.append(copied)
-        if carried_time:
-            target_track.append(mido.MetaMessage("end_of_track", time=carried_time))
         output.tracks.append(target_track)
 
     destination = Path(output_path)

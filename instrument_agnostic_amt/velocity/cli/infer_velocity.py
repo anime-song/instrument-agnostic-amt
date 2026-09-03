@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,12 +12,13 @@ import pretty_midi
 import soundfile as sf
 import torch
 import torchaudio.functional as audio_functional
-from tqdm.auto import tqdm
 
 from ...runtime import maybe_compile_forward, resolve_device
-from ..modeling.checkpoints import load_checkpoint, select_state_dict
+from ..midi_template import apply_loudness_controls
+from ..modeling.checkpoints import load_velocity_checkpoint
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
-from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ..stems import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ..windowed import VelocityNoteQuery, predict_velocity_values
 
 HF_CHECKPOINT_BASE_URL = (
     "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
@@ -56,59 +56,12 @@ def _pop_unused_assignment(
     return assignment_index
 
 
-def _replace_fixed_loudness_controls_in_mido(midi: mido.MidiFile) -> None:
-    '''CC7/CC11を各演奏チャンネルのtick 0へ1件ずつ設定する。'''
-
-    for track in midi.tracks:
-        channels = sorted(
-            {
-                int(message.channel)
-                for message in track
-                if hasattr(message, 'channel')
-                and message.type in {'program_change', 'note_on', 'note_off'}
-            }
-        )
-        if not channels:
-            continue
-
-        rebuilt_track = mido.MidiTrack()
-        carried_delta = 0
-        for message in track:
-            if (
-                message.type == 'control_change'
-                and int(message.control) in (7, 11)
-            ):
-                carried_delta += int(message.time)
-                continue
-            rebuilt_track.append(
-                message.copy(time=int(message.time) + carried_delta)
-            )
-            carried_delta = 0
-
-        insert_at = 0
-        while insert_at < len(rebuilt_track) and rebuilt_track[insert_at].time == 0:
-            insert_at += 1
-        fixed_controls = [
-            mido.Message(
-                'control_change',
-                channel=channel,
-                control=control,
-                value=127,
-                time=0,
-            )
-            for channel in channels
-            for control in (7, 11)
-        ]
-        rebuilt_track[insert_at:insert_at] = fixed_controls
-        track[:] = rebuilt_track
-
-
 def _write_velocity_template_midi(
     template_midi_path: Path | str,
     output_midi_path: Path | str,
     note_records: list[_VelocityNoteRecord],
     *,
-    set_fixed_loudness_controls: bool,
+    loudness_controls: str,
 ) -> Path:
     '''テンプレートのNote On velocityだけを更新し、ノート構造を維持する。'''
 
@@ -228,8 +181,7 @@ def _write_velocity_template_midi(
             f'{len(unmatched_note_ons)} template Note On events. {preview}'
         )
 
-    if set_fixed_loudness_controls:
-        _replace_fixed_loudness_controls_in_mido(template_midi)
+    apply_loudness_controls(template_midi, loudness_controls)
 
     destination_path = Path(output_midi_path)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,29 +213,10 @@ def load_velocity_model(
     """Velocity予測モデルと設定をチェックポイントから読み込む。"""
     target_device = torch.device(device)
     resolved_checkpoint_path = ensure_velocity_checkpoint(checkpoint_path)
-    checkpoint = load_checkpoint(resolved_checkpoint_path)
-
-    raw_config = checkpoint.get("config") or checkpoint.get("model_config")
-    if raw_config is not None:
-        if isinstance(raw_config, VelocityModelConfig):
-            config = raw_config
-        elif isinstance(raw_config, dict):
-            config_values = dict(raw_config)
-            for key in ("harmonics", "local_frame_offsets"):
-                if key in config_values and isinstance(config_values[key], list):
-                    config_values[key] = tuple(config_values[key])
-            config = VelocityModelConfig(**config_values)
-        else:
-            config = VelocityModelConfig()
-    else:
-        config = VelocityModelConfig()
-
-    model = VelocityPredictionModel(config)
-    state_dict = select_state_dict(checkpoint, prefer_ema=True)
-    model.load_state_dict(state_dict, strict=False)
-    model.to(target_device)
-    model.eval()
-
+    model, config, _ = load_velocity_checkpoint(
+        resolved_checkpoint_path,
+        device=target_device,
+    )
     return model, config
 
 
@@ -373,6 +306,30 @@ def _set_fixed_loudness_controls(
         )
 
 
+def _apply_loudness_controls_to_instruments(
+    instruments: list[pretty_midi.Instrument],
+    policy: str,
+) -> None:
+    if policy == "preserve":
+        return
+    for instrument in instruments:
+        instrument.control_changes = [
+            control
+            for control in instrument.control_changes
+            if int(control.number) not in (7, 11)
+        ]
+    if policy == "strip":
+        return
+    if policy == "velocity_only":
+        _set_fixed_loudness_controls(
+            [instrument for instrument in instruments if instrument.notes]
+        )
+        return
+    raise ValueError(
+        "loudness_controls must be one of: velocity_only, preserve, strip"
+    )
+
+
 def _merge_and_limit_instruments(
     midi_objects: Mapping[str, pretty_midi.PrettyMIDI],
     *,
@@ -440,6 +397,7 @@ def predict_velocity_for_stem_midis(
     window_seconds: float = 8.0,
     max_melodic_instruments: int = 15,
     apply_stem_gain_to_cc7: bool = False,
+    loudness_controls: str = "velocity_only",
     disable_tqdm: bool = False,
     compile_velocity: bool = False,
     compile_mode: str = "default",
@@ -460,6 +418,10 @@ def predict_velocity_for_stem_midis(
         raise ValueError("max_melodic_instruments must be nonnegative")
     if window_seconds <= 0:
         raise ValueError("window_seconds must be positive")
+    if loudness_controls not in {"velocity_only", "preserve", "strip"}:
+        raise ValueError(
+            "loudness_controls must be one of: velocity_only, preserve, strip"
+        )
 
     if template_midi_path is not None and output_midi_path is None:
         raise ValueError('template_midi_path requires output_midi_path')
@@ -491,9 +453,6 @@ def predict_velocity_for_stem_midis(
             enabled=bool(compile_velocity),
             mode=str(compile_mode),
         )
-    )
-    configure_stem_gain = (
-        isinstance(model, VelocityPredictionModel) and forward_model is model
     )
     if apply_stem_gain_to_cc7 and not config.predict_stem_gain:
         raise ValueError(
@@ -597,139 +556,50 @@ def predict_velocity_for_stem_midis(
         stem_waveforms.append(waveform)
         stem_class_ids.append(STEM_CLASS_BY_NAME.get(name, UNKNOWN_STEM_CLASS))
 
-    max_samples = max(wave.shape[1] for wave in stem_waveforms)
-    padded_waveforms: list[np.ndarray] = []
-    for wave in stem_waveforms:
-        pad_width = max_samples - wave.shape[1]
-        if pad_width > 0:
-            wave = np.pad(wave, ((0, 0), (0, pad_width)))
-        padded_waveforms.append(wave)
-
-    audio_tensor = (
-        torch.from_numpy(np.stack(padded_waveforms, axis=0))
-        .unsqueeze(0)
-        .to(device=target_device, dtype=torch.float32)
+    predictions = predict_velocity_values(
+        model=model,
+        forward_model=forward_model,
+        config=config,
+        device=target_device,
+        stem_waveforms=stem_waveforms,
+        stem_class_ids=stem_class_ids,
+        notes=tuple(
+            VelocityNoteQuery(
+                start_seconds=float(record.note.start),
+                end_seconds=float(record.note.end),
+                pitch=int(record.note.pitch),
+                program=int(record.program),
+                is_drum=bool(record.is_drum),
+                stem_index=int(record.stem_index),
+            )
+            for record in flat_notes
+        ),
+        window_seconds=float(window_seconds),
+        show_progress=not bool(disable_tqdm),
+        include_stem_gain=bool(apply_stem_gain_to_cc7),
+        configure_stem_gain=(
+            isinstance(model, VelocityPredictionModel) and forward_model is model
+        ),
+        select_note_stems_only=select_note_stems_only,
+        reject_out_of_range=False,
     )
-    stem_class_tensor = (
-        torch.tensor(stem_class_ids, dtype=torch.long)
-        .unsqueeze(0)
-        .to(device=target_device)
-    )
-
-    starts = np.array([item.note.start for item in flat_notes], dtype=np.float32)
-    ends = np.array([item.note.end for item in flat_notes], dtype=np.float32)
-    pitches = np.array([item.note.pitch for item in flat_notes], dtype=np.int64)
-    programs = np.array([item.program for item in flat_notes], dtype=np.int64)
-    is_drums = np.array([item.is_drum for item in flat_notes], dtype=np.int64)
-    stem_indices = np.array([item.stem_index for item in flat_notes], dtype=np.int64)
-
-    total_duration_seconds = float(max_samples) / float(config.sample_rate)
-    window_samples = int(window_seconds * config.sample_rate)
-    if window_samples <= 0:
-        raise ValueError("window_seconds is too small for the model sample rate")
-
-    if total_duration_seconds <= window_seconds:
-        window_starts_seconds = [0.0]
-    else:
-        window_starts_seconds = list(np.arange(0.0, total_duration_seconds, window_seconds))
-
-    predicted_velocities = np.full(len(flat_notes), 80, dtype=np.int32)
-    predicted_stem_gains_db_list: list[np.ndarray] = []
-
-    with torch.inference_mode():
-        for win_start in tqdm(
-            window_starts_seconds,
-            desc="Predicting velocity",
-            disable=disable_tqdm,
-        ):
-            win_end = win_start + window_seconds
-            note_mask_in_win = (starts >= win_start) & (starts < win_end)
-
-            indices_in_win = np.where(note_mask_in_win)[0]
-            if len(indices_in_win) == 0:
-                continue
-
-            sample_start = int(win_start * config.sample_rate)
-            sample_end = min(sample_start + window_samples, max_samples)
-            window_stem_indices = stem_indices[indices_in_win]
-            if select_note_stems_only:
-                # stem-gainを使わない経路では、当該窓にノートがあるstemだけをbackboneへ
-                # 通す。stem indexは選択後の局所indexへ詰め直す。
-                selected_stem_indices = np.unique(window_stem_indices)
-                sub_audio = audio_tensor[
-                    :, selected_stem_indices.tolist(), :, sample_start:sample_end
-                ]
-                local_stem_indices = np.searchsorted(
-                    selected_stem_indices,
-                    window_stem_indices,
-                )
-                window_stem_class_tensor = stem_class_tensor[
-                    :, selected_stem_indices.tolist()
-                ]
-            else:
-                sub_audio = audio_tensor[:, :, :, sample_start:sample_end]
-                local_stem_indices = window_stem_indices
-                window_stem_class_tensor = stem_class_tensor
-
-            win_starts = (starts[indices_in_win] - win_start).astype(np.float32)
-            win_ends = (ends[indices_in_win] - win_start).astype(np.float32)
-
-            note_start_tensor = (
-                torch.from_numpy(win_starts).unsqueeze(0).to(device=target_device, dtype=torch.float32)
-            )
-            note_end_tensor = (
-                torch.from_numpy(win_ends).unsqueeze(0).to(device=target_device, dtype=torch.float32)
-            )
-            note_pitch_tensor = (
-                torch.from_numpy(pitches[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_program_tensor = (
-                torch.from_numpy(programs[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_is_drum_tensor = (
-                torch.from_numpy(is_drums[indices_in_win]).unsqueeze(0).to(device=target_device)
-            )
-            note_stem_index_tensor = (
-                torch.from_numpy(local_stem_indices).unsqueeze(0).to(device=target_device)
-            )
-
-            forward_kwargs: dict[str, Any] = {
-                "note_start_seconds": note_start_tensor,
-                "note_end_seconds": note_end_tensor,
-                "note_pitch": note_pitch_tensor,
-                "note_program": note_program_tensor,
-                "note_is_drum": note_is_drum_tensor,
-                "note_stem_index": note_stem_index_tensor,
-                "stem_class_id": window_stem_class_tensor,
-            }
-            if configure_stem_gain:
-                forward_kwargs["include_stem_gain"] = bool(
-                    apply_stem_gain_to_cc7
-                )
-            outputs = forward_model(sub_audio, **forward_kwargs)
-
-            velocity_expected = outputs["velocity_expected"].squeeze(0).cpu().numpy()
-            velocity_clamped = np.clip(np.round(velocity_expected), 1, 127).astype(np.int32)
-            predicted_velocities[indices_in_win] = velocity_clamped
-
-            if "stem_gain_db" in outputs:
-                stem_gain_np = outputs["stem_gain_db"].squeeze(0).cpu().numpy()
-                predicted_stem_gains_db_list.append(stem_gain_np)
-            del outputs
-
-    for idx, record in enumerate(flat_notes):
-        record.note.velocity = int(predicted_velocities[idx])
+    for record, velocity in zip(flat_notes, predictions.velocities):
+        record.note.velocity = int(velocity)
 
     if not apply_stem_gain_to_cc7:
         for pm_obj in loaded_midi_objs.values():
-            _set_fixed_loudness_controls(pm_obj.instruments)
+            _apply_loudness_controls_to_instruments(
+                pm_obj.instruments,
+                loudness_controls,
+            )
 
     # 旧joint checkpointを明示的に指定した場合だけ予測gainをCC#7へ反映する。
     stem_gain_by_name: dict[str, float] = {}
-    if predicted_stem_gains_db_list:
-        mean_stem_gains = np.mean(np.stack(predicted_stem_gains_db_list, axis=0), axis=0)
-        for i, s_name in enumerate(active_stem_names):
-            stem_gain_by_name[s_name] = float(mean_stem_gains[i])
+    if predictions.stem_gains_db is not None:
+        for index, stem_name in enumerate(active_stem_names):
+            stem_gain_by_name[stem_name] = float(
+                predictions.stem_gains_db[index]
+            )
 
     if apply_stem_gain_to_cc7 and stem_gain_by_name:
         for s_name, pm_obj in loaded_midi_objs.items():
@@ -754,7 +624,9 @@ def predict_velocity_for_stem_midis(
             template_midi_path=template_midi_path,
             output_midi_path=output_midi_path,
             note_records=flat_notes,
-            set_fixed_loudness_controls=not apply_stem_gain_to_cc7,
+            loudness_controls=(
+                "preserve" if apply_stem_gain_to_cc7 else loudness_controls
+            ),
         )
 
     if output_midi_path is not None:
@@ -766,7 +638,10 @@ def predict_velocity_for_stem_midis(
             max_melodic_instruments=max_melodic_instruments,
         )
         if not apply_stem_gain_to_cc7:
-            _set_fixed_loudness_controls(merged_midi.instruments)
+            _apply_loudness_controls_to_instruments(
+                merged_midi.instruments,
+                loudness_controls,
+            )
 
         destination_path = Path(output_midi_path)
         destination_path.parent.mkdir(parents=True, exist_ok=True)

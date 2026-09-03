@@ -58,12 +58,14 @@ tsumugi works best on clean, sustained material where each stem is monophonic. A
 - 🎚️ **Per-note velocity** — a dedicated post-processing model estimates dynamics from separated stems
 - 🎯 **Beat, chord, and key** — optional MIDI-frame models, disabled by default
 - 🧪 **[Experimental] Instrument classification** — a 36-class head for per-instrument MIDI tracks
+- 🐍 **Python API** — `Transcriber` and `VelocityEstimator` load a checkpoint once and work on files or in-memory audio and MIDI from your own code
 
 <details>
 <summary><b>Changelog</b></summary>
 
 | Date | Update |
 | --- | --- |
+| 2026-09-02 | 🐍 Made tsumugi installable as a dependency of other Python projects. Added `Transcriber` and `VelocityEstimator`, which reuse the loaded model across calls. Fixed velocity estimation failing on a short segment at the end of the audio. |
 | 2026-09-01 | 🥁 Added Drum model v1.5 (`--type drums_v1_5`) and made it the Colab default for drum stems. On the real-audio evaluation set (50 ms tolerance, audio-aligned, canonical drum pitches: 40→38 and 57→49), exact F1 improved from 0.6157 to 0.6890 for Drum Kit (+7.3 points) and from 0.1879 to 0.4044 for All Percussions (+21.7 points). |
 | 2026-08-25 | 🎤 Added Vocal Harmony model v1.5 (`--type vocal_harmony_v1_5`) and made it the Colab default for `vocals` stems. COnP improved from 0.6052 to 0.6814 on the held-out MIR-ST500 split. |
 | 2026-08-20 | ⚡ Migrated to uv and PyTorch 2.13. Added MPS inference and AMP/regional compile controls; reduced device synchronization, temporary copies, and repeated stem loading. Two changes intentionally affect output: CUDA attention no longer downcasts implicitly (FP32 is now the default), and V1 window batching propagates decode state in window order. |
@@ -115,7 +117,7 @@ uv sync --locked --extra evaluation  # evaluation scripts
 uv sync --locked --extra training    # training
 ```
 
-`uv sync` creates `.venv/`. Activate it with `source .venv/bin/activate`, or prefix commands with `uv run`.
+`uv sync` creates `.venv/` and installs the checkout into it as an editable package. Activate it with `source .venv/bin/activate`, or prefix commands with `uv run`.
 
 `.python-version` selects Python 3.12 as the development default without narrowing the supported 3.10–3.14 range. If 3.12 is not installed, uv downloads a managed CPython unless downloads are disabled or the machine is offline.
 
@@ -134,6 +136,20 @@ MPS-specific tests are skipped when MPS is unavailable. The compile regression t
 RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 ```
 
+### Installing into another project
+
+tsumugi is not published on PyPI. Add it to another project from a local checkout or from a pinned Git commit. The distribution name is `instrument-agnostic-amt`; the import name is `instrument_agnostic_amt`.
+
+```bash
+# Editable install from a local checkout
+uv add --editable /path/to/tsumugi
+
+# Pinned Git dependency
+uv add git+https://github.com/anime-song/tsumugi.git --rev <commit>
+```
+
+The package contains the `instrument_agnostic_amt` modules and their bundled data (the instrument taxonomy JSON files). Repository-level scripts such as `infer.py`, the notebook, the tests, and model checkpoints are not included; the packaged CLI is available as `python -m instrument_agnostic_amt.cli.infer`. The consuming project resolves and locks dependency versions itself; this repository's `uv.lock` is not reused. When tsumugi is added as a path or Git dependency, uv does read this repository's `[tool.uv.sources]` and `[[tool.uv.index]]`, so Linux and Windows resolve PyTorch from the CUDA 13.0 index exactly as this checkout does. Installing the built wheel with pip or `uv pip` carries none of that configuration, so configure the PyTorch index yourself in that case. The installed package exposes the Python API described under [Inference](#python-api).
+
 ---
 
 ## Inference
@@ -143,6 +159,37 @@ python infer.py --audio input_song.wav
 ```
 
 If `--checkpoint` is omitted, the model is downloaded from Hugging Face.
+
+### Python API
+
+`Transcriber` runs the same inference from Python. One instance loads one checkpoint and reuses the model across calls. `from_checkpoint()` takes an existing, trusted local checkpoint and never downloads one; run the CLI once or fetch the file from Hugging Face yourself.
+
+```python
+from pathlib import Path
+
+from instrument_agnostic_amt import Transcriber, TranscriptionOptions
+
+transcriber = Transcriber.from_checkpoint("checkpoints/best_model.pth")
+result = transcriber.transcribe(
+    "input_song.wav",
+    options=TranscriptionOptions(allowed_instruments=("piano", "electric_piano", "plucked_keyboard")),
+)
+Path("input_song.mid").write_bytes(result.midi_bytes)
+```
+
+`from_checkpoint()` also accepts `device`, `amp`, `amp_dtype`, `compile`, and `compile_mode`, and `TranscriptionOptions` / `MidiExportOptions` cover the decoding and MIDI export arguments listed under [Key arguments](#key-arguments). Two defaults differ from the CLI: no CC7 volume events are written unless `instrument_volumes` is given, and no progress bar is shown unless `show_progress=True`.
+
+`transcribe()` accepts a path to any file SoundFile can read, or a `DecodedAudio(samples, sample_rate)` for audio you decoded yourself (for example M4A, which libsndfile cannot open): a CPU `float32` tensor shaped `[channels, frames]` with one or two channels and values in the ±1.0 range. Mono is duplicated to stereo and any sample rate is resampled. `result.midi_bytes` is the authoritative output; `result.notes` is the decoder output before MIDI export applies drum pitch aliases, track limiting, and the minimum note length. One instance handles one call at a time and raises `TranscriberBusyError` immediately on a concurrent call.
+
+When you are done with a model, call `close()` or use the instance as a context manager. Either way the transcriber waits for a call in progress, drops the model, and releases the accelerator cache. A closed instance rejects further calls with `RuntimeError`; `model_info` stays readable.
+
+```python
+with Transcriber.from_checkpoint("checkpoints/best_model.pth") as transcriber:
+    for audio_path in audio_paths:
+        result = transcriber.transcribe(audio_path)
+        Path(audio_path).with_suffix(".mid").write_bytes(result.midi_bytes)
+# The model and the accelerator cache are released here.
+```
 
 ### Device selection
 
@@ -195,6 +242,25 @@ python infer_velocity.py \
 ```
 
 Name files in the stem directory after their stems, such as `vocals.wav`, `bass.wav`, `drums.wav`, and `other.wav`. `--compile-velocity` regionally compiles the velocity backbone independently of the core AMT `--compile`. See [`instrument_agnostic_amt/velocity/README.md`](instrument_agnostic_amt/velocity/README.md) for training and data preparation.
+
+`VelocityEstimator` runs the same model from Python on one logical stem per call: a MIDI whose notes all belong to that stem, plus the stem's audio. The MIDI may come from tsumugi, from another transcriber, or from a merge done by your application; the estimator never guesses the stem from track names and never merges or drops notes.
+
+```python
+from pathlib import Path
+
+from instrument_agnostic_amt import VelocityEstimator, VelocityOptions
+
+estimator = VelocityEstimator.from_checkpoint("checkpoints/best_velocity_model.pth")
+result = estimator.estimate(
+    midi="stem_midis/song_bass.mid",    # path or MIDI bytes
+    audio="separated_stems/bass.wav",   # path or DecodedAudio
+    stem_kind="bass",
+    options=VelocityOptions(loudness_controls="preserve"),
+)
+Path("song_bass_velocity.mid").write_bytes(result.midi_bytes)
+```
+
+`stem_kind` is one of `bass`, `drums`, `guitar`, `other`, `piano`, `vocals`, or `unknown`. Only Note On velocities change in the output; every other event, track, and tick is preserved. `loudness_controls` handles CC7/CC11: `velocity_only` (the default, as in the CLI) sets them to 127 on note-bearing channels, `preserve` keeps them, and `strip` removes them. A MIDI without notes is returned unchanged with `velocity_applied=False`. Notes are predicted once each in windows of `window_seconds` (default 8 s); a trailing partial window is evaluated on the last full window of audio. A note that starts after the audio ends, or a `window_seconds` shorter than the model's CQT can process, raises `ValueError`. So does a MIDI whose Note On events cannot be paired into notes, such as a Note On without a matching Note Off, or a note whose Note Off falls on the same tick as its Note On; clean those up before calling. Like `Transcriber`, `from_checkpoint()` takes an existing, trusted local checkpoint and never downloads, and one instance handles one call at a time (`VelocityEstimatorBusyError`). `close()` and `with VelocityEstimator.from_checkpoint(...) as estimator:` work the same way as for `Transcriber`.
 
 ### Key arguments
 

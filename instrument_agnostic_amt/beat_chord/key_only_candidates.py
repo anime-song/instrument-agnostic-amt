@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
+from ..cli import compat as amt_infer
 from ..runtime import (
     empty_device_cache,
     is_amp_supported,
@@ -458,8 +459,6 @@ class StemTranscriptionRunner:
             cached[0].eval()
             return cached
 
-        import infer as amt_infer
-
         checkpoint_name = amt_infer.MODEL_CHECKPOINT_FILENAMES[model_type]
         checkpoint_path = self.amt_checkpoint_dir / checkpoint_name
         checkpoint_path = amt_infer._ensure_checkpoint(
@@ -571,8 +570,6 @@ class StemTranscriptionRunner:
         if is_valid_midi_file(output_midi) and not self.force:
             LOGGER.info("Reusing stem MIDI: %s", output_midi)
             return output_midi
-
-        import infer as amt_infer
 
         model_type = resolve_stem_model_type(stem_name)
         model, forward_model, config, settings = self._get_amt_bundle(model_type)
