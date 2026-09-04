@@ -5,8 +5,8 @@ from pathlib import Path
 import pretty_midi
 import pytest
 
-from instrument_agnostic_amt.inference.midi import build_midi
-from instrument_agnostic_amt.inference.types import PredictedNote
+from instrument_agnostic_amt.amt.inference.midi import build_midi
+from instrument_agnostic_amt.amt.inference.types import PredictedNote
 
 
 def test_build_midi_resolves_same_pitch_overlaps_across_slots(

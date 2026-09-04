@@ -12,7 +12,7 @@ import soundfile as sf
 import torch
 import torchaudio.functional as AF
 
-from instrument_agnostic_amt.data.audio import inspect_audio, read_audio_frames
+from instrument_agnostic_amt.amt.data.audio import inspect_audio, read_audio_frames
 
 
 def _iter_audio_files(path: Path) -> Iterable[Path]:

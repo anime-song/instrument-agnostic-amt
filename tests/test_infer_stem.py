@@ -12,8 +12,8 @@ import pytest
 import soundfile as sf
 import torch
 
-import infer_stem
-from infer_stem import (
+from instrument_agnostic_amt.cli import infer_stem
+from instrument_agnostic_amt.cli.infer_stem import (
     get_beat_chord_models,
     get_stem_pipeline_models,
     merge_midis_logic,

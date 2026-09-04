@@ -11,7 +11,7 @@ from instrument_agnostic_amt.beat_chord.decoding.meter_grouping import (
     group_boundary_log_odds_array,
     score_major_groupings,
 )
-from instrument_agnostic_amt.beat_chord.heads.meter_grouping import (
+from recipes.beat_chord.meter_grouping_loss import (
     major_grouping_loss,
 )
 from instrument_agnostic_amt.beat_chord.meter_grouping import (

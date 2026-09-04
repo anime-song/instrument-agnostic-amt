@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...modeling.backbone import AudioFeatureExtractor, V1Backbone
+from ...amt.modeling.backbone import AudioFeatureExtractor, V1Backbone
 
 
 @dataclass(frozen=True)

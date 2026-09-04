@@ -4,7 +4,7 @@ import random
 
 import torch
 
-from instrument_agnostic_amt.beat_chord.data.modulation import (
+from recipes.beat_chord.datasets.modulation import (
     ModulationAugmentConfig,
     ModulationCandidate,
     WindowHarmonyContext,
@@ -12,7 +12,7 @@ from instrument_agnostic_amt.beat_chord.data.modulation import (
     choose_modulation_candidate,
     enumerate_modulation_candidates,
 )
-from instrument_agnostic_amt.beat_chord.heads.chord import ChordConfig, ChordLoss
+from recipes.beat_chord.chord import ChordConfig, ChordLoss
 
 
 def test_modulation_candidates_do_not_require_shifted_song_files() -> None:

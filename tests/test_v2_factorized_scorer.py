@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from argparse import Namespace
-
 import torch
 
-from instrument_agnostic_amt.modeling.heads.semi_crf import (
+from instrument_agnostic_amt.amt.modeling.heads.semi_crf import (
     _build_interval_score,
     build_factorized_interval_score,
     compute_factorized_pair_interval_loss,
@@ -14,15 +12,16 @@ from instrument_agnostic_amt.modeling.heads.semi_crf import (
     decode_pitch_intervals,
     decode_pitch_intervals_sparse,
 )
-from instrument_agnostic_amt.modeling.heads.interval_boundaries import (
+from instrument_agnostic_amt.amt.modeling.heads.interval_boundaries import (
     PitchIntervalTargets,
 )
-from instrument_agnostic_amt.modeling.heads.v2 import V2OverlapSemiCRFHead
-from instrument_agnostic_amt.modeling.model import (
+from instrument_agnostic_amt.amt.modeling.heads.v2 import V2OverlapSemiCRFHead
+from instrument_agnostic_amt.amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )
-from instrument_agnostic_amt.training.losses import compute_losses
+from recipes.amt.loss_config import AMTLossConfig
+from recipes.amt.losses import compute_losses
 
 
 def _expanded_pair_features(
@@ -350,23 +349,26 @@ def test_v2_training_loss_uses_factorized_outputs_end_to_end() -> None:
         positive_pair_ids=[pair_id],
         pair_presence=pair_presence,
     )
-    args = Namespace(
+    loss_config = AMTLossConfig(
         semi_crf_loss_weight=1.0,
-        pair_gate_loss_weight=1.0,
         semi_crf_false_negative_cost=0.0,
         semi_crf_false_positive_cost=0.0,
+        semi_crf_track_batch_size=2,
+        semi_crf_loss_backend="torch",
         interval_presence_loss_weight=1.0,
         interval_offset_loss_weight=1.0,
+        instrument_loss_weight=1.0,
+        instrument_loss_type="bce",
         instrument_pair_train_topk=2,
         instrument_pair_random_negatives=1,
         instrument_pair_max_pairs=4,
-        semi_crf_track_batch_size=2,
+        pair_gate_loss_weight=1.0,
     )
 
     loss, metrics = compute_losses(
         outputs,
         {"interval_targets": [target]},
-        args=args,
+        config=loss_config,
         model=model,
     )
     loss.backward()

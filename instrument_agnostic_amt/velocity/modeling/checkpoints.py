@@ -6,12 +6,12 @@ from typing import Any, Mapping
 
 import torch
 
-from ...modeling.checkpoints import (
+from ...amt.modeling.checkpoints import (
     extract_model_config,
     load_checkpoint,
     select_state_dict,
 )
-from ...modeling.model import remap_legacy_v1_state_dict
+from ...amt.modeling.model import remap_legacy_v1_state_dict
 from .model import VelocityPredictionModel
 
 

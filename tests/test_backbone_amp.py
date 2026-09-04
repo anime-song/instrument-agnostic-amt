@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from instrument_agnostic_amt.modeling.backbone import StemConv
+from instrument_agnostic_amt.amt.modeling.backbone import StemConv
 
 
 def _small_stem() -> StemConv:

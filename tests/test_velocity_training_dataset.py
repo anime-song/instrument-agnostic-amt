@@ -6,13 +6,9 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from instrument_agnostic_amt.velocity.training.collate import (
-    collate_velocity_batch,
-)
-from instrument_agnostic_amt.velocity.training.dataset import assign_song_split
-from instrument_agnostic_amt.velocity.training.stem_dataset import (
-    SyntheticStemVelocityDataset,
-)
+from recipes.velocity.collate import collate_velocity_batch
+from recipes.velocity.split import assign_song_split
+from recipes.velocity.stem_dataset import SyntheticStemVelocityDataset
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:

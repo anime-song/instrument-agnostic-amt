@@ -4,11 +4,11 @@ import os
 
 import torch
 
-from instrument_agnostic_amt.cli.train import (
+from recipes.amt.train import (
     compile_backbone_transformers,
     drop_unsearchable_path_entries,
 )
-from instrument_agnostic_amt.modeling.model import (
+from instrument_agnostic_amt.amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )

@@ -8,14 +8,20 @@ AMTで生成したmerged MIDIをフレーム化し、ビート、ダウンビー
 ## 構成
 
 ```text
-beat_chord/
-|-- cli/                 # 事前学習、joint学習、推論の入口
-|-- data/                # コード転調augmentation
-|-- datasets/            # beat、chord、MIDI事前学習dataset
-|-- heads/               # beat/chord head、loss
+instrument_agnostic_amt/beat_chord/
+|-- cli/                 # 推論の入口
+|-- decoding/            # beat/chord decoder
+|-- heads/               # beat/chord model head
 |-- models/              # MIDI-frame stem、backbone、joint model
 |-- config.py            # モデル設定
-|-- midi_roll.py         # merged MIDIからonset/sustain rollを生成
+`-- midi_roll.py         # merged MIDIからonset/sustain rollを生成
+
+recipes/beat_chord/
+|-- datasets/            # beat、chord、MIDI事前学習dataset
+|-- beat.py              # beat loss
+|-- chord.py             # chord loss
+|-- train.py             # joint学習
+|-- pretrain_beat.py     # MIDI事前学習
 `-- training_utils.py    # checkpoint、EMA、AMP、W&B
 ```
 
@@ -50,7 +56,7 @@ beat/chordの教師ラベルとmerged MIDIは同じ曲名にしてください�
 ## 1. MIDIからbeatを事前学習
 
 ```bash
-python pretrain_midi_frame_beat.py \
+python -m recipes.beat_chord.pretrain_beat \
   --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis \
   --epochs 10 \
   --batch_size 4
@@ -65,7 +71,7 @@ tempo mapとtime-signature mapからbeat、downbeat、meter教師を作ります
 事前学習checkpointを初期値に使う場合:
 
 ```bash
-python train_midi_frame_beat_chord.py \
+python -m recipes.beat_chord.train \
   --beat_dataset_path beat_chord_dataset/beat_dataset \
   --chord_dataset_path beat_chord_dataset/chord_dataset \
   --midi_dir midi_dataset/merged \
@@ -87,7 +93,7 @@ AMP無効化は `--no_amp`、短い動作確認は `--max_steps_per_epoch 1` を
 窓全体の長さは変わりません。
 
 ```bash
-python train_midi_frame_beat_chord.py \
+python -m recipes.beat_chord.train \
   --midi_rubato_prob 0.5 \
   --midi_rubato_strength 0.12 \
   --midi_rubato_period_sec 4.0
@@ -101,7 +107,7 @@ python train_midi_frame_beat_chord.py \
 ## 3. MIDIからbeat/chordを推論
 
 ```bash
-python midi_frame_infer.py \
+python -m instrument_agnostic_amt.beat_chord.cli.infer \
   --checkpoint beat_chord_checkpoints/midi_frame/checkpoint_epoch_20.pth \
   --midi_path midi_dataset/merged/song.mid \
   --quality_json beat_chord_dataset/chord_dataset/quality.json
@@ -136,7 +142,7 @@ python scripts/distill_model.py \
 手元の MIDI ディレクトリ（テンポ・拍子情報を含む）から、本学習用の `beat_dataset` (JSONラベル・WAV音声) を自動作成します。
 
 ```bash
-python -m instrument_agnostic_amt.beat_chord.cli.convert_beat_dataset \
+python -m recipes.beat_chord.convert_beat_dataset \
   --midi_dir beat_dataset_midi \
   --output_dir beat_chord_dataset/beat_dataset
 ```
@@ -144,9 +150,9 @@ python -m instrument_agnostic_amt.beat_chord.cli.convert_beat_dataset \
 各入口はmoduleとしても実行できます。
 
 ```bash
-python -m instrument_agnostic_amt.beat_chord.cli.convert_beat_dataset --help
-python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat --help
-python -m instrument_agnostic_amt.beat_chord.cli.train --help
+python -m recipes.beat_chord.convert_beat_dataset --help
+python -m recipes.beat_chord.pretrain_beat --help
+python -m recipes.beat_chord.train --help
 python -m instrument_agnostic_amt.beat_chord.cli.infer --help
 ```
 
@@ -202,7 +208,7 @@ can be checked independently.
 実データを使う最小joint学習:
 
 ```bash
-python train_midi_frame_beat_chord.py \
+python -m recipes.beat_chord.train \
   --epochs 1 \
   --max_steps_per_epoch 1 \
   --batch_size 1 \

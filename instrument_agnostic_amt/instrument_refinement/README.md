@@ -69,7 +69,7 @@ artifacts. They do not appear in Python modules, tests, or public documentation.
 ## Prepare the manifest
 
 ```bash
-python prepare_instrument_refinement.py
+python -m recipes.instrument_refinement.prepare_manifest
 ```
 
 The default local config writes:
@@ -109,7 +109,7 @@ training. Use `--no-balanced-sampling` only for an unbalanced ablation.
 ## Train
 
 ```bash
-python train_instrument_refinement.py \\
+python -m recipes.instrument_refinement.train \\
   --init-amt checkpoints/best_model.pth \\
   --freeze-backbone
 ```
@@ -129,7 +129,7 @@ scanning every hop of the full source collection.
 ## Infer
 
 ```bash
-python infer_instrument_refinement.py \\
+python -m instrument_agnostic_amt.instrument_refinement.cli.infer \\
   --audio separated/other.wav \\
   --midi amt/other.mid \\
   --stem-name other \\

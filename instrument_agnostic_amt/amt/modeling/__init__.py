@@ -1,0 +1,2 @@
+"""Core AMT model components."""
+

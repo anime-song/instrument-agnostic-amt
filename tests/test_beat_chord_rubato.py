@@ -5,7 +5,7 @@ import random
 import pytest
 import torch
 
-from instrument_agnostic_amt.beat_chord.datasets.augment import (
+from recipes.beat_chord.datasets.augment import (
     MidiAugmentConfig,
     RubatoGesture,
     RubatoTimeMap,

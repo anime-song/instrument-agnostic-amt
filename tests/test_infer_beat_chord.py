@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from instrument_agnostic_amt.beat_chord.cli import infer as beat_chord_infer
-from infer_beat_chord import (
+from instrument_agnostic_amt.beat_chord.cli.infer import (
     DEFAULT_BEAT_CHORD_CHECKPOINT_FILENAME,
     ensure_beat_chord_checkpoint,
     load_beat_chord_model,

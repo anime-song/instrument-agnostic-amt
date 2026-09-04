@@ -6,10 +6,10 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from instrument_agnostic_amt.inference import v1_windowed
-from instrument_agnostic_amt.inference.types import InferenceSettings
-from instrument_agnostic_amt.inference.v1_windowed import decode_v1_notes
-from instrument_agnostic_amt.modeling.model import (
+from instrument_agnostic_amt.amt.inference import v1_windowed
+from instrument_agnostic_amt.amt.inference.types import InferenceSettings
+from instrument_agnostic_amt.amt.inference.v1_windowed import decode_v1_notes
+from instrument_agnostic_amt.amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )

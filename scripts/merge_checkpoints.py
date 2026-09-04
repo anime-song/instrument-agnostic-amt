@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from instrument_agnostic_amt.modeling.model import remap_legacy_v1_state_dict
+from instrument_agnostic_amt.amt.modeling.model import remap_legacy_v1_state_dict
 
 
 STATE_DICT_KEYS = ("ema_state_dict", "model_state_dict")
@@ -31,7 +31,7 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 def _select_inference_state_dict(
     checkpoint: Mapping[str, Any],
 ) -> tuple[Mapping[str, torch.Tensor], str]:
-    """Match infer.py: prefer EMA, then model_state_dict, then a raw state dict."""
+    """Match the AMT inference loader: prefer EMA, then model_state_dict, then raw."""
     for key in STATE_DICT_KEYS:
         state_dict = checkpoint.get(key)
         if isinstance(state_dict, Mapping):

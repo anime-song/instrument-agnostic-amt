@@ -5,14 +5,14 @@ from pathlib import Path
 import mido
 import torch
 
-from instrument_agnostic_amt.beat_chord.datasets import (
+from recipes.beat_chord.datasets import (
     MidiAugmentConfig,
     MidiKeyOnlyDataset,
     midi_chord_collate_fn,
     read_midi_key_segments,
 )
-from instrument_agnostic_amt.beat_chord.heads.chord import ChordConfig, ChordLoss
-from instrument_agnostic_amt.beat_chord.cli.train import is_key_only_training_step
+from recipes.beat_chord.train import is_key_only_training_step
+from recipes.beat_chord.chord import ChordConfig, ChordLoss
 
 
 def _write_key_only_midi(path: Path) -> None:

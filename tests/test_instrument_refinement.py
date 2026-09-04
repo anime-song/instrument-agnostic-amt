@@ -27,9 +27,6 @@ from instrument_agnostic_amt.instrument_refinement.data.labels import (
     inference_stem_group,
     refinement_stem_extra_class_ids,
 )
-from instrument_agnostic_amt.instrument_refinement.data.manifest import (
-    build_refinement_manifest,
-)
 from instrument_agnostic_amt.instrument_refinement.data.midi import (
     load_refinement_note_table,
 )
@@ -44,20 +41,15 @@ from instrument_agnostic_amt.instrument_refinement.modeling.model import (
     InstrumentRefinementConfig,
     InstrumentRefinementModel,
 )
-from instrument_agnostic_amt.instrument_refinement.training.collate import (
-    collate_refinement_batch,
-)
-from instrument_agnostic_amt.instrument_refinement.training.dataset import (
+from recipes.instrument_refinement.collate import collate_refinement_batch
+from recipes.instrument_refinement.dataset import (
     ClassBalancedSampler,
     ManifestInstrumentRefinementDataset,
     _manifest_path,
 )
-from instrument_agnostic_amt.instrument_refinement.training.forward import (
-    forward_refinement_batch,
-)
-from instrument_agnostic_amt.instrument_refinement.training.losses import (
-    compute_refinement_losses,
-)
+from recipes.instrument_refinement.forward import forward_refinement_batch
+from recipes.instrument_refinement.losses import compute_refinement_losses
+from recipes.instrument_refinement.manifest import build_refinement_manifest
 from instrument_agnostic_amt.taxonomy.instrument_classes import (
     INSTRUMENT_CLASSES,
     get_instrument_class_id_by_name,
@@ -637,7 +629,7 @@ def test_other_group_can_mix_one_to_n_configured_sources(tmp_path: Path, monkeyp
         composite_probability=1.0,
     )
     monkeypatch.setattr(
-        "instrument_agnostic_amt.instrument_refinement.training.dataset.random.randint",
+        "recipes.instrument_refinement.dataset.random.randint",
         lambda _minimum, maximum: maximum,
     )
     batch = collate_refinement_batch([dataset[0]])
@@ -1297,7 +1289,7 @@ def test_sampler_without_weights_keeps_previous_behaviour() -> None:
 
 
 def test_parse_dataset_weights_rejects_malformed_values() -> None:
-    from instrument_agnostic_amt.instrument_refinement.cli.train import parse_dataset_weights
+    from recipes.instrument_refinement.train import parse_dataset_weights
 
     assert parse_dataset_weights(["real_recordings=3", "cocochorales=0.5"]) == {
         "real_recordings": 3.0,
@@ -1366,7 +1358,7 @@ def test_force_split_rejects_an_unknown_split(tmp_path: Path) -> None:
 
 
 def test_dataset_weights_load_from_json_and_yaml(tmp_path: Path) -> None:
-    from instrument_agnostic_amt.instrument_refinement.cli.train import load_dataset_weights
+    from recipes.instrument_refinement.train import load_dataset_weights
 
     json_path = tmp_path / "weights.json"
     json_path.write_text(json.dumps({"real_recordings": 6, "cocochorales": 1}), encoding="utf-8")
@@ -1387,7 +1379,7 @@ def test_dataset_weights_load_from_json_and_yaml(tmp_path: Path) -> None:
 
 
 def test_dataset_weights_file_rejects_bad_content(tmp_path: Path) -> None:
-    from instrument_agnostic_amt.instrument_refinement.cli.train import load_dataset_weights
+    from recipes.instrument_refinement.train import load_dataset_weights
 
     missing = tmp_path / "nope.json"
     with pytest.raises(SystemExit, match="not found"):
@@ -1411,7 +1403,7 @@ def test_dataset_weights_file_rejects_bad_content(tmp_path: Path) -> None:
 
 def test_command_line_overrides_the_weights_file_and_typos_are_rejected(tmp_path: Path) -> None:
     """名前を打ち間違えると重みが効かないまま学習が回ってしまうので、まとめて弾く。"""
-    from instrument_agnostic_amt.instrument_refinement.cli.train import resolve_dataset_weights
+    from recipes.instrument_refinement.train import resolve_dataset_weights
 
     weights_file = tmp_path / "weights.yaml"
     weights_file.write_text("real_recordings: 6\ncocochorales: 5\n", encoding="utf-8")

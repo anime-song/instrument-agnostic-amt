@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import pretty_midi
 
-from instrument_agnostic_amt.beat_chord.cli.convert_beat_dataset import (
+from recipes.beat_chord.convert_beat_dataset import (
     convert_midi_dir_to_beat_dataset,
 )
 
@@ -128,7 +128,7 @@ def test_convert_midi_with_tempo_and_time_signature_changes(tmp_path: Path) -> N
 def test_ritardando_beat_times_and_dataset_loading(tmp_path: Path) -> None:
     """1小節内で rit. (減速) がある場合に beat_times が正確に非線形計算されるかを検証する。"""
     import mido
-    from instrument_agnostic_amt.beat_chord.datasets.beat import MidiBeatDataset
+    from recipes.beat_chord.datasets.beat import MidiBeatDataset
 
     midi_dir = tmp_path / "rit_midi"
     output_dir = tmp_path / "rit_beat_output"

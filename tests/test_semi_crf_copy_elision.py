@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from instrument_agnostic_amt.modeling.heads.semi_crf import (
+from instrument_agnostic_amt.amt.modeling.heads.semi_crf import (
     _build_dense_sparse_candidates,
     _select_sparse_candidates,
     viterbiBackward,

@@ -8,14 +8,14 @@ import pretty_midi
 import soundfile as sf
 
 from instrument_agnostic_amt.velocity.data.midi import load_midi_note_table
-from instrument_agnostic_amt.velocity.synthesis.config import SyntheticDataConfig
-from instrument_agnostic_amt.velocity.synthesis.midi import write_target_velocity_midi
-from instrument_agnostic_amt.velocity.synthesis.mix import (
+from recipes.velocity.synthesis.config import SyntheticDataConfig
+from recipes.velocity.synthesis.midi import write_target_velocity_midi
+from recipes.velocity.synthesis.mix import (
     mix_rendered_stems,
     write_dataset_manifest,
 )
-from instrument_agnostic_amt.velocity.synthesis.plan import prepare_synthetic_plan
-from instrument_agnostic_amt.velocity.synthesis.sampling import (
+from recipes.velocity.synthesis.plan import prepare_synthetic_plan
+from recipes.velocity.synthesis.sampling import (
     sample_note_velocities,
     sample_stem_gains,
 )

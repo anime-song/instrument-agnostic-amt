@@ -8,7 +8,7 @@ import torch
 
 import instrument_agnostic_amt.runtime as runtime
 from instrument_agnostic_amt.beat_chord.key_only_candidates import parse_arguments
-from instrument_agnostic_amt.cli.infer import parse_args, process_file
+from instrument_agnostic_amt.amt.cli.infer import parse_args, process_file
 from instrument_agnostic_amt.instrument_refinement.cli.infer import (
     parse_args as parse_refinement_args,
 )

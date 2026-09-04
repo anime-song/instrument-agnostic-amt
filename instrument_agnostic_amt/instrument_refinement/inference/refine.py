@@ -23,8 +23,8 @@ import pretty_midi
 import torch
 from tqdm.auto import tqdm
 
-from ...inference.audio import load_audio
-from ...inference.instruments import resolve_stem_instrument_class_ids
+from ...amt.inference.audio import load_audio
+from ...amt.inference.instruments import resolve_stem_instrument_class_ids
 from ...runtime import (
     copy_tensors_to_cpu_once,
     is_amp_supported,

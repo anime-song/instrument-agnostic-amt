@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...modeling.backbone import AudioFeatureExtractor, V1Backbone
+from ...amt.modeling.backbone import AudioFeatureExtractor, V1Backbone
 from ...taxonomy.instrument_classes import NUM_INSTRUMENT_CLASSES
 from ..data.labels import FAMILY_NAMES, STEM_CONTEXT_NAMES
 

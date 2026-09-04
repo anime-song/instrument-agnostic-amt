@@ -6,13 +6,13 @@ import sys
 import pytest
 import torch
 
-from instrument_agnostic_amt.cli import train
-from instrument_agnostic_amt.modeling.heads import semi_crf
-from instrument_agnostic_amt.modeling.heads.semi_crf import (
+from instrument_agnostic_amt.amt.modeling.heads import semi_crf
+from instrument_agnostic_amt.amt.modeling.heads.semi_crf import (
     NeuralSemiCRFInterval,
     compute_factorized_pair_interval_loss,
     compute_pitch_interval_loss,
 )
+from recipes.amt import train
 
 
 TRITON_CUDA_AVAILABLE = bool(

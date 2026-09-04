@@ -6,10 +6,10 @@ import sys
 import pytest
 import torch
 
-from instrument_agnostic_amt.cli import infer
-from instrument_agnostic_amt.modeling.heads import semi_crf
-from instrument_agnostic_amt.modeling.heads.semi_crf import viterbiBackward
-from instrument_agnostic_amt.modeling.model import SemiCRFModelConfig
+from instrument_agnostic_amt.amt.cli import infer
+from instrument_agnostic_amt.amt.modeling.heads import semi_crf
+from instrument_agnostic_amt.amt.modeling.heads.semi_crf import viterbiBackward
+from instrument_agnostic_amt.amt.modeling.model import SemiCRFModelConfig
 
 
 TRITON_CUDA_AVAILABLE = bool(

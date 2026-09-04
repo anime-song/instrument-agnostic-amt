@@ -204,7 +204,7 @@ def test_batch_runner_routes_amp_to_core_amt_inference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infer as amt_infer
+    from instrument_agnostic_amt.amt.cli import infer as amt_infer
 
     inference_calls: list[dict[str, object]] = []
 
@@ -317,7 +317,7 @@ def test_batch_runner_routes_compiled_forward_to_core_amt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import infer as amt_infer
+    from instrument_agnostic_amt.amt.cli import infer as amt_infer
 
     eager_model = object()
     compiled_forward = object()

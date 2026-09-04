@@ -458,7 +458,7 @@ class StemTranscriptionRunner:
             cached[0].eval()
             return cached
 
-        import infer as amt_infer
+        from instrument_agnostic_amt.amt.cli import infer as amt_infer
 
         checkpoint_name = amt_infer.MODEL_CHECKPOINT_FILENAMES[model_type]
         checkpoint_path = self.amt_checkpoint_dir / checkpoint_name
@@ -572,7 +572,7 @@ class StemTranscriptionRunner:
             LOGGER.info("Reusing stem MIDI: %s", output_midi)
             return output_midi
 
-        import infer as amt_infer
+        from instrument_agnostic_amt.amt.cli import infer as amt_infer
 
         model_type = resolve_stem_model_type(stem_name)
         model, forward_model, config, settings = self._get_amt_bundle(model_type)

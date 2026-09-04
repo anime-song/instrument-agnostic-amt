@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from instrument_agnostic_amt.beat_chord.datasets.meter_aware_crop import (
+from recipes.beat_chord.datasets.meter_aware_crop import (
     MeterAwareCropConfig,
     choose_meter_aware_window_start,
 )

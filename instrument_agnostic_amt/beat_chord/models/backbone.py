@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from instrument_agnostic_amt.modeling.blocks.transformer import RMSNorm, Transformer
+from instrument_agnostic_amt.amt.modeling.blocks.transformer import RMSNorm, Transformer
 
 from ..config import MidiFrameModelConfig
 from .stem import MidiFrameStem

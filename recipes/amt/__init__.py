@@ -1,0 +1,1 @@
+"""Core AMT training recipe."""

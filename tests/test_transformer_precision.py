@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from instrument_agnostic_amt.modeling.blocks import transformer
+from instrument_agnostic_amt.amt.modeling.blocks import transformer
 
 
 def _capture_attention_dtypes(

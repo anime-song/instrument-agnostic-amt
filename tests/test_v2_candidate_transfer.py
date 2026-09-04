@@ -5,8 +5,8 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from instrument_agnostic_amt.inference.types import InferenceSettings
-from instrument_agnostic_amt.inference.windowed import _select_pair_candidates
+from instrument_agnostic_amt.amt.inference.types import InferenceSettings
+from instrument_agnostic_amt.amt.inference.windowed import _select_pair_candidates
 
 
 def _settings() -> InferenceSettings:

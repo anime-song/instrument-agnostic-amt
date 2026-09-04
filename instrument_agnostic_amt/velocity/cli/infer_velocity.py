@@ -23,7 +23,7 @@ from ...runtime import (
 )
 from ..modeling.checkpoints import load_checkpoint, select_state_dict
 from ..modeling.model import VelocityModelConfig, VelocityPredictionModel
-from ..training.dataset import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
+from ..stems import STEM_CLASS_BY_NAME, STEM_NAMES, UNKNOWN_STEM_CLASS
 
 HF_CHECKPOINT_BASE_URL = "https://huggingface.co/anime-song/instrument_agnostic_amt/resolve/main"
 DEFAULT_VELOCITY_CHECKPOINT_FILENAME = "best_velocity_model.pth"

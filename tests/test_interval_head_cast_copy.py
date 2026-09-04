@@ -7,15 +7,15 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from instrument_agnostic_amt.inference import v1_windowed
-from instrument_agnostic_amt.inference.types import InferenceSettings
-from instrument_agnostic_amt.inference.v1_windowed import decode_v1_notes
-from instrument_agnostic_amt.modeling.heads.interval_boundaries import (
+from instrument_agnostic_amt.amt.inference import v1_windowed
+from instrument_agnostic_amt.amt.inference.types import InferenceSettings
+from instrument_agnostic_amt.amt.inference.v1_windowed import decode_v1_notes
+from instrument_agnostic_amt.amt.modeling.heads.interval_boundaries import (
     FlattenedIntervalEntry,
     gather_interval_endpoint_features,
     gather_interval_sequence_features,
 )
-from instrument_agnostic_amt.modeling.model import (
+from instrument_agnostic_amt.amt.modeling.model import (
     AudioSemiCRFTransformer,
     SemiCRFModelConfig,
 )

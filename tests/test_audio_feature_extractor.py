@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from instrument_agnostic_amt.modeling.backbone import AudioFeatureExtractor
+from instrument_agnostic_amt.amt.modeling.backbone import AudioFeatureExtractor
 
 
 def _extractor(*, cqt_log_scale: bool = False) -> AudioFeatureExtractor:

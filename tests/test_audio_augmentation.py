@@ -12,7 +12,7 @@ import sys
 import numpy as np
 import pytest
 
-from instrument_agnostic_amt.data import augmentation as aug
+from recipes.common import augmentation as aug
 
 SAMPLE_RATE = 22_050
 

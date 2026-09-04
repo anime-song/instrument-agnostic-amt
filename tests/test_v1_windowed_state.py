@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from instrument_agnostic_amt.inference.types import InferenceSettings, PredictedNote
-from instrument_agnostic_amt.inference.windowed import decode_notes
-from instrument_agnostic_amt.modeling.model import SemiCRFModelConfig
+from instrument_agnostic_amt.amt.inference.types import InferenceSettings, PredictedNote
+from instrument_agnostic_amt.amt.inference.windowed import decode_notes
+from instrument_agnostic_amt.amt.modeling.model import SemiCRFModelConfig
 
 
 class _WindowStateV1Model:

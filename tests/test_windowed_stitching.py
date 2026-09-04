@@ -1,5 +1,5 @@
-from instrument_agnostic_amt.inference.types import PredictedNote
-from instrument_agnostic_amt.inference.windowed import WindowNoteStitcher
+from instrument_agnostic_amt.amt.inference.types import PredictedNote
+from instrument_agnostic_amt.amt.inference.windowed import WindowNoteStitcher
 
 
 def _note(

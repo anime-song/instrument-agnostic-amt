@@ -7,21 +7,21 @@ import mido
 import numpy as np
 import soundfile as sf
 
-from instrument_agnostic_amt.velocity.config import PseudoLabelConfig
-from instrument_agnostic_amt.velocity.data.calibration import (
+from recipes.velocity.config import PseudoLabelConfig
+from recipes.velocity.data.calibration import (
     build_velocity_sweep_midi,
 )
-from instrument_agnostic_amt.velocity.data.curve import (
+from recipes.velocity.data.curve import (
     CalibrationAnalysisConfig,
     analyze_sweep_files,
     isotonic_increasing,
 )
-from instrument_agnostic_amt.velocity.data.index import discover_amt_cbnet_items
+from recipes.velocity.data.index import discover_amt_cbnet_items
 from instrument_agnostic_amt.velocity.data.midi import (
     MidiNoteTable,
     canonicalize_amt_midi,
 )
-from instrument_agnostic_amt.velocity.data.pseudo import (
+from recipes.velocity.data.pseudo import (
     build_pseudo_labels_from_audio,
 )
 

@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from instrument_agnostic_amt.inference import v1_windowed
-from instrument_agnostic_amt.inference.types import InferenceSettings
-from instrument_agnostic_amt.inference.windowed import decode_notes
-from instrument_agnostic_amt.modeling.heads.v2 import SelectedPairIndices
-from instrument_agnostic_amt.modeling.model import (
+from instrument_agnostic_amt.amt.inference import v1_windowed
+from instrument_agnostic_amt.amt.inference.types import InferenceSettings
+from instrument_agnostic_amt.amt.inference.windowed import decode_notes
+from instrument_agnostic_amt.amt.modeling.heads.v2 import SelectedPairIndices
+from instrument_agnostic_amt.amt.modeling.model import (
     AudioSemiCRFTransformer,
     NUM_PITCHES,
     SemiCRFModelConfig,

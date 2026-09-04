@@ -23,7 +23,7 @@ To run locally:
 git clone https://github.com/anime-song/tsumugi.git
 cd tsumugi
 uv sync --locked
-uv run python infer.py --audio input_song.wav
+uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ```
 
 The checkpoint is downloaded from Hugging Face on the first run.
@@ -139,7 +139,7 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 ## Inference
 
 ```bash
-python infer.py --audio input_song.wav
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ```
 
 If `--checkpoint` is omitted, the model is downloaded from Hugging Face.
@@ -149,16 +149,16 @@ If `--checkpoint` is omitted, the model is downloaded from Hugging Face.
 `--device` defaults to `auto` and selects the first available backend in this order: **CUDA → MPS → CPU**. If an explicitly requested backend is unavailable, inference fails instead of silently falling back.
 
 ```bash
-python infer.py --audio input_song.wav                # auto
-python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
-python infer.py --audio input_song.wav --device cpu
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav                # auto
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --device mps   # Apple Silicon GPU
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --device cpu
 ```
 
 ### Optional regional compilation
 
 ```bash
-python infer.py --audio input_song.wav --compile
-python infer.py --audio input_song.wav --compile --compile-mode reduce-overhead
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile --compile-mode reduce-overhead
 ```
 
 The first window pays the compilation cost, so a short one-off transcription may be slower. Compilation is most useful when the loaded model processes many songs. `--compile-mode` also accepts `default`, `reduce-overhead`, and `max-autotune-no-cudagraphs`.
@@ -174,7 +174,7 @@ It is slower than a single pass over the mix, but usually more accurate because 
 Reclassifies each note in an existing MIDI file using the stem it was transcribed from. Timing and pitch are preserved; only the track program and name change.
 
 ```bash
-python infer_instrument_refinement.py \
+python -m instrument_agnostic_amt.instrument_refinement.cli.infer \
   --audio separated_stems/song_other.wav \
   --midi stem_midis/song_other.mid \
   --stem-name other \
@@ -188,7 +188,7 @@ python infer_instrument_refinement.py \
 This is a separate post-processing model. Given a MIDI file and its stems, it replaces fixed velocities with per-note dynamics while preserving tracks, pitches, and Note On/Off timing.
 
 ```bash
-python infer_velocity.py \
+python -m instrument_agnostic_amt.velocity.cli.infer_velocity \
   --midi output.mid \
   --stems-dir separated_stems \
   --output-midi output_velocity.mid
@@ -270,7 +270,7 @@ python -m preprocess.resample_only --input ./stems --resample-rate 22050
 ## Training
 
 ```bash
-python train.py \
+python -m recipes.amt.train \
   --manifest_path manifest.csv \
   --batch_size 8 \
   --lr 5e-4 \
@@ -282,7 +282,7 @@ python train.py \
 With all augmentations enabled:
 
 ```bash
-python train.py \
+python -m recipes.amt.train \
   --dataset_config dataset_config.yaml \
   --batch_size 8 --lr 5e-4 --warmup_steps 1000 --epochs 3000 \
   --ir_folder ./IRs --noise_folder ./noise --drum_folder ./drum_stems \
@@ -359,14 +359,14 @@ Entries with the same `group` and CSV `song_name` form one virtual song, allowin
 
 ```bash
 # Pretrain beat detection from MIDI
-python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat \
+python -m recipes.beat_chord.pretrain_beat \
   --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
 # Joint beat/chord training
-python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
+python -m recipes.beat_chord.train --midi_dir midi_dataset/merged
 
 # Beat/chord inference
-python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.mid
+python -m instrument_agnostic_amt.beat_chord.cli.infer --checkpoint path/to/checkpoint.pth --midi_path song.mid
 ```
 
 ---
@@ -375,29 +375,21 @@ python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.
 
 ```
 instrument_agnostic_amt/
-├── train.py                    # Training loop (AMP, W&B, warmup)
-├── infer.py                    # Inference: audio → MIDI
-├── dataset.py                  # StemDataset with stem-mixing augmentation
-├── losses.py                   # Semi-CRF NLL + boundary + instrument classification
-├── augmentation.py             # AudioAugmentor (EQ, pitch shift, reverb, noise, …)
-├── instrument_classes.py       # Instrument class mapping (GM program ↔ class ID)
-├── instrument_merge.json       # Instrument taxonomy
-├── gm_instrument_classes.json  # General MIDI metadata
-├── dataset_config.yaml         # Weighted multi-dataset sampling
-│
-├── models/
-│   ├── model.py                # AudioSemiCRFTransformer (top level)
-│   ├── transcription_model.py  # Feature extraction, StemConv, Backbone
-│   ├── transformer.py          # RoPE Transformer with gated attention
-│   ├── cqt.py                  # RecursiveCQT (fast octave-recursive CQT)
-│   ├── semi_crf.py             # Neural Semi-CRF (forward-backward, Viterbi, loss)
-│   ├── interval_boundaries.py  # Interval-boundary feature gathering
-│   └── spec_augment.py         # SpecAugment and MiniBatch Mixture Masking
-│
-└── preprocess/
-    ├── prepare_dataset.py      # Create manifest.csv from audio/MIDI pairs
-    ├── resample_only.py        # Batch resampling
-    └── apply_ir_augmentation.py # Offline IR convolution
+├── amt/                        # Core AMT model, inference, data, and CLI
+├── taxonomy/                   # Instrument classes and GM mappings
+├── beat_chord/                 # Public beat/chord models and inference
+├── instrument_refinement/      # Public refinement model and inference
+├── velocity/                   # Public velocity model and inference
+└── cli/                        # Composed stem inference pipeline
+
+recipes/
+├── amt/                        # AMT train, dataset, targets, and losses
+├── beat_chord/                 # Beat/chord datasets and training
+├── instrument_refinement/      # Refinement dataset preparation and training
+├── velocity/                   # Velocity data preparation and training
+└── common/                     # Training-only shared augmentation
+
+preprocess/                     # Standalone dataset preparation tools
 ```
 
 ---

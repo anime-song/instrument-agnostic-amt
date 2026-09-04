@@ -1,2 +1,2 @@
-"""Command line entrypoints."""
+"""Cross-task command line entrypoints."""
 

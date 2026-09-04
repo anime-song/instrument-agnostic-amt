@@ -5,13 +5,13 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from instrument_agnostic_amt.modeling.backbone import V1Backbone
+from instrument_agnostic_amt.amt.modeling.backbone import V1Backbone
 from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
 )
-from instrument_agnostic_amt.velocity.training.forward import forward_velocity_batch
-from instrument_agnostic_amt.velocity.training.losses import (
+from recipes.velocity.forward import forward_velocity_batch
+from recipes.velocity.losses import (
     VelocityLossConfig,
     compute_velocity_losses,
 )

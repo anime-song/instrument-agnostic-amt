@@ -23,7 +23,7 @@
 git clone https://github.com/anime-song/tsumugi.git
 cd tsumugi
 uv sync --locked
-uv run python infer.py --audio input_song.wav
+uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ```
 
 初回実行時にチェックポイントが Hugging Face から自動的にダウンロードされます。
@@ -140,7 +140,7 @@ RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 ## 推論
 
 ```bash
-python infer.py --audio input_song.wav
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 ```
 
 `--checkpoint` を指定しない場合、モデルは Hugging Face からダウンロードされます。
@@ -150,16 +150,16 @@ python infer.py --audio input_song.wav
 `--device` のデフォルトは `auto` で、**CUDA → MPS → CPU** の順に利用可能な最初のバックエンドを選びます。バックエンドを明示的に指定した場合、利用できなければ暗黙にフォールバックせずエラーになります。
 
 ```bash
-python infer.py --audio input_song.wav                # auto
-python infer.py --audio input_song.wav --device mps   # Apple Silicon GPU
-python infer.py --audio input_song.wav --device cpu
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav                # auto
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --device mps   # Apple Silicon GPU
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --device cpu
 ```
 
 ### regional compile（任意）
 
 ```bash
-python infer.py --audio input_song.wav --compile
-python infer.py --audio input_song.wav --compile --compile-mode reduce-overhead
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile
+python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav --compile --compile-mode reduce-overhead
 ```
 
 初回のウィンドウでコンパイルのコストがかかるため、短い曲を 1 回だけ採譜する場合は遅くなる可能性があります。
@@ -176,7 +176,7 @@ python infer.py --audio input_song.wav --compile --compile-mode reduce-overhead
 既存 MIDI の各ノートについて、採譜元のステムを使って楽器を再分類します。タイミングとピッチは維持し、トラックのプログラム番号と名前だけを変更します。
 
 ```bash
-python infer_instrument_refinement.py \
+python -m instrument_agnostic_amt.instrument_refinement.cli.infer \
   --audio separated_stems/song_other.wav \
   --midi stem_midis/song_other.mid \
   --stem-name other \
@@ -190,7 +190,7 @@ python infer_instrument_refinement.py \
 AMT とは別の後処理モデルです。MIDI ファイルとステムを入力し、トラック、ピッチ、Note On/Off のタイミングを維持したまま、固定ベロシティをノートごとに予測した強弱へ置き換えます。
 
 ```bash
-python infer_velocity.py \
+python -m instrument_agnostic_amt.velocity.cli.infer_velocity \
   --midi output.mid \
   --stems-dir separated_stems \
   --output-midi output_velocity.mid
@@ -272,7 +272,7 @@ python -m preprocess.resample_only --input ./stems --resample-rate 22050
 ## 学習
 
 ```bash
-python train.py \
+python -m recipes.amt.train \
   --manifest_path manifest.csv \
   --batch_size 8 \
   --lr 5e-4 \
@@ -284,7 +284,7 @@ python train.py \
 すべてのデータ拡張を有効にする場合：
 
 ```bash
-python train.py \
+python -m recipes.amt.train \
   --dataset_config dataset_config.yaml \
   --batch_size 8 --lr 5e-4 --warmup_steps 1000 --epochs 3000 \
   --ir_folder ./IRs --noise_folder ./noise --drum_folder ./drum_stems \
@@ -361,14 +361,14 @@ datasets:
 
 ```bash
 # MIDI からビートを事前学習
-python -m instrument_agnostic_amt.beat_chord.cli.pretrain_beat \
+python -m recipes.beat_chord.pretrain_beat \
   --pretrain_midi_dir beat_chord_dataset/beat_pretrain_dataset/midis
 
 # ビート／コードを joint 学習
-python train_midi_frame_beat_chord.py --midi_dir midi_dataset/merged
+python -m recipes.beat_chord.train --midi_dir midi_dataset/merged
 
 # ビート／コードを推論
-python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.mid
+python -m instrument_agnostic_amt.beat_chord.cli.infer --checkpoint path/to/checkpoint.pth --midi_path song.mid
 ```
 
 ---
@@ -377,29 +377,21 @@ python midi_frame_infer.py --checkpoint path/to/checkpoint.pth --midi_path song.
 
 ```
 instrument_agnostic_amt/
-├── train.py                    # 学習ループ（AMP、W&B、warmup）
-├── infer.py                    # 推論：オーディオ → MIDI
-├── dataset.py                  # ステムミキシング拡張を持つ StemDataset
-├── losses.py                   # Semi-CRF NLL＋boundary＋楽器分類
-├── augmentation.py             # AudioAugmentor（EQ、pitch shift、reverb、noise、…）
-├── instrument_classes.py       # 楽器クラスの対応（GM program ↔ class ID）
-├── instrument_merge.json       # 楽器 taxonomy
-├── gm_instrument_classes.json  # General MIDI metadata
-├── dataset_config.yaml         # マルチデータセットの重み付きサンプリング
-│
-├── models/
-│   ├── model.py                # AudioSemiCRFTransformer（トップレベル）
-│   ├── transcription_model.py  # 特徴抽出、StemConv、Backbone
-│   ├── transformer.py          # gated attention を持つ RoPE Transformer
-│   ├── cqt.py                  # RecursiveCQT（高速な octave-recursive CQT）
-│   ├── semi_crf.py             # Neural Semi-CRF（forward-backward、Viterbi、loss）
-│   ├── interval_boundaries.py  # 区間境界の特徴量収集
-│   └── spec_augment.py         # SpecAugment と MiniBatch Mixture Masking
-│
-└── preprocess/
-    ├── prepare_dataset.py      # オーディオ／MIDI ペアから manifest.csv を生成
-    ├── resample_only.py        # 一括リサンプリング
-    └── apply_ir_augmentation.py # オフライン IR convolution
+├── amt/                        # AMT 本体のモデル・推論・データ・CLI
+├── taxonomy/                   # 楽器クラスと GM の対応
+├── beat_chord/                 # 公開 beat/chord モデルと推論
+├── instrument_refinement/      # 公開 refinement モデルと推論
+├── velocity/                   # 公開 velocity モデルと推論
+└── cli/                        # 複数モデルを束ねるステム推論
+
+recipes/
+├── amt/                        # AMT の train、Dataset、target、loss
+├── beat_chord/                 # beat/chord の Dataset と学習
+├── instrument_refinement/      # refinement のデータ準備と学習
+├── velocity/                   # velocity のデータ準備と学習
+└── common/                     # 学習専用の共通 augmentation
+
+preprocess/                     # 独立したデータ準備ツール
 ```
 
 ---

@@ -6,32 +6,11 @@
 ```text
 velocity/
 ├── data/
-│   ├── index.py          # stems/midis/mergedを結合
-│   ├── midi.py           # MIDI読込、固定velocity/CC7/CC11の除去
-│   ├── pseudo.py         # 実ステムから弱いノート強度・level教師を作成
-│   ├── calibration.py    # 対象SoundFont用velocity sweep MIDI
-│   └── curve.py          # sweep WAVの測定と単調velocity curve fitting
-├── synthesis/
-│   ├── sampling.py       # 擬似rankからtarget velocityをサンプル
-│   ├── midi.py           # render用target MIDIを作成
-│   ├── plan.py           # 曲・variation単位の合成ジョブを準備
-│   └── mix.py            # render済みステムをgain付きでmix
-├── training/
-│   ├── dataset.py        # 曲split・window読込・音声resample・教師抽出
-│   └── collate.py        # 可変ステム/ノート次元のpaddingとmask
+│   └── midi.py           # MIDI読込、固定velocity/CC7/CC11の除去
+├── modeling/             # 公開モデルとcheckpoint読込
 ├── cli/
-│   ├── prepare_dataset.py
-│   ├── prepare_calibration.py
-│   ├── render_soundfont.py
-│   ├── analyze_calibration.py
-│   ├── prepare_synthetic_dataset.py
-│   ├── render_synthetic.py
-│   ├── assemble_synthetic_dataset.py
-│   └── inspect_training_dataset.py
-├── configs/
-│   ├── monalisa_gm.json
-│   └── synthetic.json
-└── artifacts/            # 生成物。Git管理外
+│   └── infer_velocity.py
+└── stems.py              # stem class定義
 ```
 
 ## 教師の扱い
@@ -48,7 +27,7 @@ velocity/
 ## 1. 入力ファイルの索引を作る
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.prepare_dataset `
+python -m recipes.velocity.prepare_dataset `
   --source-root '<AMT dataset root>' `
   --mode index
 ```
@@ -60,7 +39,7 @@ python -m instrument_agnostic_amt.velocity.cli.prepare_dataset `
 まず少数曲で確認します。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.prepare_dataset `
+python -m recipes.velocity.prepare_dataset `
   --source-root '<AMT dataset root>' `
   --mode pseudo `
   --limit-songs 10 `
@@ -80,7 +59,7 @@ pseudo velocity、confidence、valid maskが入ります。canonical MIDIはAMT�
 0-based GM programごとのsweep MIDIを作ります。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.prepare_calibration
+python -m recipes.velocity.prepare_calibration
 ```
 
 初期設定では128 melodic programそれぞれについて5 pitch × 8 velocityの40音と、
@@ -91,7 +70,7 @@ WAVを作り直す場合だけ、SoundFontは実行時引数として渡しま�
 保存しません。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.render_soundfont `
+python -m recipes.velocity.render_soundfont `
   --soundfont '<path-to-sf2>' `
   --fluidsynth-executable '<path-to-fluidsynth>'
 ```
@@ -99,7 +78,7 @@ python -m instrument_agnostic_amt.velocity.cli.render_soundfont `
 WAV生成後は、次の解析を実行します。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.analyze_calibration
+python -m recipes.velocity.analyze_calibration
 ```
 
 `analysis/velocity_curves.csv` と `velocity_curves.npz` に、各
@@ -113,7 +92,7 @@ python -m instrument_agnostic_amt.velocity.cli.analyze_calibration
 擬似教師のmanifestから、まず音声を必要としない合成計画を作ります。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.prepare_synthetic_dataset `
+python -m recipes.velocity.prepare_synthetic_dataset `
   --variations 2 `
   --limit-songs 10 `
   --overwrite
@@ -134,7 +113,7 @@ target MIDIをレンダリングします。SoundFontの場所は実行時にだ
 保存しません。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.render_synthetic `
+python -m recipes.velocity.render_synthetic `
   --soundfont '<path-to-sf2>' `
   --fluidsynth-executable '<path-to-fluidsynth>'
 ```
@@ -143,7 +122,7 @@ rendered stemは最初から22.05 kHzのPCM 16-bit WAVとして保存します�
 作ったWAVは、次のコマンドで個別に検証しながら同じパスへ変換できます。
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.resample_rendered_stems `
+python -m recipes.velocity.resample_rendered_stems `
   --workers 4
 ```
 
@@ -162,7 +141,7 @@ mixtureとpeak limiterを経由しないため、学習と推論のどちらも�
 ## 5. 学習Datasetを確認する
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.inspect_training_dataset `
+python -m recipes.velocity.inspect_dataset `
   --split all `
   --max-examples 4
 ```
@@ -183,7 +162,7 @@ variationが別splitへ漏れません。長い曲は固定長windowとして読
 ## 6. モデルをdry-runする
 
 ```powershell
-python -m instrument_agnostic_amt.velocity.cli.train_velocity `
+python -m recipes.velocity.train `
   --root instrument_agnostic_amt/velocity/artifacts/synthetic `
   --init-amt '<AMT checkpoint>' `
   --freeze-backbone `
@@ -207,7 +186,7 @@ HCQT backboneで消える全体レベルを補うため、velocity headには局
 
 ## 実装の境界
 
-学習モデルは `velocity/modeling/`、損失・Dataset・学習補助は
-`velocity/training/`、学習CLIは `velocity/cli/train_velocity.py` にあります。
+公開モデル・MIDI前処理・推論CLIは `velocity/`、データ準備・合成データ生成・
+損失・Dataset・学習補助・学習CLIは `recipes/velocity/` にあります。
 MIDIへの書き戻しは次段階として `velocity/inference/` に追加します。AMT本体の
 `modeling/` と `training/` には混在させません。

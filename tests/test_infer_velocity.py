@@ -19,7 +19,7 @@ from instrument_agnostic_amt.velocity.modeling.model import (
     VelocityModelConfig,
     VelocityPredictionModel,
 )
-from instrument_agnostic_amt.velocity.training.dataset import STEM_CLASS_BY_NAME
+from instrument_agnostic_amt.velocity.stems import STEM_CLASS_BY_NAME
 
 
 def test_velocity_auto_routes_model_to_mps(
