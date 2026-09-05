@@ -287,7 +287,7 @@ def get_stem_pipeline_models(
     if resolved_semi_crf_backend == "triton" and device.type != "cuda":
         raise ValueError("semi_crf_backend='triton' requires a CUDA device")
 
-    # 低显存模式：模型常驻 CPU 内存（RAM），仅在推理时搬运到 device。
+    # 低VRAMモード：モデルは CPU メモリ（RAM）に常駐させ、推論時だけ device へ移す。
     storage_device = torch.device("cpu") if low_vram_mode else device
 
     resolved_checkpoint = infer._ensure_checkpoint(
@@ -324,7 +324,7 @@ def get_stem_pipeline_models(
                     batch_size=int(stem_splitter_batch_size),
                 )
             else:
-                # 低显存モードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
+                # 低VRAMモードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
                 print("[LowVRAM] Separation uses fp16 autocast ...")
                 sep_config = SeparationConfig(
                     skip_existing=True,
@@ -438,7 +438,7 @@ def get_refinement_models(
     """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
     device = resolve_device(device_preference)
 
-    # 低显存模式：モデルは CPU に常駐させ、推論時だけ device へ移す。
+    # 低VRAMモード：モデルは CPU に常駐させ、推論時だけ device へ移す。
     storage_device = torch.device("cpu") if low_vram_mode else device
 
     resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
