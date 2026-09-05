@@ -64,6 +64,7 @@ uv run python -m instrument_agnostic_amt.amt.cli.infer --audio input_song.wav
 
 | 日付 | 更新内容 |
 | --- | --- |
+| 2026-09-02 | 🐍 `uv add` で別の Python プロジェクトへ依存パッケージとしてインストールできるように変更。`uv sync` による開発環境の作り方は従来どおり。 |
 | 2026-09-01 | 🥁 Drum model v1.5（`--type drums_v1_5`）を追加し、Colab のドラムステムのデフォルトに設定。実音源評価セットで exact F1 は Drum Kit が 0.6157→0.6890（+7.3ポイント）、All Percussions が 0.1879→0.4044（+21.7ポイント）に向上。 |
 | 2026-08-25 | 🎤 Vocal harmony model v1.5（`--type vocal_harmony_v1_5`）を追加し、Colab の `vocals` ステムのデフォルトに設定。MIR-ST500 のホールドアウト分割で COnP が 0.6052 から 0.6814 に向上。 |
 | 2026-08-20 | ⚡ uv と PyTorch 2.13 へ移行。MPS 推論、AMP、regional compile の制御を追加し、デバイス同期、一時コピー、ステムの重複読み込みを削減。意図的に出力が変わる変更が 2 点あり、CUDA で attention を暗黙に低精度化しないように変更（FP32 がデフォルト）し、V1 のウィンドウバッチでデコード状態をウィンドウ順に伝播するように変更。 |
@@ -116,7 +117,7 @@ uv sync --locked --extra evaluation  # 評価スクリプト
 uv sync --locked --extra training    # 学習
 ```
 
-`uv sync` は `.venv/` を作成します。`source .venv/bin/activate` で有効化するか、コマンドの前に `uv run` を付けてください。
+`uv sync` は `.venv/` を作成し、クローンしたリポジトリを編集可能な形でそこへインストールします。`source .venv/bin/activate` で有効化するか、コマンドの前に `uv run` を付けてください。
 
 `.python-version` は開発時のデフォルトとして Python 3.12 を選択しますが、サポート範囲は 3.10～3.14 のままです。3.12 がない場合、ダウンロードが無効化されているかオフラインでない限り、uv が管理対象の CPython をダウンロードします。
 
@@ -134,6 +135,20 @@ MPS が利用できない環境では MPS 固有のテストをスキップし�
 ```bash
 RUN_ACCELERATOR_COMPILE_TEST=1 uv run pytest tests/test_mps_inference.py
 ```
+
+### 別のプロジェクトへインストールする
+
+tsumugi は PyPI には公開していません。別のプロジェクトから使う場合は、ローカルにクローンしたリポジトリか、コミットを固定した Git の参照を依存関係として追加してください。配布名は `instrument-agnostic-amt`、インポート名は `instrument_agnostic_amt` です。
+
+```bash
+# ローカルのクローンを編集可能な形で追加
+uv add --editable /path/to/tsumugi
+
+# コミットを固定した Git 依存として追加
+uv add git+https://github.com/anime-song/tsumugi.git --rev <commit>
+```
+
+パッケージに含まれるのは、`instrument_agnostic_amt` のモジュールと、同梱するデータ（楽器 taxonomy の JSON ファイル）です。リポジトリ直下の `infer.py` などのスクリプト、ノートブック、テスト、モデルのチェックポイントは含まれません。パッケージ化された CLI は `python -m instrument_agnostic_amt.cli.infer` として実行できます。依存関係のバージョンは利用側のプロジェクトが解決して lock します。このリポジトリの `uv.lock` は再利用されません。path または Git の依存として追加した場合、uv はこのリポジトリの `[tool.uv.sources]` と `[[tool.uv.index]]` も読むので、Linux と Windows ではこのリポジトリと同じく PyTorch を CUDA 13.0 用の取得先から解決します。ビルド済み wheel を pip や `uv pip` で入れる場合はこの設定が引き継がれないため、PyTorch の取得先は利用側で設定してください。インストールされるモジュールは、この時点ではまだ安定した公開 API ではありません。
 
 ---
 
