@@ -60,6 +60,24 @@ _WaveformLoader = Callable[[Path, int], torch.Tensor]
 REFINEMENT_EXCLUDED_STEM_GROUPS = ("drums", "vocals")
 
 
+def _current_model_device(model: torch.nn.Module) -> torch.device:
+    """モデルの先頭パラメータから現在のデバイスを取得する。"""
+    first_param = next(model.parameters(), None)
+    if first_param is None:
+        return torch.device("cpu")
+    return first_param.device
+
+
+def _move_model(model: torch.nn.Module, target: torch.device | str) -> None:
+    """モデルを target へ移動し、CUDA 側の不要な確保を解放する。"""
+    target_device = torch.device(target)
+    current_device = _current_model_device(model)
+    if current_device.type != target_device.type or current_device.index != target_device.index:
+        model.to(target_device)
+    if target_device.type == "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def merge_midis_logic(
     midi_paths: list[Path | str],
     output_file: Path | str,
@@ -239,6 +257,8 @@ def get_stem_pipeline_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
     model_type: str = "default",
+    low_vram_mode: bool = False,
+    no_half: bool = False,
     stem_splitter_batch_size: int = 1,
     compile_model: bool = False,
     compile_mode: str = "default",
@@ -267,6 +287,9 @@ def get_stem_pipeline_models(
     if resolved_semi_crf_backend == "triton" and device.type != "cuda":
         raise ValueError("semi_crf_backend='triton' requires a CUDA device")
 
+    # 低显存模式：模型常驻 CPU 内存（RAM），仅在推理时搬运到 device。
+    storage_device = torch.device("cpu") if low_vram_mode else device
+
     resolved_checkpoint = infer._ensure_checkpoint(
         None if checkpoint_path in (None, "", "DEFAULT") else Path(checkpoint_path),
         model_type=model_type,
@@ -277,19 +300,43 @@ def get_stem_pipeline_models(
     amt_cache_key = (
         "amt",
         str(resolved_checkpoint.resolve()),
-        str(device),
+        str(storage_device),
         ("semi-crf", resolved_semi_crf_backend),
         *compile_cache_key,
     )
-    sep_cache_key = ("sep", str(device))
+    if low_vram_mode:
+        sep_variant = "fp32_half_chunk" if no_half else "fp16"
+    else:
+        sep_variant = "fp32"
+    sep_cache_key = ("sep", str(storage_device), sep_variant)
 
     if sep_cache_key not in STEM_PIPELINE_CACHE:
-        print(f"Loading Separation model on {device} ...")
-        sep_config = SeparationConfig(
-            batch_size=int(stem_splitter_batch_size),
-            skip_existing=True,
-        )
-        sep_model = load_mss_model(sep_config, device=device)
+        print(f"Loading Separation model on {storage_device} ...")
+        if low_vram_mode:
+            if no_half:
+                # fp16 非対応/低速な GPU 向け: fp32 のまま、チャンクを半分にして VRAM を抑える。
+                print("[LowVRAM] Separation uses fp32 with half chunks ...")
+                sep_config = SeparationConfig(
+                    skip_existing=True,
+                    use_half_precision=False,
+                    chunk_size=294_400,
+                    hop_size=147_200,
+                    batch_size=int(stem_splitter_batch_size),
+                )
+            else:
+                # 低显存モードでは分離を fp16 autocast で実行し、ピーク VRAM を抑える。
+                print("[LowVRAM] Separation uses fp16 autocast ...")
+                sep_config = SeparationConfig(
+                    skip_existing=True,
+                    use_half_precision=True,
+                    batch_size=int(stem_splitter_batch_size),
+                )
+        else:
+            sep_config = SeparationConfig(
+                batch_size=int(stem_splitter_batch_size),
+                skip_existing=True,
+            )
+        sep_model = load_mss_model(sep_config, device=storage_device)
         sep_dtype = (
             torch.float16
             if sep_config.use_half_precision and device.type == "cuda"
@@ -303,10 +350,10 @@ def get_stem_pipeline_models(
         sep_config.batch_size = int(stem_splitter_batch_size)
 
     if amt_cache_key not in STEM_PIPELINE_CACHE:
-        print(f"Loading AMT model ({model_type}) on {device} ...")
+        print(f"Loading AMT model ({model_type}) on {storage_device} ...")
         amt_model, amt_config, amt_settings = infer._load_model_and_settings(
             resolved_checkpoint,
-            device=device,
+            device=storage_device,
             window_ms_override=None,
             stride_ms_override=None,
             track_batch_size_override=None,
@@ -324,7 +371,7 @@ def get_stem_pipeline_models(
             amt_settings,
         )
     else:
-        print(f"Reusing cached AMT model ({model_type}) on {device} ...")
+        print(f"Reusing cached AMT model ({model_type}) on {storage_device} ...")
         amt_model, amt_forward, amt_config, amt_settings = STEM_PIPELINE_CACHE[
             amt_cache_key
         ]
@@ -386,22 +433,26 @@ def get_velocity_models(
 def get_refinement_models(
     checkpoint_path: Path | str | None = None,
     device_preference: torch.device | str | None = None,
+    low_vram_mode: bool = False,
 ) -> dict[str, object]:
     """Instrument Refinement モデルを読み込み、セッション中は再利用する。"""
     device = resolve_device(device_preference)
 
+    # 低显存模式：モデルは CPU に常駐させ、推論時だけ device へ移す。
+    storage_device = torch.device("cpu") if low_vram_mode else device
+
     resolved_checkpoint = ensure_refinement_checkpoint(checkpoint_path)
-    cache_key = ("refine", str(resolved_checkpoint), str(device))
+    cache_key = ("refine", str(resolved_checkpoint), str(storage_device))
 
     if cache_key not in STEM_PIPELINE_CACHE:
-        print(f"Loading Instrument Refinement model on {device} ...")
+        print(f"Loading Instrument Refinement model on {storage_device} ...")
         refinement_model, refinement_config, _ = load_refinement_model(
             resolved_checkpoint,
-            device=device,
+            device=storage_device,
         )
         STEM_PIPELINE_CACHE[cache_key] = (refinement_model, refinement_config)
     else:
-        print(f"Reusing cached Instrument Refinement model on {device} ...")
+        print(f"Reusing cached Instrument Refinement model on {storage_device} ...")
         refinement_model, refinement_config = STEM_PIPELINE_CACHE[cache_key]
 
     return {
@@ -449,6 +500,7 @@ def refine_stem_instrument_midis(
     refinement_model: object,
     refinement_config: object,
     device: torch.device | str | None = None,
+    low_vram_mode: bool = False,
     stem_names: Sequence[str] | None = None,
     mode: str = "cluster",
     window_seconds: float = 8.0,
@@ -511,23 +563,31 @@ def refine_stem_instrument_midis(
             if waveform_loader is not None
             else None
         )
-        report = refine_midi_instruments(
-            stem_audio_path,
-            source_midi,
-            output_midi_path=refined_midi,
-            stem_name=stem_name,
-            device=device,
-            window_seconds=window_seconds,
-            stride_seconds=stride_seconds,
-            window_batch_size=window_batch_size,
-            mode=mode,
-            disable_tqdm=disable_tqdm,
-            preloaded_model=refinement_model,
-            preloaded_config=refinement_config,
-            preloaded_waveform=preloaded_waveform,
-            amp=amp,
-            amp_dtype=amp_dtype,
-        )
+        if low_vram_mode:
+            print(f"[LowVRAM] Moving refinement model ({stem_name}) to {device} ...")
+            _move_model(refinement_model, device)
+        try:
+            report = refine_midi_instruments(
+                stem_audio_path,
+                source_midi,
+                output_midi_path=refined_midi,
+                stem_name=stem_name,
+                device=device,
+                window_seconds=window_seconds,
+                stride_seconds=stride_seconds,
+                window_batch_size=window_batch_size,
+                mode=mode,
+                disable_tqdm=disable_tqdm,
+                preloaded_model=refinement_model,
+                preloaded_config=refinement_config,
+                preloaded_waveform=preloaded_waveform,
+                amp=amp,
+                amp_dtype=amp_dtype,
+            )
+        finally:
+            if low_vram_mode:
+                print(f"[LowVRAM] Moving refinement model ({stem_name}) back to CPU ...")
+                _move_model(refinement_model, "cpu")
         refined_midi_paths[stem_name] = refined_midi
 
         refined_class_names = sorted(
@@ -568,6 +628,8 @@ def run_stem_separated_transcription(
     checkpoint_path: Path | str | None = None,
     output_root: Path | str = "colab_outputs",
     stem_splitter_batch_size: int = 1,
+    low_vram_mode: bool = False,
+    no_half: bool = False,
     window_batch_size: int = 4,
     max_midi_melodic_instruments: int = 15,
     transcribe_drum_stems: bool = True,
@@ -592,6 +654,10 @@ def run_stem_separated_transcription(
 ) -> dict[str, object]:
     """ステム分離 -> 各ステム採譜 -> 楽器再ラベリング -> MIDI マージ -> Velocity予測 -> Beat/Chord予測を一括実行する。
 
+    low_vram_mode=True にすると、モデルをすべて CPU メモリに常駐させ、
+    各ステムの採譜を行う直前に対象モデルだけを GPU へ移動し、終わったら
+    すぐ CPU へ戻す。GPU に置かれるモデルは常に 1 つだけになる。
+
     amp は AMT・楽器再ラベリング・Velocity の 3 段の backbone に共通で効く。
     どの段も窓ごとの backbone が支配項で、AMP の有無で 2〜3 割変わる。
     Beat/Chord だけは FP32 のままにしている。こちらは推論時間の大半が
@@ -606,6 +672,8 @@ def run_stem_separated_transcription(
         checkpoint_path=checkpoint_path,
         device_preference=device,
         model_type="default",
+        low_vram_mode=low_vram_mode,
+        no_half=no_half,
         stem_splitter_batch_size=stem_splitter_batch_size,
         compile_model=compile_model,
         compile_mode=compile_mode,
@@ -649,6 +717,8 @@ def run_stem_separated_transcription(
                 checkpoint_path=checkpoint_path,
                 device_preference=device,
                 model_type=model_type_key,
+                low_vram_mode=low_vram_mode,
+                no_half=no_half,
                 stem_splitter_batch_size=stem_splitter_batch_size,
                 compile_model=compile_model,
                 compile_mode=compile_mode,
@@ -674,14 +744,22 @@ def run_stem_separated_transcription(
         f"Separating stems for: {audio_file.name} "
         f"(batch_size={stem_splitter_batch_size})"
     )
-    stems = _separate_one_file(
-        separation_input,
-        stem_dir,
-        sep_config,
-        sep_model,
-        device,
-        sep_dtype,
-    )
+    if low_vram_mode:
+        print(f"[LowVRAM] Moving separation model to {device} ...")
+        _move_model(sep_model, device)
+    try:
+        stems = _separate_one_file(
+            separation_input,
+            stem_dir,
+            sep_config,
+            sep_model,
+            device,
+            sep_dtype,
+        )
+    finally:
+        if low_vram_mode:
+            print("[LowVRAM] Moving separation model back to CPU ...")
+            _move_model(sep_model, "cpu")
 
     # 3. 再実行時に分離が省略された場合は既存 stem のパスを復元。
     if not stems:
@@ -725,38 +803,46 @@ def run_stem_separated_transcription(
             f"instruments={','.join(allowed_instrument_names)})"
         )
 
-        waveform = load_run_waveform(
-            Path(stem_path),
-            int(current_amt_config.sample_rate),
-        )
-        notes, _, _ = infer.run_inference(
-            model=current_amt_model,
-            forward_model=current_amt_forward,
-            waveform=waveform.to(device),
-            model_config=current_amt_config,
-            settings=current_amt_settings,
-            device=device,
-            amp_enabled=amt_amp_enabled,
-            amp_dtype=amt_amp_dtype,
-            velocity=100,
-            merge_gap_ms=None,
-            merge_onset_ms=merge_onset_ms,
-            silence_gate_rms_dbfs=-72,
-            window_batch_size=window_batch_size,
-            max_midi_melodic_instruments=max_midi_melodic_instruments,
-            disable_tqdm=True,
-            max_note_seconds=15.0,
-            allowed_instrument_ids=allowed_instrument_ids,
-        )
+        if low_vram_mode:
+            print(f"[LowVRAM] Moving AMT model ({model_type}) to {device} ...")
+            _move_model(current_amt_model, device)
+        try:
+            waveform = load_run_waveform(
+                Path(stem_path),
+                int(current_amt_config.sample_rate),
+            )
+            notes, _, _ = infer.run_inference(
+                model=current_amt_model,
+                forward_model=current_amt_forward,
+                waveform=waveform.to(device),
+                model_config=current_amt_config,
+                settings=current_amt_settings,
+                device=device,
+                amp_enabled=amt_amp_enabled,
+                amp_dtype=amt_amp_dtype,
+                velocity=100,
+                merge_gap_ms=None,
+                merge_onset_ms=merge_onset_ms,
+                silence_gate_rms_dbfs=-72,
+                window_batch_size=window_batch_size,
+                max_midi_melodic_instruments=max_midi_melodic_instruments,
+                disable_tqdm=True,
+                max_note_seconds=15.0,
+                allowed_instrument_ids=allowed_instrument_ids,
+            )
 
-        instrument_volumes = None if predict_velocity else dict(infer.DEFAULT_INSTRUMENT_VOLUMES)
-        midi = infer._build_midi(
-            notes,
-            sample_rate=current_amt_config.sample_rate,
-            instrument_volumes=instrument_volumes,
-        )
-        midi.write(str(output_midi))
-        stem_midi_paths[stem_name] = output_midi
+            instrument_volumes = None if predict_velocity else dict(infer.DEFAULT_INSTRUMENT_VOLUMES)
+            midi = infer._build_midi(
+                notes,
+                sample_rate=current_amt_config.sample_rate,
+                instrument_volumes=instrument_volumes,
+            )
+            midi.write(str(output_midi))
+            stem_midi_paths[stem_name] = output_midi
+        finally:
+            if low_vram_mode:
+                print(f"[LowVRAM] Moving AMT model ({model_type}) back to CPU ...")
+                _move_model(current_amt_model, "cpu")
         del waveform
 
     if not stem_midi_paths:
@@ -770,6 +856,7 @@ def run_stem_separated_transcription(
             refinement_bundle = get_refinement_models(
                 checkpoint_path=refinement_checkpoint_path,
                 device_preference=device,
+                low_vram_mode=low_vram_mode,
             )
             refined_midi_paths = refine_stem_instrument_midis(
                 stem_midis=stem_midi_paths,
@@ -778,6 +865,7 @@ def run_stem_separated_transcription(
                 refinement_model=refinement_bundle["refinement_model"],
                 refinement_config=refinement_bundle["refinement_config"],
                 device=device,
+                low_vram_mode=low_vram_mode,
                 stem_names=refinement_stem_names,
                 mode=refinement_mode,
                 window_batch_size=window_batch_size,
@@ -811,6 +899,7 @@ def run_stem_separated_transcription(
     # 6. Velocity予測を実行し、MIDIノートの強弱を補正する。
     preloaded_velocity_waveforms: dict[str, torch.Tensor] | None = None
     if predict_velocity:
+        velocity_model = None
         try:
             print("Predicting note velocities from separated stems...")
             stem_midis_map = {
@@ -819,12 +908,23 @@ def run_stem_separated_transcription(
                 if Path(midi_path).exists()
             }
             velocity_midi_path = merged_dir / f"{audio_file.stem}_velocity.mid"
-            velocity_model, velocity_forward, velocity_config = get_velocity_models(
-                checkpoint_path=velocity_checkpoint_path,
-                device_preference=device,
-                compile_velocity=compile_velocity,
-                compile_mode=compile_mode,
-            )
+            if low_vram_mode:
+                print("[LowVRAM] Loading velocity model on CPU ...")
+                velocity_model, velocity_forward, velocity_config = get_velocity_models(
+                    checkpoint_path=velocity_checkpoint_path,
+                    device_preference="cpu",
+                    compile_velocity=compile_velocity,
+                    compile_mode=compile_mode,
+                )
+                print(f"[LowVRAM] Moving velocity model to {device} ...")
+                _move_model(velocity_model, device)
+            else:
+                velocity_model, velocity_forward, velocity_config = get_velocity_models(
+                    checkpoint_path=velocity_checkpoint_path,
+                    device_preference=device,
+                    compile_velocity=compile_velocity,
+                    compile_mode=compile_mode,
+                )
             preloaded_velocity_waveforms = {
                 stem_name: load_run_waveform(
                     Path(stem_path),
@@ -857,6 +957,9 @@ def run_stem_separated_transcription(
         except Exception as err:
             print(f"Warning: Velocity prediction skipped due to error: {err}")
         finally:
+            if low_vram_mode and velocity_model is not None:
+                print("[LowVRAM] Moving velocity model back to CPU ...")
+                _move_model(velocity_model, "cpu")
             if preloaded_velocity_waveforms is not None:
                 preloaded_velocity_waveforms.clear()
             if waveform_cache is not None:
@@ -893,6 +996,11 @@ def run_stem_separated_transcription(
             print("Updated merged MIDI with predicted beat/chord/key:", merged_midi_path)
         except Exception as err:
             print(f"Warning: Beat/chord prediction skipped due to error: {err}")
+        finally:
+            if low_vram_mode and device.type == "cuda":
+                # beat_chord モデルは関数内でローカルに読み込まれるため、
+                # 戻り後に空きメモリを解放するだけで GPU 上から消える。
+                torch.cuda.empty_cache()
 
     # 7. 中間の分離 wav を削除。
     if cleanup_separated_stems:
